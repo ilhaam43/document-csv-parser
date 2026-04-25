@@ -21,9 +21,20 @@ NULL_LIKE_VALUES = {"", "na", "n/a", "null", "none", "nan", "-"}
 EXCEL_MAX_SHEET_NAME_LENGTH = 31
 DEFAULT_INPUT_DIR = "input-today"
 DEFAULT_OUTPUT_DIR = "output-today"
+DEFAULT_VLOOKUP_DIR = "vlookup-yesterday"
 TARGET_HEADER_INSERT_AFTER = "Quo"
 TARGET_SOURCE_HEADER = "Target + On Hold Duration"
 QUO_EXCLUDE_TERM = "XBOT"
+DEPT_SD_HEADER = "Dept SD"
+PM_HEADER = "PM"
+QUO_HEADER = "Quo"
+STATUS_HEADER = "Status"
+PROCESS_HEADER = "Process"
+PROCESS_ADJUSTMENT_HEADER = "Process Adjustment"
+SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div"
+LOOKUP_SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div."
+PHASE_HEADER_PREFIX = "Phase"
+VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
 @dataclass(frozen=True)
@@ -260,6 +271,161 @@ def sanitize_sheet_name(path: Path, used: set[str]) -> str:
     return sheet_name
 
 
+def resolve_vlookup_workbook() -> Path:
+    lookup_dir = Path(__file__).resolve().parent / DEFAULT_VLOOKUP_DIR
+    candidates = sorted(
+        path for path in lookup_dir.glob("*.xlsx") if path.is_file() and not path.name.startswith("~$")
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No lookup workbook found in: {lookup_dir}")
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def phase_lookup_header(lookup_workbook: Path) -> str:
+    match = re.search(r"Daily Tracking\s+(.+)$", lookup_workbook.stem, flags=re.IGNORECASE)
+    if match:
+        return f"{PHASE_HEADER_PREFIX} {match.group(1).strip()}"
+
+    return PHASE_HEADER_PREFIX
+
+
+def load_lookup_mappings(
+    lookup_workbook: Path,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str], str]:
+    lookup_df = pd.read_excel(lookup_workbook, sheet_name=VLOOKUP_SHEET_NAME, dtype="string")
+    lookup_df.columns = make_unique_columns(lookup_df.columns, normalize=True)
+    if (
+        PM_HEADER not in lookup_df.columns
+        or DEPT_SD_HEADER not in lookup_df.columns
+        or LOOKUP_SERVICE_DELIVERY_DIV_HEADER not in lookup_df.columns
+        or QUO_HEADER not in lookup_df.columns
+        or PHASE_HEADER_PREFIX not in lookup_df.columns
+        or PROCESS_ADJUSTMENT_HEADER not in lookup_df.columns
+    ):
+        raise ValueError(
+            "Lookup workbook must contain "
+            f"'{PM_HEADER}', '{DEPT_SD_HEADER}', '{LOOKUP_SERVICE_DELIVERY_DIV_HEADER}', "
+            f"'{QUO_HEADER}', '{PHASE_HEADER_PREFIX}', and '{PROCESS_ADJUSTMENT_HEADER}' "
+            f"columns in sheet '{VLOOKUP_SHEET_NAME}'."
+        )
+
+    dept_sd_mapping: dict[str, str] = {}
+    service_delivery_div_mapping: dict[str, str] = {}
+    phase_mapping: dict[str, str] = {}
+    process_adjustment_mapping: dict[str, str] = {}
+    for _, row in lookup_df[
+        [
+            PM_HEADER,
+            DEPT_SD_HEADER,
+            LOOKUP_SERVICE_DELIVERY_DIV_HEADER,
+            QUO_HEADER,
+            PHASE_HEADER_PREFIX,
+            PROCESS_ADJUSTMENT_HEADER,
+        ]
+    ].dropna(
+        subset=[PM_HEADER]
+    ).iterrows():
+        pm_value = str(row[PM_HEADER]).strip()
+        if not pm_value:
+            continue
+
+        dept_sd_value = row[DEPT_SD_HEADER]
+        if pm_value not in dept_sd_mapping and not pd.isna(dept_sd_value):
+            dept_sd_mapping[pm_value] = str(dept_sd_value).strip()
+
+        service_delivery_div_value = row[LOOKUP_SERVICE_DELIVERY_DIV_HEADER]
+        if pm_value not in service_delivery_div_mapping and not pd.isna(service_delivery_div_value):
+            service_delivery_div_mapping[pm_value] = str(service_delivery_div_value).strip()
+
+        quo_value = str(row[QUO_HEADER]).strip()
+        phase_value = row[PHASE_HEADER_PREFIX]
+        if quo_value and quo_value not in phase_mapping and not pd.isna(phase_value):
+            phase_mapping[quo_value] = str(phase_value).strip()
+
+        process_adjustment_value = row[PROCESS_ADJUSTMENT_HEADER]
+        if quo_value and quo_value not in process_adjustment_mapping and not pd.isna(process_adjustment_value):
+            process_adjustment_mapping[quo_value] = str(process_adjustment_value).strip()
+
+    return (
+        dept_sd_mapping,
+        service_delivery_div_mapping,
+        phase_mapping,
+        process_adjustment_mapping,
+        phase_lookup_header(lookup_workbook),
+    )
+
+
+def apply_lookup_values(
+    df: pd.DataFrame,
+    dept_sd_lookup: dict[str, str],
+    service_delivery_div_lookup: dict[str, str],
+    phase_lookup: dict[str, str],
+    process_adjustment_lookup: dict[str, str],
+    phase_header: str,
+) -> pd.DataFrame:
+    if PM_HEADER not in df.columns and QUO_HEADER not in df.columns:
+        return df
+
+    result = df.copy()
+    pm_values = result[PM_HEADER].astype("string").str.strip() if PM_HEADER in result.columns else None
+
+    if DEPT_SD_HEADER in result.columns and pm_values is not None:
+        looked_up_dept_sd = pm_values.map(dept_sd_lookup)
+        result[DEPT_SD_HEADER] = pd.Series(looked_up_dept_sd, index=result.index, dtype="string")
+
+    if pm_values is not None:
+        looked_up_service_delivery_div = pd.Series(pm_values.map(service_delivery_div_lookup), index=result.index, dtype="string")
+        if SERVICE_DELIVERY_DIV_HEADER in result.columns:
+            result[SERVICE_DELIVERY_DIV_HEADER] = looked_up_service_delivery_div
+        else:
+            insert_at = result.columns.get_loc(DEPT_SD_HEADER) + 1 if DEPT_SD_HEADER in result.columns else len(result.columns)
+            result.insert(insert_at, SERVICE_DELIVERY_DIV_HEADER, looked_up_service_delivery_div)
+
+    if QUO_HEADER in result.columns:
+        quo_values = result[QUO_HEADER].astype("string").str.strip()
+        looked_up_phase = pd.Series(quo_values.map(phase_lookup), index=result.index, dtype="string")
+        if phase_header in result.columns:
+            result[phase_header] = looked_up_phase
+        else:
+            insert_at = result.columns.get_loc(STATUS_HEADER) + 1 if STATUS_HEADER in result.columns else len(result.columns)
+            result.insert(insert_at, phase_header, looked_up_phase)
+
+        looked_up_process_adjustment = pd.Series(
+            quo_values.map(process_adjustment_lookup),
+            index=result.index,
+            dtype="string",
+        )
+        if PROCESS_ADJUSTMENT_HEADER in result.columns:
+            result[PROCESS_ADJUSTMENT_HEADER] = looked_up_process_adjustment
+        else:
+            insert_at = result.columns.get_loc(PROCESS_HEADER) + 1 if PROCESS_HEADER in result.columns else len(result.columns)
+            result.insert(insert_at, PROCESS_ADJUSTMENT_HEADER, looked_up_process_adjustment)
+
+    return result
+
+
+def write_excel_sheet(
+    writer: pd.ExcelWriter,
+    df: pd.DataFrame,
+    sheet_name: str,
+    dept_sd_lookup: dict[str, str],
+    service_delivery_div_lookup: dict[str, str],
+    phase_lookup: dict[str, str],
+    process_adjustment_lookup: dict[str, str],
+    phase_header: str,
+) -> None:
+    df = apply_lookup_values(
+        df,
+        dept_sd_lookup,
+        service_delivery_div_lookup,
+        phase_lookup,
+        process_adjustment_lookup,
+        phase_header,
+    )
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
 def resolve_csv_files(input_path: Path) -> list[Path]:
     if input_path.is_file():
         return [input_path]
@@ -307,18 +473,44 @@ def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df = clean_dataframe(read_csv(csv_path, options), options)
-    df.to_excel(output_path, index=False, engine="openpyxl")
+    dept_sd_lookup, service_delivery_div_lookup, phase_lookup, process_adjustment_lookup, phase_header = load_lookup_mappings(
+        resolve_vlookup_workbook()
+    )
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        write_excel_sheet(
+            writer,
+            df,
+            "Sheet1",
+            dept_sd_lookup,
+            service_delivery_div_lookup,
+            phase_lookup,
+            process_adjustment_lookup,
+            phase_header,
+        )
     print(f"Wrote {output_path}")
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
+    dept_sd_lookup, service_delivery_div_lookup, phase_lookup, process_adjustment_lookup, phase_header = load_lookup_mappings(
+        resolve_vlookup_workbook()
+    )
     if options.combine:
         options.output.parent.mkdir(parents=True, exist_ok=True)
         used_sheet_names: set[str] = set()
         with pd.ExcelWriter(options.output, engine="openpyxl") as writer:
             for csv_path in csv_files:
                 df = clean_dataframe(read_csv(csv_path, options), options)
-                df.to_excel(writer, sheet_name=sanitize_sheet_name(csv_path, used_sheet_names), index=False)
+                sheet_name = sanitize_sheet_name(csv_path, used_sheet_names)
+                write_excel_sheet(
+                    writer,
+                    df,
+                    sheet_name,
+                    dept_sd_lookup,
+                    service_delivery_div_lookup,
+                    phase_lookup,
+                    process_adjustment_lookup,
+                    phase_header,
+                )
         print(f"Wrote {options.output}")
         return
 
