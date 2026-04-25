@@ -39,6 +39,8 @@ YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
 RFS_COMMMIT_HEADER = "RFS Commmit"
 AGING_OF_RFS_HEADER = "Aging Of RFS"
 STATUS_ORDER_HEADER = "STATUS ORDER"
+TARGET_SO_COMPLETE_DATE_HEADERS = ("Target SO Complete Date", "Target SO Completion Date")
+EXCEL_DATE_DISPLAY_FORMAT = "yyyy-mm-dd"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
@@ -499,6 +501,34 @@ def write_excel_sheet(
         phase_header,
     )
     df.to_excel(writer, sheet_name=sheet_name, index=False)
+    worksheet = writer.sheets[sheet_name]
+    worksheet.auto_filter.ref = worksheet.dimensions
+    apply_target_so_complete_date_filter_format(worksheet, df)
+
+
+def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> None:
+    header_positions = {
+        str(cell.value).strip(): cell.column
+        for cell in worksheet[1]
+        if cell.value is not None and str(cell.value).strip()
+    }
+    target_header = next(
+        (header for header in TARGET_SO_COMPLETE_DATE_HEADERS if header in df.columns and header in header_positions),
+        None,
+    )
+    if target_header is None:
+        return
+
+    target_dates = pd.to_datetime(df[target_header], errors="coerce", format="mixed")
+    target_column = header_positions[target_header]
+
+    for row_index, target_date in enumerate(target_dates, start=2):
+        if pd.isna(target_date):
+            continue
+
+        cell = worksheet.cell(row=row_index, column=target_column)
+        cell.value = target_date.to_pydatetime()
+        cell.number_format = EXCEL_DATE_DISPLAY_FORMAT
 
 
 def resolve_csv_files(input_path: Path) -> list[Path]:
