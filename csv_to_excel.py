@@ -34,6 +34,10 @@ PROCESS_ADJUSTMENT_HEADER = "Process Adjustment"
 SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div"
 LOOKUP_SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div."
 PHASE_HEADER_PREFIX = "Phase"
+FAB_UPLOAD_HEADER = "FAB Upload"
+YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
+RFS_COMMMIT_HEADER = "RFS Commmit"
+AGING_OF_RFS_HEADER = "Aging Of RFS"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
@@ -168,7 +172,53 @@ def drop_excluded_quo_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[~quo_values.str.contains(QUO_EXCLUDE_TERM, case=False, na=False)]
 
 
-def clean_dataframe(df: pd.DataFrame, options: ConvertOptions) -> pd.DataFrame:
+def add_year_fab_upload_column(df: pd.DataFrame) -> pd.DataFrame:
+    if FAB_UPLOAD_HEADER not in df.columns:
+        return df
+
+    result = df.copy()
+    fab_upload_dates = pd.to_datetime(result[FAB_UPLOAD_HEADER], errors="coerce", format="mixed")
+    year_values = pd.Series(pd.NA, index=result.index, dtype="string")
+    has_date = fab_upload_dates.notna()
+    year_values.loc[has_date] = fab_upload_dates.loc[has_date].dt.strftime("%Y")
+
+    if YEAR_FAB_UPLOAD_HEADER in result.columns:
+        result[YEAR_FAB_UPLOAD_HEADER] = year_values
+        return result
+
+    insert_at = result.columns.get_loc(FAB_UPLOAD_HEADER) + 1
+    result.insert(insert_at, YEAR_FAB_UPLOAD_HEADER, year_values)
+    return result
+
+
+def reference_date_from_csv_path(csv_path: Path) -> date:
+    match = re.search(r"(\d{8})", csv_path.stem)
+    if match:
+        return pd.to_datetime(match.group(1), format="%Y%m%d").date()
+
+    return date.today()
+
+
+def add_aging_of_rfs_column(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
+    if RFS_COMMMIT_HEADER not in df.columns:
+        return df
+
+    result = df.copy()
+    rfs_commit_dates = pd.to_datetime(result[RFS_COMMMIT_HEADER], errors="coerce", format="mixed")
+    aging_values = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    has_date = rfs_commit_dates.notna()
+    aging_values.loc[has_date] = (pd.Timestamp(reference_date) - rfs_commit_dates.loc[has_date]).dt.days
+
+    if AGING_OF_RFS_HEADER in result.columns:
+        result[AGING_OF_RFS_HEADER] = aging_values
+        return result
+
+    insert_at = result.columns.get_loc(RFS_COMMMIT_HEADER) + 1
+    result.insert(insert_at, AGING_OF_RFS_HEADER, aging_values)
+    return result
+
+
+def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -> pd.DataFrame:
     df = df.copy()
     df.columns = make_unique_columns(df.columns, options.normalize_headers)
     df = add_target_header(df)
@@ -185,6 +235,8 @@ def clean_dataframe(df: pd.DataFrame, options: ConvertOptions) -> pd.DataFrame:
             df[column] = cleaned.mask(cleaned.str.lower().isin(NULL_LIKE_VALUES), pd.NA)
 
     df = drop_excluded_quo_rows(df)
+    df = add_year_fab_upload_column(df)
+    df = add_aging_of_rfs_column(df, reference_date_from_csv_path(csv_path))
 
     if not options.keep_empty:
         df = df.dropna(how="all")
@@ -472,7 +524,7 @@ def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.
 
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df = clean_dataframe(read_csv(csv_path, options), options)
+    df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
     dept_sd_lookup, service_delivery_div_lookup, phase_lookup, process_adjustment_lookup, phase_header = load_lookup_mappings(
         resolve_vlookup_workbook()
     )
@@ -499,7 +551,7 @@ def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
         used_sheet_names: set[str] = set()
         with pd.ExcelWriter(options.output, engine="openpyxl") as writer:
             for csv_path in csv_files:
-                df = clean_dataframe(read_csv(csv_path, options), options)
+                df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
                 sheet_name = sanitize_sheet_name(csv_path, used_sheet_names)
                 write_excel_sheet(
                     writer,
