@@ -2,6 +2,8 @@
 
 Small Python CLI and Docker image for parsing CSV files, cleaning common formatting problems, and exporting `.xlsx` files.
 
+By default, the script reads CSV files from `.\input-today` and writes results to `.\output-today`.
+
 ## What It Cleans
 
 - Detects CSV encoding and delimiter when not provided.
@@ -19,19 +21,19 @@ Small Python CLI and Docker image for parsing CSV files, cleaning common formatt
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python csv_to_excel.py .\input\report.csv -o .\output\report.xlsx
+python csv_to_excel.py
 ```
 
 Convert every CSV in a folder to separate Excel files:
 
 ```powershell
-python csv_to_excel.py .\input -o .\output
+python csv_to_excel.py .\input-today -o .\output-today
 ```
 
 Combine every CSV in a folder into one workbook:
 
 ```powershell
-python csv_to_excel.py .\input -o .\output\combined.xlsx --combine
+python csv_to_excel.py .\input-today -o .\output-today\combined.xlsx --combine
 ```
 
 ## Run With Docker
@@ -45,19 +47,19 @@ docker build -t csv-to-excel .
 Convert one file:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input/report.csv -o /data/output/report.xlsx
+docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today/report.csv -o /data/output-today/report.xlsx
 ```
 
 Convert a folder:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input -o /data/output
+docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today -o /data/output-today
 ```
 
 Combine a folder into one workbook:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input -o /data/output/combined.xlsx --combine
+docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today -o /data/output-today/combined.xlsx --combine
 ```
 
 ## Useful Options

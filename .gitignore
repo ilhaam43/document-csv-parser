@@ -220,4 +220,6 @@ __marimo__/
 # Project runtime data
 input/
 output/
+input-today/
+output-today/
 ~$*.xlsx

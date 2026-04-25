@@ -19,8 +19,11 @@ from charset_normalizer import from_path
 COMMON_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin1")
 NULL_LIKE_VALUES = {"", "na", "n/a", "null", "none", "nan", "-"}
 EXCEL_MAX_SHEET_NAME_LENGTH = 31
+DEFAULT_INPUT_DIR = "input-today"
+DEFAULT_OUTPUT_DIR = "output-today"
 TARGET_HEADER_INSERT_AFTER = "Quo"
 TARGET_SOURCE_HEADER = "Target + On Hold Duration"
+QUO_EXCLUDE_TERM = "XBOT"
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,14 @@ def add_target_header(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def drop_excluded_quo_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if TARGET_HEADER_INSERT_AFTER not in df.columns:
+        return df
+
+    quo_values = df[TARGET_HEADER_INSERT_AFTER].astype("string")
+    return df.loc[~quo_values.str.contains(QUO_EXCLUDE_TERM, case=False, na=False)]
+
+
 def clean_dataframe(df: pd.DataFrame, options: ConvertOptions) -> pd.DataFrame:
     df = df.copy()
     df.columns = make_unique_columns(df.columns, options.normalize_headers)
@@ -161,6 +172,8 @@ def clean_dataframe(df: pd.DataFrame, options: ConvertOptions) -> pd.DataFrame:
                 .str.replace(r"\s+", " ", regex=True)
             )
             df[column] = cleaned.mask(cleaned.str.lower().isin(NULL_LIKE_VALUES), pd.NA)
+
+    df = drop_excluded_quo_rows(df)
 
     if not options.keep_empty:
         df = df.dropna(how="all")
@@ -265,10 +278,12 @@ def default_output_path(input_path: Path, combine: bool) -> Path:
     if input_path.is_file():
         return input_path.with_suffix(".xlsx")
 
-    if combine:
-        return input_path / "combined.xlsx"
+    output_dir = input_path.parent / DEFAULT_OUTPUT_DIR
 
-    return input_path / "excel"
+    if combine:
+        return output_dir / "combined.xlsx"
+
+    return output_dir
 
 
 def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.Namespace) -> Path:
@@ -316,12 +331,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Clean CSV data and export it to Excel (.xlsx).",
     )
-    parser.add_argument("input", type=Path, help="CSV file or directory containing CSV files.")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        type=Path,
+        default=Path(DEFAULT_INPUT_DIR),
+        help=f"CSV file or directory containing CSV files. Defaults to .\\{DEFAULT_INPUT_DIR}.",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="Output .xlsx file or output directory. Defaults next to the input.",
+        help=f"Output .xlsx file or output directory. Defaults to .\\{DEFAULT_OUTPUT_DIR} for directory input.",
     )
     parser.add_argument("--delimiter", help="CSV delimiter. Auto-detected when omitted.")
     parser.add_argument("--encoding", help="CSV encoding. Auto-detected when omitted.")
