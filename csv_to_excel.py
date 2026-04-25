@@ -38,6 +38,7 @@ FAB_UPLOAD_HEADER = "FAB Upload"
 YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
 RFS_COMMMIT_HEADER = "RFS Commmit"
 AGING_OF_RFS_HEADER = "Aging Of RFS"
+STATUS_ORDER_HEADER = "STATUS ORDER"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
@@ -218,6 +219,27 @@ def add_aging_of_rfs_column(df: pd.DataFrame, reference_date: date) -> pd.DataFr
     return result
 
 
+def add_status_order_column(df: pd.DataFrame) -> pd.DataFrame:
+    if AGING_OF_RFS_HEADER not in df.columns:
+        return df
+
+    result = df.copy()
+    aging_values = pd.to_numeric(result[AGING_OF_RFS_HEADER], errors="coerce")
+    status_order_values = pd.Series(pd.NA, index=result.index, dtype="string")
+    has_aging = aging_values.notna()
+    status_order_values.loc[has_aging] = "Delay"
+    status_order_values.loc[aging_values < 0] = "Potential Delay"
+    status_order_values.loc[aging_values < -5] = "On Track"
+
+    if STATUS_ORDER_HEADER in result.columns:
+        result[STATUS_ORDER_HEADER] = status_order_values
+        return result
+
+    insert_at = result.columns.get_loc(AGING_OF_RFS_HEADER) + 1
+    result.insert(insert_at, STATUS_ORDER_HEADER, status_order_values)
+    return result
+
+
 def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -> pd.DataFrame:
     df = df.copy()
     df.columns = make_unique_columns(df.columns, options.normalize_headers)
@@ -237,6 +259,7 @@ def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -
     df = drop_excluded_quo_rows(df)
     df = add_year_fab_upload_column(df)
     df = add_aging_of_rfs_column(df, reference_date_from_csv_path(csv_path))
+    df = add_status_order_column(df)
 
     if not options.keep_empty:
         df = df.dropna(how="all")
