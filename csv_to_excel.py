@@ -8,12 +8,15 @@ import csv
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 from charset_normalizer import from_path
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 COMMON_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin1")
@@ -41,6 +44,8 @@ AGING_OF_RFS_HEADER = "Aging Of RFS"
 STATUS_ORDER_HEADER = "STATUS ORDER"
 TARGET_SO_COMPLETE_DATE_HEADERS = ("Target SO Complete Date", "Target SO Completion Date")
 EXCEL_DATE_DISPLAY_FORMAT = "yyyy-mm-dd"
+EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
+EXCEL_HEADER_FONT_COLOR = "FFFFFF"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
@@ -502,8 +507,8 @@ def write_excel_sheet(
     )
     df.to_excel(writer, sheet_name=sheet_name, index=False)
     worksheet = writer.sheets[sheet_name]
-    worksheet.auto_filter.ref = worksheet.dimensions
     apply_target_so_complete_date_filter_format(worksheet, df)
+    apply_worksheet_presentation(worksheet)
 
 
 def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> None:
@@ -529,6 +534,55 @@ def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> 
         cell = worksheet.cell(row=row_index, column=target_column)
         cell.value = target_date.to_pydatetime()
         cell.number_format = EXCEL_DATE_DISPLAY_FORMAT
+
+
+def apply_worksheet_presentation(worksheet) -> None:
+    add_excel_table(worksheet)
+    autofit_worksheet_columns(worksheet)
+    style_header_row(worksheet)
+
+
+def add_excel_table(worksheet) -> None:
+    table_name = re.sub(r"[^A-Za-z0-9_]", "_", f"Table_{worksheet.title}") or "Table_1"
+    if table_name[0].isdigit():
+        table_name = f"Table_{table_name}"
+
+    table = Table(displayName=table_name, ref=worksheet.dimensions)
+    table.tableStyleInfo = TableStyleInfo(
+        name=EXCEL_TABLE_STYLE_NAME,
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    worksheet.add_table(table)
+
+
+def autofit_worksheet_columns(worksheet) -> None:
+    for column_cells in worksheet.iter_cols():
+        max_length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+
+        for cell in column_cells:
+            value = cell.value
+            if value is None:
+                continue
+
+            if isinstance(value, datetime):
+                rendered = value.strftime("%Y-%m-%d")
+            elif isinstance(value, date):
+                rendered = value.strftime("%Y-%m-%d")
+            else:
+                rendered = str(value)
+
+            max_length = max(max_length, len(rendered))
+
+        worksheet.column_dimensions[column_letter].width = max_length + 2
+
+
+def style_header_row(worksheet) -> None:
+    for cell in worksheet[1]:
+        cell.font = Font(color=EXCEL_HEADER_FONT_COLOR, bold=True)
 
 
 def resolve_csv_files(input_path: Path) -> list[Path]:
