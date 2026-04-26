@@ -58,7 +58,9 @@ EXCEL_RED_FONT_COLOR = "FF0000"
 EXCEL_RED_HEADER_FILL = "FF0000"
 EXCEL_YELLOW_HEADER_FILL = "FFFF00"
 EXCEL_HEADER_ROW_HEIGHT_POINTS = 22.5
+EXCEL_ON_PROGRESS_TAB_COLOR = "ADD8E6"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
+ON_PROGRESS_SHEET_PREFIX = "ALL ORDER ON PROGRESS"
 
 
 @dataclass(frozen=True)
@@ -173,7 +175,7 @@ def current_target_values(source: pd.Series) -> pd.Series:
     values = pd.Series("Target Not Yet Inputted", index=source.index, dtype="string")
 
     values[source_months < target_month] = f"Before {month_name}"
-    values[source_months == target_month] = f"This {month_name}"
+    values[source_months == target_month] = f"Target {month_name}"
     values[source_months > target_month] = f"After {month_name}"
 
     return values
@@ -369,7 +371,11 @@ def read_csv(path: Path, options: ConvertOptions) -> pd.DataFrame:
 def sanitize_sheet_name(path: Path, used: set[str]) -> str:
     base = re.sub(r"[\[\]\:\*\?\/\\]", "_", path.stem).strip() or "Sheet"
     base = base[:EXCEL_MAX_SHEET_NAME_LENGTH]
-    sheet_name = base
+    return make_unique_sheet_name(base, used)
+
+
+def make_unique_sheet_name(base: str, used: set[str]) -> str:
+    sheet_name = base[:EXCEL_MAX_SHEET_NAME_LENGTH] or "Sheet"
     suffix = 2
 
     while sheet_name in used:
@@ -379,6 +385,16 @@ def sanitize_sheet_name(path: Path, used: set[str]) -> str:
 
     used.add(sheet_name)
     return sheet_name
+
+
+def on_progress_sheet_name(csv_path: Path, used: set[str] | None = None) -> str:
+    reference_date = reference_date_from_csv_path(csv_path)
+    preferred = f"{ON_PROGRESS_SHEET_PREFIX} {reference_date.day} {reference_date.strftime('%b')}"
+
+    if used is None:
+        return preferred[:EXCEL_MAX_SHEET_NAME_LENGTH]
+
+    return make_unique_sheet_name(preferred, used)
 
 
 def resolve_vlookup_workbook() -> Path:
@@ -604,7 +620,7 @@ def write_excel_sheet(
     division_sales_lookup: dict[str, str],
     segment_sales_lookup: dict[str, str],
     phase_header: str,
-) -> None:
+) -> pd.DataFrame:
     df = apply_lookup_values(
         df,
         dept_sd_lookup,
@@ -621,6 +637,273 @@ def write_excel_sheet(
     worksheet = writer.sheets[sheet_name]
     apply_target_so_complete_date_filter_format(worksheet, df)
     apply_worksheet_presentation(worksheet)
+    return df
+
+
+def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: Path, sheet_name: str) -> None:
+    target_header = next((column for column in df.columns if str(column).startswith("TARGET")), None)
+    if target_header is None or QUO_HEADER not in df.columns or PHASE_HEADER_PREFIX not in df.columns:
+        return
+
+    reference_date = reference_date_from_csv_path(csv_path)
+    month_name = reference_date.strftime("%B")
+    target_month_label = f"Target {month_name}"
+    source_month_label = f"This {month_name}"
+    filtered_all = df.copy()
+    if YEAR_FAB_UPLOAD_HEADER in filtered_all.columns:
+        year_values = filtered_all[YEAR_FAB_UPLOAD_HEADER].astype("string").str.strip().fillna("")
+        filtered_all = filtered_all[~year_values.str.lower().isin({"", "nan", "none", "n/a", "(blank)", "null"})]
+
+    filtered_table_2 = filtered_all.copy()
+    if PHASE_HEADER_PREFIX in filtered_table_2.columns:
+        phase_values = filtered_table_2[PHASE_HEADER_PREFIX].astype("string").str.strip().str.lower()
+        filtered_table_2 = filtered_table_2[~phase_values.isin({"cancel", "so complete"})]
+
+    pivot_all = pd.pivot_table(
+        filtered_all,
+        index=target_header,
+        values=QUO_HEADER,
+        aggfunc="count",
+        fill_value=0,
+    )
+    counts_all = {str(index): int(row[QUO_HEADER]) for index, row in pivot_all.iterrows()}
+    if source_month_label in counts_all:
+        counts_all[target_month_label] = counts_all.pop(source_month_label)
+
+    pivot_table_2 = pd.pivot_table(
+        filtered_table_2,
+        index=target_header,
+        values=QUO_HEADER,
+        aggfunc="count",
+        fill_value=0,
+    )
+    counts_table_2 = {str(index): int(row[QUO_HEADER]) for index, row in pivot_table_2.iterrows()}
+    if source_month_label in counts_table_2:
+        counts_table_2[target_month_label] = counts_table_2.pop(source_month_label)
+
+    worksheet = writer.book.create_sheet(title=sheet_name)
+    writer.sheets[sheet_name] = worksheet
+    worksheet.sheet_properties.tabColor = EXCEL_ON_PROGRESS_TAB_COLOR
+    write_on_progress_filters(worksheet, start_col=1, phase_value="(All)")
+    write_on_progress_filters(worksheet, start_col=4, phase_value="(Multiple Items)")
+    write_on_progress_table(
+        worksheet,
+        start_row=5,
+        start_col=1,
+        labels=[target_month_label, f"After {month_name}"],
+        counts=counts_all,
+    )
+    write_on_progress_table(
+        worksheet,
+        start_row=5,
+        start_col=4,
+        labels=[f"Before {month_name}", "Target Not Yet Inputted"],
+        counts=counts_table_2,
+    )
+
+    autofit_worksheet_columns(worksheet)
+
+
+def write_on_progress_filters(worksheet, start_col: int, phase_value: str) -> None:
+    worksheet.cell(row=1, column=start_col, value=PHASE_HEADER_PREFIX)
+    worksheet.cell(row=1, column=start_col + 1, value=phase_value)
+    worksheet.cell(row=2, column=start_col, value=PROCESS_ADJUSTMENT_HEADER)
+    worksheet.cell(row=2, column=start_col + 1, value="(All)")
+    worksheet.cell(row=3, column=start_col, value=YEAR_FAB_UPLOAD_HEADER)
+    worksheet.cell(row=3, column=start_col + 1, value="(Multiple Items)")
+
+
+def write_on_progress_table(
+    worksheet,
+    start_row: int,
+    start_col: int,
+    labels: list[str],
+    counts: dict[str, int],
+) -> None:
+    worksheet.cell(row=start_row, column=start_col, value="Row Labels")
+    worksheet.cell(row=start_row, column=start_col + 1, value="Count of quo")
+    for cell in worksheet[start_row]:
+        if cell.column in {start_col, start_col + 1}:
+            cell.font = Font(bold=True)
+
+    row_index = start_row + 1
+    subtotal = 0
+    for label in labels:
+        if label not in counts:
+            continue
+
+        worksheet.cell(row=row_index, column=start_col, value=label)
+        worksheet.cell(row=row_index, column=start_col + 1, value=counts[label])
+        subtotal += counts[label]
+        row_index += 1
+
+    worksheet.cell(row=row_index, column=start_col, value="Grand Total")
+    worksheet.cell(row=row_index, column=start_col + 1, value=subtotal)
+
+
+def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_header: str) -> None:
+    """Post-process the saved workbook via the Excel COM API to add real PivotTables."""
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        print("[warn] pywin32 not installed – skipping real PivotTable creation.", file=sys.stderr)
+        return
+
+    xl = None
+    wb = None
+    try:
+        xl = win32com.client.DispatchEx("Excel.Application")
+        xl.Visible = False
+        xl.DisplayAlerts = False
+
+        wb = xl.Workbooks.Open(str(output_path.resolve()))
+        data_sheet = None
+        progress_sheet = None
+        for sheet in wb.Sheets:
+            if sheet.Name == VLOOKUP_SHEET_NAME:
+                data_sheet = sheet
+            elif sheet.Name == on_progress_name:
+                progress_sheet = sheet
+
+        if data_sheet is None or progress_sheet is None:
+            print("[warn] Could not find required sheets for PivotTable creation.", file=sys.stderr)
+            return
+
+        # Clear the existing static summary that openpyxl wrote
+        progress_sheet.Cells.Clear()
+
+        # Build the PivotCache from the ALL ORDER sheet data range
+        data_range = data_sheet.UsedRange
+        pivot_cache = wb.PivotCaches().Create(
+            SourceType=1,  # xlDatabase
+            SourceData=data_range,
+        )
+
+        # Constants
+        xlRowField   = 1
+        xlPageField  = 3
+        xlCount      = -4112
+        xlTabularRow = 0
+
+        BLANK_LIKE = {"", "nan", "none", "n/a", "(blank)", "null"}
+        date_match = re.search(r"(\d{1,2}) ([A-Za-z]{3})$", on_progress_name)
+        month_short = date_match.group(2) if date_match else ""
+        month_full = datetime.strptime(month_short, "%b").strftime("%B") if month_short else ""
+        source_month_label = f"This {month_full}" if month_full else ""
+        target_month_label = f"Target {month_full}" if month_full else ""
+
+        def _build_pivot(
+            top_left_cell,
+            table_name: str,
+            visible_row_items: set[str] | None = None,
+            exclude_phase_values: set[str] | None = None,
+        ) -> None:
+            table_range = progress_sheet.Range(top_left_cell)
+            pt = pivot_cache.CreatePivotTable(
+                TableDestination=table_range,
+                TableName=table_name,
+            )
+            pt.ManualUpdate = True
+
+            # --- Filter: YEAR FAB UPLOAD (all except blank-like values) ---
+            try:
+                year_field = pt.PivotFields(YEAR_FAB_UPLOAD_HEADER)
+                year_field.Orientation = xlPageField
+                year_field.EnableMultiplePageItems = True
+                for item in year_field.PivotItems():
+                    if str(item.Value).strip().lower() in BLANK_LIKE:
+                        item.Visible = False
+            except Exception:
+                pass
+
+            # --- Filter: Process Adjustment (All) ---
+            try:
+                pt.PivotFields(PROCESS_ADJUSTMENT_HEADER).Orientation = xlPageField
+            except Exception:
+                pass
+
+            # --- Filter: Phase (All or multiple items with exclusions) ---
+            try:
+                phase_field = pt.PivotFields(PHASE_HEADER_PREFIX)
+                phase_field.Orientation = xlPageField
+                if exclude_phase_values:
+                    phase_field.EnableMultiplePageItems = True
+                    excluded_lower = {value.lower() for value in exclude_phase_values}
+                    for item in phase_field.PivotItems():
+                        if str(item.Value).strip().lower() in excluded_lower:
+                            item.Visible = False
+            except Exception:
+                pass
+
+            # --- Row field: TARGET Determined as 1 <Month Year> ---
+            try:
+                rf = pt.PivotFields(target_header)
+                rf.Orientation = xlRowField
+                rf.LayoutForm = xlTabularRow
+                if visible_row_items:
+                    visible_lower = {value.lower() for value in visible_row_items}
+                    for item in rf.PivotItems():
+                        item_name = str(item.Name).strip()
+                        compare_name = target_month_label if item_name == source_month_label else item_name
+                        item.Visible = compare_name.lower() in visible_lower
+            except Exception:
+                pass
+
+            # --- Value field: Count of quo ---
+            try:
+                df_field = pt.AddDataField(
+                    pt.PivotFields(QUO_HEADER),
+                    "Count of quo",
+                    xlCount,
+                )
+                df_field.NumberFormat = "0"
+            except Exception:
+                pass
+
+            try:
+                pt.TableStyle2 = "PivotStyleMedium2"
+            except Exception:
+                pass
+
+            pt.ManualUpdate = False
+            pt.Update()
+
+            if source_month_label and target_month_label:
+                try:
+                    rf = pt.PivotFields(target_header)
+                    for item in rf.PivotItems():
+                        if str(item.Name).strip() == source_month_label:
+                            item.Caption = target_month_label
+                except Exception:
+                    pass
+
+        _build_pivot(
+            "A1",
+            f"PivotTable_{on_progress_name}_1",
+            visible_row_items={target_month_label, f"After {month_full}"} if month_full else None,
+        )
+        _build_pivot(
+            "D1",
+            f"PivotTable_{on_progress_name}_2",
+            visible_row_items={f"Before {month_full}", "Target Not Yet Inputted"} if month_full else None,
+            exclude_phase_values={"cancel", "so complete"},
+        )
+
+        wb.Save()
+        print(f"[info] Added PivotTables to '{on_progress_name}' in {output_path.name}")
+    except Exception as exc:
+        print(f"[warn] Could not add PivotTables via COM: {exc}", file=sys.stderr)
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if xl is not None:
+            try:
+                xl.Quit()
+            except Exception:
+                pass
 
 
 def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> None:
@@ -799,8 +1082,10 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
         segment_sales_lookup,
         phase_header,
     ) = load_lookup_mappings(resolve_vlookup_workbook())
+    progress_sheet_name = on_progress_sheet_name(csv_path)
+    target_header = next((col for col in df.columns if str(col).startswith("TARGET")), "")
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        write_excel_sheet(
+        output_df = write_excel_sheet(
             writer,
             df,
             VLOOKUP_SHEET_NAME,
@@ -814,7 +1099,10 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
             segment_sales_lookup,
             phase_header,
         )
+        write_on_progress_sheet(writer, output_df, csv_path, progress_sheet_name)
     print(f"Wrote {output_path}")
+    if target_header:
+        add_pivot_tables_via_com(output_path, progress_sheet_name, target_header)
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
@@ -836,7 +1124,7 @@ def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
             for csv_path in csv_files:
                 df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
                 sheet_name = sanitize_sheet_name(csv_path, used_sheet_names)
-                write_excel_sheet(
+                output_df = write_excel_sheet(
                     writer,
                     df,
                     sheet_name,
@@ -850,7 +1138,12 @@ def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
                     segment_sales_lookup,
                     phase_header,
                 )
+                ps_name = on_progress_sheet_name(csv_path, used_sheet_names)
+                target_hdr = next((col for col in output_df.columns if str(col).startswith("TARGET")), "")
+                write_on_progress_sheet(writer, output_df, csv_path, ps_name)
         print(f"Wrote {options.output}")
+        if target_hdr:
+            add_pivot_tables_via_com(options.output, ps_name, target_hdr)
         return
 
     options.output.mkdir(parents=True, exist_ok=True)
