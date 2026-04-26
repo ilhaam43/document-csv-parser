@@ -14,7 +14,7 @@ from typing import Iterable
 
 import pandas as pd
 from charset_normalizer import from_path
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -34,8 +34,16 @@ QUO_HEADER = "Quo"
 STATUS_HEADER = "Status"
 PROCESS_HEADER = "Process"
 PROCESS_ADJUSTMENT_HEADER = "Process Adjustment"
+PRODUCT_CATEGORY_HEADER = "Product Category"
+GROUP_SALES_HEADER = "group_sales"
+DIVISION_SALES_HEADER = "Division_sales"
+SEGMENT_SALES_HEADER = "segment_sales"
+SALES_HEADER = "Sales"
 SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div"
 LOOKUP_SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div."
+LOOKUP_GROUP_SALES_HEADER = "Group Sales"
+LOOKUP_DIVISION_SALES_HEADER = "Division Sales"
+LOOKUP_SEGMENT_SALES_HEADER = "Segment Sales"
 PHASE_HEADER_PREFIX = "Phase"
 FAB_UPLOAD_HEADER = "FAB Upload"
 YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
@@ -46,6 +54,10 @@ TARGET_SO_COMPLETE_DATE_HEADERS = ("Target SO Complete Date", "Target SO Complet
 EXCEL_DATE_DISPLAY_FORMAT = "yyyy-mm-dd"
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 EXCEL_HEADER_FONT_COLOR = "FFFFFF"
+EXCEL_RED_FONT_COLOR = "FF0000"
+EXCEL_RED_HEADER_FILL = "FF0000"
+EXCEL_YELLOW_HEADER_FILL = "FFFF00"
+EXCEL_HEADER_ROW_HEIGHT_POINTS = 22.5
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 
 
@@ -119,6 +131,16 @@ def make_unique_columns(columns: Iterable[object], normalize: bool) -> list[str]
         names.append(name if count == 0 else f"{name} ({count + 1})")
 
     return names
+
+
+def rename_output_headers(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(
+        columns={
+            "Group Sales": GROUP_SALES_HEADER,
+            "Division Sales": DIVISION_SALES_HEADER,
+            "Segment Sales": SEGMENT_SALES_HEADER,
+        }
+    )
 
 
 def escape_excel_formula_text(value: object) -> object:
@@ -207,6 +229,11 @@ def reference_date_from_csv_path(csv_path: Path) -> date:
     return date.today()
 
 
+def output_filename_from_csv_path(csv_path: Path) -> str:
+    reference_date = reference_date_from_csv_path(csv_path)
+    return f"Daily Tracking {reference_date.day} {reference_date.strftime('%B %Y')}.xlsx"
+
+
 def add_aging_of_rfs_column(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
     if RFS_COMMMIT_HEADER not in df.columns:
         return df
@@ -250,6 +277,7 @@ def add_status_order_column(df: pd.DataFrame) -> pd.DataFrame:
 def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -> pd.DataFrame:
     df = df.copy()
     df.columns = make_unique_columns(df.columns, options.normalize_headers)
+    df = rename_output_headers(df)
     df = add_target_header(df)
 
     for column in df.columns:
@@ -374,7 +402,7 @@ def phase_lookup_header(lookup_workbook: Path) -> str:
 
 def load_lookup_mappings(
     lookup_workbook: Path,
-) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str], str]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str], dict[str, str], dict[str, str], dict[str, str], dict[str, str], str]:
     lookup_df = pd.read_excel(lookup_workbook, sheet_name=VLOOKUP_SHEET_NAME, dtype="string")
     lookup_df.columns = make_unique_columns(lookup_df.columns, normalize=True)
     if (
@@ -384,11 +412,18 @@ def load_lookup_mappings(
         or QUO_HEADER not in lookup_df.columns
         or PHASE_HEADER_PREFIX not in lookup_df.columns
         or PROCESS_ADJUSTMENT_HEADER not in lookup_df.columns
+        or PRODUCT_CATEGORY_HEADER not in lookup_df.columns
+        or SALES_HEADER not in lookup_df.columns
+        or LOOKUP_GROUP_SALES_HEADER not in lookup_df.columns
+        or LOOKUP_DIVISION_SALES_HEADER not in lookup_df.columns
+        or LOOKUP_SEGMENT_SALES_HEADER not in lookup_df.columns
     ):
         raise ValueError(
             "Lookup workbook must contain "
             f"'{PM_HEADER}', '{DEPT_SD_HEADER}', '{LOOKUP_SERVICE_DELIVERY_DIV_HEADER}', "
-            f"'{QUO_HEADER}', '{PHASE_HEADER_PREFIX}', and '{PROCESS_ADJUSTMENT_HEADER}' "
+            f"'{QUO_HEADER}', '{PHASE_HEADER_PREFIX}', '{PROCESS_ADJUSTMENT_HEADER}', and "
+            f"'{PRODUCT_CATEGORY_HEADER}', '{SALES_HEADER}', '{LOOKUP_GROUP_SALES_HEADER}', and "
+            f"'{LOOKUP_DIVISION_SALES_HEADER}', and '{LOOKUP_SEGMENT_SALES_HEADER}' "
             f"columns in sheet '{VLOOKUP_SHEET_NAME}'."
         )
 
@@ -396,6 +431,10 @@ def load_lookup_mappings(
     service_delivery_div_mapping: dict[str, str] = {}
     phase_mapping: dict[str, str] = {}
     process_adjustment_mapping: dict[str, str] = {}
+    product_category_mapping: dict[str, str] = {}
+    group_sales_mapping: dict[str, str] = {}
+    division_sales_mapping: dict[str, str] = {}
+    segment_sales_mapping: dict[str, str] = {}
     for _, row in lookup_df[
         [
             PM_HEADER,
@@ -404,6 +443,11 @@ def load_lookup_mappings(
             QUO_HEADER,
             PHASE_HEADER_PREFIX,
             PROCESS_ADJUSTMENT_HEADER,
+            PRODUCT_CATEGORY_HEADER,
+            SALES_HEADER,
+            LOOKUP_GROUP_SALES_HEADER,
+            LOOKUP_DIVISION_SALES_HEADER,
+            LOOKUP_SEGMENT_SALES_HEADER,
         ]
     ].dropna(
         subset=[PM_HEADER]
@@ -429,11 +473,32 @@ def load_lookup_mappings(
         if quo_value and quo_value not in process_adjustment_mapping and not pd.isna(process_adjustment_value):
             process_adjustment_mapping[quo_value] = str(process_adjustment_value).strip()
 
+        product_category_value = row[PRODUCT_CATEGORY_HEADER]
+        if quo_value and quo_value not in product_category_mapping and not pd.isna(product_category_value):
+            product_category_mapping[quo_value] = str(product_category_value).strip()
+
+        sales_value = str(row[SALES_HEADER]).strip()
+        group_sales_value = row[LOOKUP_GROUP_SALES_HEADER]
+        if sales_value and sales_value not in group_sales_mapping and not pd.isna(group_sales_value):
+            group_sales_mapping[sales_value] = str(group_sales_value).strip()
+
+        division_sales_value = row[LOOKUP_DIVISION_SALES_HEADER]
+        if sales_value and sales_value not in division_sales_mapping and not pd.isna(division_sales_value):
+            division_sales_mapping[sales_value] = str(division_sales_value).strip()
+
+        segment_sales_value = row[LOOKUP_SEGMENT_SALES_HEADER]
+        if sales_value and sales_value not in segment_sales_mapping and not pd.isna(segment_sales_value):
+            segment_sales_mapping[sales_value] = str(segment_sales_value).strip()
+
     return (
         dept_sd_mapping,
         service_delivery_div_mapping,
         phase_mapping,
         process_adjustment_mapping,
+        product_category_mapping,
+        group_sales_mapping,
+        division_sales_mapping,
+        segment_sales_mapping,
         phase_lookup_header(lookup_workbook),
     )
 
@@ -444,6 +509,10 @@ def apply_lookup_values(
     service_delivery_div_lookup: dict[str, str],
     phase_lookup: dict[str, str],
     process_adjustment_lookup: dict[str, str],
+    product_category_lookup: dict[str, str],
+    group_sales_lookup: dict[str, str],
+    division_sales_lookup: dict[str, str],
+    segment_sales_lookup: dict[str, str],
     phase_header: str,
 ) -> pd.DataFrame:
     if PM_HEADER not in df.columns and QUO_HEADER not in df.columns:
@@ -463,6 +532,34 @@ def apply_lookup_values(
         else:
             insert_at = result.columns.get_loc(DEPT_SD_HEADER) + 1 if DEPT_SD_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, SERVICE_DELIVERY_DIV_HEADER, looked_up_service_delivery_div)
+
+    if SALES_HEADER in result.columns:
+        looked_up_group_sales = pd.Series(
+            result[SALES_HEADER].astype("string").str.strip().map(group_sales_lookup),
+            index=result.index,
+            dtype="string",
+        )
+        if GROUP_SALES_HEADER in result.columns:
+            result[GROUP_SALES_HEADER] = looked_up_group_sales
+
+        looked_up_division_sales = pd.Series(
+            result[SALES_HEADER].astype("string").str.strip().map(division_sales_lookup),
+            index=result.index,
+            dtype="string",
+        )
+        if DIVISION_SALES_HEADER in result.columns:
+            result[DIVISION_SALES_HEADER] = looked_up_division_sales
+        else:
+            insert_at = result.columns.get_loc(GROUP_SALES_HEADER) + 1 if GROUP_SALES_HEADER in result.columns else len(result.columns)
+            result.insert(insert_at, DIVISION_SALES_HEADER, looked_up_division_sales)
+
+        looked_up_segment_sales = pd.Series(
+            result[SALES_HEADER].astype("string").str.strip().map(segment_sales_lookup),
+            index=result.index,
+            dtype="string",
+        )
+        if SEGMENT_SALES_HEADER in result.columns:
+            result[SEGMENT_SALES_HEADER] = looked_up_segment_sales
 
     if QUO_HEADER in result.columns:
         quo_values = result[QUO_HEADER].astype("string").str.strip()
@@ -484,6 +581,13 @@ def apply_lookup_values(
             insert_at = result.columns.get_loc(PROCESS_HEADER) + 1 if PROCESS_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, PROCESS_ADJUSTMENT_HEADER, looked_up_process_adjustment)
 
+        if PRODUCT_CATEGORY_HEADER in result.columns:
+            result[PRODUCT_CATEGORY_HEADER] = pd.Series(
+                quo_values.map(product_category_lookup),
+                index=result.index,
+                dtype="string",
+            )
+
     return result
 
 
@@ -495,6 +599,10 @@ def write_excel_sheet(
     service_delivery_div_lookup: dict[str, str],
     phase_lookup: dict[str, str],
     process_adjustment_lookup: dict[str, str],
+    product_category_lookup: dict[str, str],
+    group_sales_lookup: dict[str, str],
+    division_sales_lookup: dict[str, str],
+    segment_sales_lookup: dict[str, str],
     phase_header: str,
 ) -> None:
     df = apply_lookup_values(
@@ -503,6 +611,10 @@ def write_excel_sheet(
         service_delivery_div_lookup,
         phase_lookup,
         process_adjustment_lookup,
+        product_category_lookup,
+        group_sales_lookup,
+        division_sales_lookup,
+        segment_sales_lookup,
         phase_header,
     )
     df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -581,8 +693,52 @@ def autofit_worksheet_columns(worksheet) -> None:
 
 
 def style_header_row(worksheet) -> None:
+    worksheet.row_dimensions[1].height = EXCEL_HEADER_ROW_HEIGHT_POINTS
     for cell in worksheet[1]:
-        cell.font = Font(color=EXCEL_HEADER_FONT_COLOR, bold=True)
+        fill_color = header_fill_color(cell.value)
+        font_color = EXCEL_RED_FONT_COLOR if fill_color == EXCEL_YELLOW_HEADER_FILL else EXCEL_HEADER_FONT_COLOR
+        cell.font = Font(color=font_color, bold=True)
+        if fill_color is not None:
+            cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+
+
+def header_fill_color(header_value: object) -> str | None:
+    normalized = normalize_header_key(header_value)
+    if not normalized:
+        return None
+
+    if (
+        normalized in {
+            normalize_header_key(DEPT_SD_HEADER),
+            normalize_header_key(SERVICE_DELIVERY_DIV_HEADER),
+            normalize_header_key(STATUS_ORDER_HEADER),
+            normalize_header_key(GROUP_SALES_HEADER),
+            normalize_header_key(DIVISION_SALES_HEADER),
+            normalize_header_key(SEGMENT_SALES_HEADER),
+            normalize_header_key(SALES_HEADER),
+            normalize_header_key("Target SO Completion Date"),
+            normalize_header_key("Target SO Complete Date"),
+        }
+        or normalized.startswith("targetdeterminedas")
+        or normalized.startswith("targetdeteminedas")
+    ):
+        return EXCEL_RED_HEADER_FILL
+
+    if (
+        normalized in {
+            normalize_header_key(PROCESS_ADJUSTMENT_HEADER),
+            normalize_header_key(AGING_OF_RFS_HEADER),
+            normalize_header_key(YEAR_FAB_UPLOAD_HEADER),
+        }
+        or normalized.startswith("phase") and normalized != normalize_header_key(PHASE_HEADER_PREFIX)
+    ):
+        return EXCEL_YELLOW_HEADER_FILL
+
+    return None
+
+
+def normalize_header_key(header_value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(header_value).lower())
 
 
 def resolve_csv_files(input_path: Path) -> list[Path]:
@@ -601,7 +757,7 @@ def resolve_csv_files(input_path: Path) -> list[Path]:
 
 def default_output_path(input_path: Path, combine: bool) -> Path:
     if input_path.is_file():
-        return input_path.with_suffix(".xlsx")
+        return input_path.parent / output_filename_from_csv_path(input_path)
 
     output_dir = input_path.parent / DEFAULT_OUTPUT_DIR
 
@@ -615,7 +771,7 @@ def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.
     output = args.output or default_output_path(input_path, args.combine)
 
     if input_path.is_file() and (output.exists() and output.is_dir()):
-        return output / f"{input_path.stem}.xlsx"
+        return output / output_filename_from_csv_path(input_path)
 
     if input_path.is_dir() and args.combine and output.suffix.lower() != ".xlsx":
         return output / "combined.xlsx"
@@ -632,27 +788,47 @@ def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
-    dept_sd_lookup, service_delivery_div_lookup, phase_lookup, process_adjustment_lookup, phase_header = load_lookup_mappings(
-        resolve_vlookup_workbook()
-    )
+    (
+        dept_sd_lookup,
+        service_delivery_div_lookup,
+        phase_lookup,
+        process_adjustment_lookup,
+        product_category_lookup,
+        group_sales_lookup,
+        division_sales_lookup,
+        segment_sales_lookup,
+        phase_header,
+    ) = load_lookup_mappings(resolve_vlookup_workbook())
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         write_excel_sheet(
             writer,
             df,
-            "Sheet1",
+            VLOOKUP_SHEET_NAME,
             dept_sd_lookup,
             service_delivery_div_lookup,
             phase_lookup,
             process_adjustment_lookup,
+            product_category_lookup,
+            group_sales_lookup,
+            division_sales_lookup,
+            segment_sales_lookup,
             phase_header,
         )
     print(f"Wrote {output_path}")
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
-    dept_sd_lookup, service_delivery_div_lookup, phase_lookup, process_adjustment_lookup, phase_header = load_lookup_mappings(
-        resolve_vlookup_workbook()
-    )
+    (
+        dept_sd_lookup,
+        service_delivery_div_lookup,
+        phase_lookup,
+        process_adjustment_lookup,
+        product_category_lookup,
+        group_sales_lookup,
+        division_sales_lookup,
+        segment_sales_lookup,
+        phase_header,
+    ) = load_lookup_mappings(resolve_vlookup_workbook())
     if options.combine:
         options.output.parent.mkdir(parents=True, exist_ok=True)
         used_sheet_names: set[str] = set()
@@ -668,6 +844,10 @@ def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
                     service_delivery_div_lookup,
                     phase_lookup,
                     process_adjustment_lookup,
+                    product_category_lookup,
+                    group_sales_lookup,
+                    division_sales_lookup,
+                    segment_sales_lookup,
                     phase_header,
                 )
         print(f"Wrote {options.output}")
@@ -675,7 +855,7 @@ def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
 
     options.output.mkdir(parents=True, exist_ok=True)
     for csv_path in csv_files:
-        convert_one(csv_path, options.output / f"{csv_path.stem}.xlsx", options)
+        convert_one(csv_path, options.output / output_filename_from_csv_path(csv_path), options)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
