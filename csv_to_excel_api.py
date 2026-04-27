@@ -94,6 +94,7 @@ class ConvertOptions:
     infer_types: bool
     combine: bool
     refresh_template: bool = True
+    lookup_workbook: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -439,6 +440,10 @@ def resolve_vlookup_workbook() -> Path:
         raise FileNotFoundError(f"No lookup workbook found in: {lookup_dir}")
 
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def lookup_workbook_for_options(options: ConvertOptions) -> Path:
+    return options.lookup_workbook or resolve_vlookup_workbook()
 
 
 def phase_lookup_header(lookup_workbook: Path) -> str:
@@ -1898,6 +1903,7 @@ def build_options(args: argparse.Namespace, output_path: Path) -> ConvertOptions
         infer_types=args.infer_types,
         combine=args.combine,
         refresh_template=not args.skip_template_refresh,
+        lookup_workbook=None,
     )
 
 
@@ -1912,7 +1918,7 @@ def convert_csv_files(input_path: Path, csv_files: list[Path], output_path: Path
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
-    lookup_workbook = resolve_vlookup_workbook()
+    lookup_workbook = lookup_workbook_for_options(options)
     mappings = load_lookup_mappings(lookup_workbook)
     progress_sheet_name = on_progress_sheet_name(csv_path)
 
@@ -1944,7 +1950,7 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
-    mappings = load_lookup_mappings(resolve_vlookup_workbook())
+    mappings = load_lookup_mappings(lookup_workbook_for_options(options))
     if options.combine:
         options.output.parent.mkdir(parents=True, exist_ok=True)
         used_sheet_names: set[str] = set()

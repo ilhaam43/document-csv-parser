@@ -47,19 +47,69 @@ docker build -t csv-to-excel .
 Convert one file:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today/report.csv -o /data/output-today/report.xlsx
+docker run --rm `
+  -v "${PWD}:/data" `
+  -v "${PWD}\vlookup-yesterday:/app/vlookup-yesterday:ro" `
+  csv-to-excel python /app/csv_to_excel.py /data/input-today/report.csv -o /data/output-today/report.xlsx --skip-template-refresh
 ```
 
 Convert a folder:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today -o /data/output-today
+docker run --rm `
+  -v "${PWD}:/data" `
+  -v "${PWD}\vlookup-yesterday:/app/vlookup-yesterday:ro" `
+  csv-to-excel python /app/csv_to_excel.py /data/input-today -o /data/output-today --skip-template-refresh
 ```
 
 Combine a folder into one workbook:
 
 ```powershell
-docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today -o /data/output-today/combined.xlsx --combine
+docker run --rm `
+  -v "${PWD}:/data" `
+  -v "${PWD}\vlookup-yesterday:/app/vlookup-yesterday:ro" `
+  csv-to-excel python /app/csv_to_excel.py /data/input-today -o /data/output-today/combined.xlsx --combine
+```
+
+## Run API With Docker Compose
+
+Start the FastAPI service:
+
+```powershell
+docker compose up --build
+```
+
+The API listens on `http://localhost:8000`.
+
+Health check:
+
+```powershell
+curl http://localhost:8000/health
+```
+
+Convert the mounted `.\input-today` folder and write to `.\output-today`:
+
+```powershell
+curl -X POST http://localhost:8000/convert/path `
+  -H "Content-Type: application/json" `
+  -d "{\"input_path\":\"input-today\",\"output_path\":\"output-today\",\"refresh_template\":false}"
+```
+
+Upload one raw CSV plus yesterday's cleaned Excel workbook and receive a JSON success response:
+
+```powershell
+curl -X POST http://localhost:8000/convert/upload `
+  -F "raw_data=@.\input-today\report.csv;type=text/csv" `
+  -F "yesterday_cleaned_data=@.\vlookup-yesterday\Daily Tracking 23 April 2026.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" `
+  -F "refresh_template=false"
+```
+
+The response includes a `download_url` field with a full link to download the generated Excel workbook.
+
+The Docker API defaults to portable workbook generation (`refresh_template=false`) because Linux containers cannot automate Microsoft Excel through Windows COM. On Windows, the CLI can still refresh the template by default. Use `--skip-template-refresh` for portable CLI output:
+
+```powershell
+python csv_to_excel.py .\input-today -o .\output-today --skip-template-refresh
 ```
 
 ## Useful Options
@@ -72,4 +122,5 @@ docker run --rm -v "${PWD}:/data" csv-to-excel /data/input-today -o /data/output
 --keep-empty             Keep fully empty rows and columns.
 --drop-empty-columns     Drop columns where all values are empty.
 --no-normalize-headers   Keep original column names.
+--skip-template-refresh  Skip Windows Excel COM template refresh.
 ```

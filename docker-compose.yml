@@ -1,0 +1,13 @@
+services:
+  report-csv-api:
+    build: .
+    container_name: report-csv-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./input-today:/app/input-today
+      - ./output-today:/app/output-today
+      - ./vlookup-yesterday:/app/vlookup-yesterday:ro
+    environment:
+      CSV_TO_EXCEL_SKIP_TEMPLATE_REFRESH: "1"
+    restart: unless-stopped

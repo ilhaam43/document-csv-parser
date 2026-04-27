@@ -8,7 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY csv_to_excel.py .
+COPY csv_to_excel.py csv_to_excel_api.py app.py ./
+RUN mkdir -p input-today output-today vlookup-yesterday
 
-ENTRYPOINT ["python", "/app/csv_to_excel.py"]
-CMD ["--help"]
+EXPOSE 8000
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
