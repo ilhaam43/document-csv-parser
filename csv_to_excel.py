@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -44,6 +46,7 @@ LOOKUP_SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div."
 LOOKUP_GROUP_SALES_HEADER = "Group Sales"
 LOOKUP_DIVISION_SALES_HEADER = "Division Sales"
 LOOKUP_SEGMENT_SALES_HEADER = "Segment Sales"
+PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER = "Service Delivery Div. "
 PHASE_HEADER_PREFIX = "Phase"
 FAB_UPLOAD_HEADER = "FAB Upload"
 YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
@@ -59,8 +62,10 @@ EXCEL_RED_HEADER_FILL = "FF0000"
 EXCEL_YELLOW_HEADER_FILL = "FFFF00"
 EXCEL_HEADER_ROW_HEIGHT_POINTS = 22.5
 EXCEL_ON_PROGRESS_TAB_COLOR = "ADD8E6"
+EXCEL_PIVOT_TAB_COLOR = "FFFF00"
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 ON_PROGRESS_SHEET_PREFIX = "ALL ORDER ON PROGRESS"
+PIVOT_SHEET_NAME = "PIVOT"
 
 
 @dataclass(frozen=True)
@@ -640,6 +645,107 @@ def write_excel_sheet(
     return df
 
 
+def pivot_template_target_header(csv_path: Path) -> str:
+    reference_date = reference_date_from_csv_path(csv_path)
+    return f"TARGET  Detemined as 1 {reference_date.strftime('%b')} {reference_date.strftime('%y')}"
+
+
+def add_pivot_template_compatibility_columns(
+    df: pd.DataFrame,
+    csv_path: Path,
+    target_header: str,
+    phase_header: str,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Add hidden source fields required by the copied PIVOT sheet."""
+    result = df.copy()
+    hidden_columns: set[str] = set()
+
+    short_target_header = pivot_template_target_header(csv_path)
+    if target_header and target_header in result.columns and short_target_header not in result.columns:
+        result[short_target_header] = result[target_header]
+        hidden_columns.add(short_target_header)
+
+    if SERVICE_DELIVERY_DIV_HEADER in result.columns:
+        result[PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER] = result[SERVICE_DELIVERY_DIV_HEADER]
+        hidden_columns.add(PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER)
+
+    if phase_header in result.columns:
+        if PHASE_HEADER_PREFIX not in result.columns:
+            hidden_columns.add(PHASE_HEADER_PREFIX)
+        result[PHASE_HEADER_PREFIX] = result[phase_header]
+
+    return result, hidden_columns
+
+
+def hide_worksheet_columns(worksheet, hidden_columns: set[str]) -> None:
+    if not hidden_columns:
+        return
+
+    for cell in worksheet[1]:
+        if cell.value in hidden_columns:
+            worksheet.column_dimensions[get_column_letter(cell.column)].hidden = True
+
+
+def coerce_numeric_columns_for_pivots(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    for column in ("MRC",):
+        if column not in result.columns:
+            continue
+
+        cleaned = (
+            result[column]
+            .astype("string")
+            .str.strip()
+            .str.replace(",", "", regex=False)
+            .str.replace(" ", "", regex=False)
+        )
+        result[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    return result
+
+
+def write_all_order_sheet_for_template(
+    writer: pd.ExcelWriter,
+    df: pd.DataFrame,
+    csv_path: Path,
+    dept_sd_lookup: dict[str, str],
+    service_delivery_div_lookup: dict[str, str],
+    phase_lookup: dict[str, str],
+    process_adjustment_lookup: dict[str, str],
+    product_category_lookup: dict[str, str],
+    group_sales_lookup: dict[str, str],
+    division_sales_lookup: dict[str, str],
+    segment_sales_lookup: dict[str, str],
+    phase_header: str,
+) -> tuple[pd.DataFrame, set[str]]:
+    output_df = apply_lookup_values(
+        df,
+        dept_sd_lookup,
+        service_delivery_div_lookup,
+        phase_lookup,
+        process_adjustment_lookup,
+        product_category_lookup,
+        group_sales_lookup,
+        division_sales_lookup,
+        segment_sales_lookup,
+        phase_header,
+    )
+    output_df = coerce_numeric_columns_for_pivots(output_df)
+    target_header = next((column for column in output_df.columns if str(column).startswith("TARGET")), "")
+    output_df, hidden_columns = add_pivot_template_compatibility_columns(
+        output_df,
+        csv_path,
+        target_header,
+        phase_header,
+    )
+    output_df.to_excel(writer, sheet_name=VLOOKUP_SHEET_NAME, index=False)
+    worksheet = writer.sheets[VLOOKUP_SHEET_NAME]
+    apply_target_so_complete_date_filter_format(worksheet, output_df)
+    apply_worksheet_presentation(worksheet)
+    hide_worksheet_columns(worksheet, hidden_columns)
+    return output_df, hidden_columns
+
+
 def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: Path, sheet_name: str) -> None:
     target_header = next((column for column in df.columns if str(column).startswith("TARGET")), None)
     if target_header is None or QUO_HEADER not in df.columns or PHASE_HEADER_PREFIX not in df.columns:
@@ -906,6 +1012,778 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
                 pass
 
 
+def add_pivot_sheet_via_com(
+    output_path: Path,
+    source_workbook_path: Path,
+    csv_path: Path,
+    target_header: str,
+    phase_header: str,
+) -> None:
+    """Build the PIVOT sheet via Excel COM using ALL ORDER as the live data source."""
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        print("[warn] pywin32 not installed – skipping PIVOT sheet creation.", file=sys.stderr)
+        return
+
+    xl = None
+    target_wb = None
+    source_wb = None
+    try:
+        xl = win32com.client.DispatchEx("Excel.Application")
+        xl.Visible = False
+        xl.DisplayAlerts = False
+
+        target_wb = xl.Workbooks.Open(str(output_path.resolve()))
+        source_wb = xl.Workbooks.Open(str(source_workbook_path.resolve()))
+
+        data_sheet = None
+        for sheet in target_wb.Sheets:
+            if sheet.Name == VLOOKUP_SHEET_NAME:
+                data_sheet = sheet
+                break
+
+        source_pivot_sheet = None
+        for sheet in source_wb.Sheets:
+            if sheet.Name == PIVOT_SHEET_NAME:
+                source_pivot_sheet = sheet
+                break
+
+        if data_sheet is None or source_pivot_sheet is None:
+            print("[warn] Could not find ALL ORDER or source PIVOT sheet.", file=sys.stderr)
+            return
+
+        pivot_sheet = None
+        for sheet in target_wb.Sheets:
+            if sheet.Name == PIVOT_SHEET_NAME:
+                pivot_sheet = sheet
+                break
+        if pivot_sheet is None:
+            pivot_sheet = target_wb.Worksheets.Add(After=target_wb.Sheets(target_wb.Sheets.Count))
+            pivot_sheet.Name = PIVOT_SHEET_NAME
+        try:
+            pivot_sheet.Cells.Clear()
+        except Exception:
+            pass
+        try:
+            pivot_sheet.Tab.Color = int(EXCEL_PIVOT_TAB_COLOR, 16)
+        except Exception:
+            pass
+
+        used_rows = source_pivot_sheet.UsedRange.Rows.Count
+        used_columns = source_pivot_sheet.UsedRange.Columns.Count
+        for row_index in range(1, used_rows + 1):
+            try:
+                pivot_sheet.Rows(row_index).RowHeight = source_pivot_sheet.Rows(row_index).RowHeight
+            except Exception:
+                pass
+        for column_index in range(1, used_columns + 1):
+            try:
+                pivot_sheet.Columns(column_index).ColumnWidth = source_pivot_sheet.Columns(column_index).ColumnWidth
+            except Exception:
+                pass
+
+        reference_date = reference_date_from_csv_path(csv_path)
+        month_name = reference_date.strftime("%B")
+        month_name_upper = month_name.upper()
+        month_short = reference_date.strftime("%b")
+        year_value = reference_date.year
+        year_short = reference_date.strftime("%y")
+        target_month_label = f"Target {month_name}"
+        before_month_label = f"Before {month_name}"
+        after_month_label = f"After {month_name}"
+        not_inputted_label = "Target Not Yet Inputted"
+        short_target_header = f"TARGET  Detemined as 1 {month_short} {year_short}"
+
+        pivot_sheet.Range("A1").Value = (
+            f" TARGET COMPLETE {month_name_upper} {year_value} "
+            f"(Based on Dashboard 1 {month_name_upper} {year_value})"
+        )
+        pivot_sheet.Range("A3").Value = "New Registration "
+        pivot_sheet.Range("A109").Value = "Non New Registration "
+        pivot_sheet.Range("A178").Value = (
+            f"STATUS ORDER WITH AGING FROM RFS COMMIT DATE {month_name_upper} {year_short}"
+        )
+        pivot_sheet.Range("A368").Value = f"TARGET AFTER {month_name_upper} {year_value}"
+        pivot_sheet.Range("E439").Value = "TARGET NOT INPUTTED YET"
+
+        pivot_ranges = [
+            "A5:C22",
+            "D4:L22",
+            "A110:C124",
+            "D109:K124",
+            "A180:F202",
+            "A279:C297",
+            "D279:I297",
+            "A374:C387",
+            "D373:J387",
+            "E441:L461",
+        ]
+        for cell_range in pivot_ranges:
+            try:
+                pivot_sheet.Range(cell_range).Clear()
+            except Exception:
+                pass
+
+        headers = [data_sheet.Cells(1, column).Value for column in range(1, data_sheet.UsedRange.Columns.Count + 1)]
+        try:
+            mrc_column = headers.index("MRC") + 1
+        except ValueError:
+            mrc_column = None
+        if mrc_column is not None:
+            for row_index in range(2, data_sheet.UsedRange.Rows.Count + 1):
+                cell = data_sheet.Cells(row_index, mrc_column)
+                value = cell.Value
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", stripped):
+                        try:
+                            cell.Value = float(stripped) if "." in stripped else int(stripped)
+                        except Exception:
+                            pass
+
+        pivot_cache = target_wb.PivotCaches().Create(
+            SourceType=1,  # xlDatabase
+            SourceData=data_sheet.UsedRange,
+        )
+
+        xlRowField = 1
+        xlColumnField = 2
+        xlPageField = 3
+        xlHidden = 0
+        xlCount = -4112
+        xlSum = -4157
+        xlPercent = 2
+        blank_like = {"", "1900", "nan", "none", "n/a", "(blank)", "null"}
+
+        def _normalize_item(value) -> str:
+            return str(value).strip().lower()
+
+        def _configure_page_field(
+            pt,
+            field_name: str,
+            position: int,
+            include_values: set[str] | None = None,
+            exclude_values: set[str] | None = None,
+            caption: str | None = None,
+        ) -> None:
+            field = pt.PivotFields(field_name)
+            field.Orientation = xlPageField
+            field.Position = position
+            if caption is not None:
+                try:
+                    field.Caption = caption
+                except Exception:
+                    pass
+            if include_values is None and exclude_values is None:
+                return
+
+            include_normalized = {_normalize_item(value) for value in include_values or set()}
+            exclude_normalized = {_normalize_item(value) for value in exclude_values or set()}
+            field.EnableMultiplePageItems = True
+            try:
+                for item in field.PivotItems():
+                    item.Visible = True
+            except Exception:
+                pass
+
+            visible_count = 0
+            for item in field.PivotItems():
+                item_value = _normalize_item(getattr(item, "Value", item.Name))
+                visible = True
+                if include_normalized:
+                    visible = item_value in include_normalized
+                if exclude_normalized and item_value in exclude_normalized:
+                    visible = False
+                try:
+                    item.Visible = visible
+                    if visible:
+                        visible_count += 1
+                except Exception:
+                    pass
+
+            if visible_count == 0:
+                try:
+                    field.ClearAllFilters()
+                except Exception:
+                    pass
+
+        def _add_data_fields(pt, include_sum_mrc: bool) -> None:
+            if include_sum_mrc:
+                try:
+                    sum_field = pt.AddDataField(pt.PivotFields("MRC"), "Sum of MRC", xlSum)
+                    sum_field.NumberFormat = "0"
+                except Exception:
+                    pass
+            try:
+                count_field = pt.AddDataField(pt.PivotFields(QUO_HEADER), "Count of quo", xlCount)
+                count_field.NumberFormat = "0"
+            except Exception:
+                pass
+            if include_sum_mrc:
+                try:
+                    pt.DataPivotField.Orientation = xlColumnField
+                    pt.DataPivotField.Position = 1
+                except Exception:
+                    pass
+
+        def _add_completion_field(pt) -> None:
+            try:
+                formula = (
+                    "=('SO Complete'+'Cancel')/"
+                    f"'{QUO_HEADER}'"
+                )
+                target_name = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+                try:
+                    pt.CalculatedFields(target_name).Delete()
+                except Exception:
+                    pass
+                pt.CalculatedFields().Add(target_name, formula, True)
+                percent_field = pt.AddDataField(
+                    pt.PivotFields(target_name),
+                    target_name,
+                    xlSum,
+                )
+                percent_field.NumberFormat = "0.00%"
+            except Exception:
+                pass
+
+        def _build_pivot(
+            table_name: str,
+            destination: str,
+            row_fields: list[str],
+            column_field: str | None,
+            page_fields: list[tuple[str, int, set[str] | None, set[str] | None, str | None]],
+            include_sum_mrc: bool = False,
+            row_grand: bool = True,
+        ) -> None:
+            pt = pivot_cache.CreatePivotTable(
+                TableDestination=pivot_sheet.Range(destination),
+                TableName=table_name,
+            )
+            pt.ManualUpdate = True
+            try:
+                pt.CompactLayoutRowHeader = "Div./Dept."
+                pt.CompactLayoutColumnHeader = "Column Labels"
+                pt.RowGrand = row_grand
+                pt.ColumnGrand = True
+            except Exception:
+                pass
+            for field_name in row_fields:
+                try:
+                    rf = pt.PivotFields(field_name)
+                    rf.Orientation = xlRowField
+                    rf.Position = row_fields.index(field_name) + 1
+                except Exception:
+                    pass
+            if column_field:
+                try:
+                    cf = pt.PivotFields(column_field)
+                    cf.Orientation = xlColumnField
+                    cf.Position = 1
+                    if column_field == phase_header:
+                        cf.Caption = PHASE_HEADER_PREFIX
+                except Exception:
+                    pass
+            for field_name, position, include_values, exclude_values, caption in page_fields:
+                try:
+                    _configure_page_field(pt, field_name, position, include_values, exclude_values, caption)
+                except Exception:
+                    pass
+            _add_data_fields(pt, include_sum_mrc)
+            try:
+                pt.TableStyle2 = "PivotStyleLight14"
+            except Exception:
+                pass
+            pt.ManualUpdate = False
+            pt.Update()
+            return pt
+
+        year_excludes = blank_like
+        pt1 = _build_pivot(
+            "PivotTable_PIVOT_1",
+            "A185",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER, PM_HEADER],
+            STATUS_ORDER_HEADER,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (PROCESS_ADJUSTMENT_HEADER, 2, {"new reg"}, None, PROCESS_ADJUSTMENT_HEADER),
+                (
+                    phase_header,
+                    3,
+                    {"00-new", "01-presales", "02-survey", "03-allocation", "04-pre installation", "05-customer preparation", "06-installation"},
+                    None,
+                    PHASE_HEADER_PREFIX,
+                ),
+                (RFS_COMMMIT_HEADER, 4, None, None, RFS_COMMMIT_HEADER),
+            ],
+            row_grand=True,
+        )
+        pt2 = _build_pivot(
+            "PivotTable_PIVOT_2",
+            "D282",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            phase_header,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (target_header, 2, {before_month_label.lower()}, None, short_target_header),
+            ],
+            row_grand=False,
+        )
+        pt3 = _build_pivot(
+            "PivotTable_PIVOT_3",
+            "A9",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            None,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (PROCESS_ADJUSTMENT_HEADER, 2, {"new reg"}, None, PROCESS_ADJUSTMENT_HEADER),
+                (target_header, 3, {target_month_label.lower()}, None, short_target_header),
+            ],
+            include_sum_mrc=True,
+            row_grand=True,
+        )
+        pt4 = _build_pivot(
+            "PivotTable_PIVOT_4",
+            "D8",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            phase_header,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, " "),
+                (PROCESS_ADJUSTMENT_HEADER, 2, {"new reg"}, None, PROCESS_ADJUSTMENT_HEADER),
+                (target_header, 3, {target_month_label.lower()}, None, short_target_header),
+            ],
+            row_grand=False,
+        )
+        pt5 = _build_pivot(
+            "PivotTable_PIVOT_5",
+            "A377",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            None,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (target_header, 2, {after_month_label.lower()}, None, short_target_header),
+            ],
+            include_sum_mrc=True,
+            row_grand=True,
+        )
+        pt6 = _build_pivot(
+            "PivotTable_PIVOT_6",
+            "E444",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            phase_header,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (target_header, 2, {not_inputted_label.lower()}, None, short_target_header),
+            ],
+            row_grand=True,
+        )
+        pt7 = _build_pivot(
+            "PivotTable_PIVOT_7",
+            "A114",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            None,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (PROCESS_ADJUSTMENT_HEADER, 2, {"non new reg"}, None, PROCESS_ADJUSTMENT_HEADER),
+                (target_header, 3, {target_month_label.lower()}, None, short_target_header),
+            ],
+            include_sum_mrc=True,
+            row_grand=True,
+        )
+        pt8 = _build_pivot(
+            "PivotTable_PIVOT_8",
+            "A283",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            None,
+            [
+                (
+                    phase_header,
+                    1,
+                    {"00-new", "01-presales", "02-survey", "03-allocation", "04-pre installation", "05-customer preparation", "06-installation", "07-uat on hold"},
+                    None,
+                    PHASE_HEADER_PREFIX,
+                ),
+                (YEAR_FAB_UPLOAD_HEADER, 2, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (target_header, 3, {before_month_label.lower()}, None, short_target_header),
+            ],
+            include_sum_mrc=True,
+            row_grand=True,
+        )
+        pt9 = _build_pivot(
+            "PivotTable_PIVOT_9",
+            "D113",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            phase_header,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (PROCESS_ADJUSTMENT_HEADER, 2, {"non new reg"}, None, PROCESS_ADJUSTMENT_HEADER),
+                (target_header, 3, {target_month_label.lower()}, None, short_target_header),
+            ],
+            row_grand=False,
+        )
+        pt10 = _build_pivot(
+            "PivotTable_PIVOT_10",
+            "D376",
+            [SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER],
+            phase_header,
+            [
+                (YEAR_FAB_UPLOAD_HEADER, 1, None, year_excludes, YEAR_FAB_UPLOAD_HEADER),
+                (target_header, 2, {after_month_label.lower()}, None, short_target_header),
+            ],
+            row_grand=False,
+        )
+
+        pivot_sheet.Range("A1").Value = (
+            f" TARGET COMPLETE {month_name_upper} {year_value} "
+            f"(Based on Dashboard 1 {month_name_upper} {year_value})"
+        )
+        pivot_sheet.Range("A3").Value = "New Registration "
+        pivot_sheet.Range("A109").Value = "Non New Registration "
+        pivot_sheet.Range("A178").Value = (
+            f"STATUS ORDER WITH AGING FROM RFS COMMIT DATE {month_name_upper} {year_short}"
+        )
+        pivot_sheet.Range("A368").Value = f"TARGET AFTER {month_name_upper} {year_value}"
+        pivot_sheet.Range("E439").Value = "TARGET NOT INPUTTED YET"
+
+        def _column_letter(column_number: int) -> str:
+            result = ""
+            while column_number:
+                column_number, remainder = divmod(column_number - 1, 26)
+                result = chr(65 + remainder) + result
+            return result
+
+        def _header_column(pt, header_row: int, header_text: str) -> int | None:
+            start_col = pt.TableRange2.Column
+            end_col = start_col + pt.TableRange2.Columns.Count - 1
+            target_normalized = str(header_text).strip().lower()
+            for column_index in range(start_col, end_col + 1):
+                value = pivot_sheet.Cells(header_row, column_index).Value
+                if str(value).strip().lower() == target_normalized:
+                    return column_index
+            return None
+
+        def _write_side_percentage(pt, page_field_count: int, left_count_column: str, mode: str) -> None:
+            header_row = pt.TableRange2.Row + page_field_count + 2
+            data_row_start = header_row + 1
+            data_row_end = pt.TableRange2.Row + pt.TableRange2.Rows.Count - 1
+            formula_col = pt.TableRange2.Column + pt.TableRange2.Columns.Count
+            formula_letter = _column_letter(formula_col)
+            cancel_col = _header_column(pt, header_row, "Cancel")
+            so_col = _header_column(pt, header_row, "SO Complete")
+
+            pivot_sheet.Cells(header_row, formula_col).Value = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+            for row_index in range(data_row_start, data_row_end + 1):
+                if so_col is None:
+                    continue
+                so_letter = _column_letter(so_col)
+                cancel_letter = _column_letter(cancel_col) if cancel_col is not None else None
+                if mode == "sum_cancel_so":
+                    if cancel_letter is not None:
+                        formula = f"=({cancel_letter}{row_index}+{so_letter}{row_index})/{left_count_column}{row_index}"
+                    else:
+                        formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
+                elif mode == "source_non_new":
+                    if cancel_letter is not None:
+                        formula = f"=({cancel_letter}{row_index}+{so_letter}{row_index}/{left_count_column}{row_index})"
+                    else:
+                        formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
+                else:
+                    formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
+                pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
+                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0,00%"
+
+        _write_side_percentage(pt4, 3, "C", "sum_cancel_so")
+        _write_side_percentage(pt9, 3, "C", "source_non_new")
+        _write_side_percentage(pt10, 2, "C", "so_only")
+
+        target_wb.Save()
+        print(f"[info] Added '{PIVOT_SHEET_NAME}' sheet to {output_path.name}")
+    except Exception as exc:
+        print(f"[warn] Could not add PIVOT sheet via COM: {exc}", file=sys.stderr)
+    finally:
+        if source_wb is not None:
+            try:
+                source_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if target_wb is not None:
+            try:
+                target_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if xl is not None:
+            try:
+                xl.Quit()
+            except Exception:
+                pass
+
+
+def update_template_workbook_via_com(
+    output_path: Path,
+    generated_workbook_path: Path,
+    progress_sheet_name: str,
+    target_header: str,
+    hidden_all_order_columns: set[str],
+) -> None:
+    """Replace data sheets in a copied template workbook and refresh its existing pivots."""
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        raise RuntimeError("pywin32 is required to update the template workbook and refresh pivots.")
+
+    xl = None
+    target_wb = None
+    generated_wb = None
+    try:
+        xl = win32com.client.DispatchEx("Excel.Application")
+        xl.Visible = False
+        xl.DisplayAlerts = False
+
+        target_wb = xl.Workbooks.Open(str(output_path.resolve()))
+        generated_wb = xl.Workbooks.Open(str(generated_workbook_path.resolve()))
+
+        def _sheet_by_name(workbook, sheet_name: str):
+            for sheet in workbook.Sheets:
+                if sheet.Name == sheet_name:
+                    return sheet
+            return None
+
+        def _copy_used_range(source_sheet, target_sheet) -> tuple[int, int]:
+            xl_paste_all = -4104
+            xl_paste_column_widths = 8
+
+            try:
+                while target_sheet.ListObjects.Count:
+                    target_sheet.ListObjects(1).Delete()
+            except Exception:
+                pass
+
+            target_sheet.Cells.Clear()
+            source_used = source_sheet.UsedRange
+            row_count = source_used.Rows.Count
+            column_count = source_used.Columns.Count
+            source_used.Copy()
+            target_sheet.Range("A1").PasteSpecial(Paste=xl_paste_all)
+            target_sheet.Range("A1").PasteSpecial(Paste=xl_paste_column_widths)
+            xl.CutCopyMode = False
+
+            try:
+                target_sheet.Rows(1).RowHeight = source_sheet.Rows(1).RowHeight
+            except Exception:
+                pass
+
+            for column_index in range(1, column_count + 1):
+                try:
+                    target_sheet.Columns(column_index).Hidden = source_sheet.Columns(column_index).Hidden
+                except Exception:
+                    pass
+
+            return row_count, column_count
+
+        def _ensure_table(sheet, row_count: int, column_count: int) -> None:
+            if row_count < 1 or column_count < 1:
+                return
+
+            data_range = sheet.Range(sheet.Cells(1, 1), sheet.Cells(row_count, column_count))
+            try:
+                table = sheet.ListObjects.Add(1, data_range, None, 1)
+                table.Name = "Table_ALL_ORDER"
+                table.TableStyle = EXCEL_TABLE_STYLE_NAME
+            except Exception:
+                try:
+                    if sheet.ListObjects.Count:
+                        sheet.ListObjects(1).TableStyle = EXCEL_TABLE_STYLE_NAME
+                except Exception:
+                    pass
+
+        def _hide_columns_by_header(sheet, row_count: int, column_count: int) -> None:
+            if not hidden_all_order_columns:
+                return
+
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                if header_value in hidden_all_order_columns:
+                    try:
+                        sheet.Columns(column_index).Hidden = True
+                    except Exception:
+                        pass
+
+        def _delete_on_progress_sheets() -> None:
+            for sheet_index in range(target_wb.Sheets.Count, 0, -1):
+                sheet = target_wb.Sheets(sheet_index)
+                if str(sheet.Name).startswith(ON_PROGRESS_SHEET_PREFIX):
+                    sheet.Delete()
+
+        data_sheet = _sheet_by_name(target_wb, VLOOKUP_SHEET_NAME)
+        generated_data_sheet = _sheet_by_name(generated_wb, VLOOKUP_SHEET_NAME)
+        generated_progress_sheet = _sheet_by_name(generated_wb, progress_sheet_name)
+        pivot_sheet = _sheet_by_name(target_wb, PIVOT_SHEET_NAME)
+
+        if data_sheet is None or generated_data_sheet is None or pivot_sheet is None:
+            raise RuntimeError("Could not find required sheets for template update.")
+
+        row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet)
+        _ensure_table(data_sheet, row_count, column_count)
+        _hide_columns_by_header(data_sheet, row_count, column_count)
+
+        _delete_on_progress_sheets()
+        progress_sheet = None
+        if generated_progress_sheet is not None:
+            progress_sheet = target_wb.Worksheets.Add(None, data_sheet)
+            progress_sheet.Name = progress_sheet_name
+            _copy_used_range(generated_progress_sheet, progress_sheet)
+
+        def _add_on_progress_pivots() -> None:
+            if progress_sheet is None or not target_header:
+                return
+
+            xl_count = -4112
+            xl_page_field = 3
+            xl_row_field = 1
+            xl_tabular_row = 1
+            blank_like = {"", "nan", "none", "n/a", "(blank)", "null"}
+
+            progress_sheet.Cells.Clear()
+            on_progress_cache = target_wb.PivotCaches().Create(SourceType=1, SourceData=source_data)
+            date_match = re.search(r"1\s+([A-Za-z]+)\s+(\d{4})", target_header)
+            month_full = date_match.group(1) if date_match else ""
+            target_month_label = f"Target {month_full}" if month_full else ""
+            source_month_label = f"This {month_full}" if month_full else ""
+
+            def _build_progress_pivot(
+                top_left_cell,
+                table_name: str,
+                visible_row_items: set[str] | None = None,
+                exclude_phase_values: set[str] | None = None,
+            ) -> None:
+                pt = on_progress_cache.CreatePivotTable(
+                    TableDestination=progress_sheet.Range(top_left_cell),
+                    TableName=table_name,
+                )
+                pt.ManualUpdate = True
+
+                try:
+                    year_field = pt.PivotFields(YEAR_FAB_UPLOAD_HEADER)
+                    year_field.Orientation = xl_page_field
+                    year_field.EnableMultiplePageItems = True
+                    for item in year_field.PivotItems():
+                        if str(item.Value).strip().lower() in blank_like:
+                            item.Visible = False
+                except Exception:
+                    pass
+
+                try:
+                    pt.PivotFields(PROCESS_ADJUSTMENT_HEADER).Orientation = xl_page_field
+                except Exception:
+                    pass
+
+                try:
+                    phase_field = pt.PivotFields(PHASE_HEADER_PREFIX)
+                    phase_field.Orientation = xl_page_field
+                    if exclude_phase_values:
+                        phase_field.EnableMultiplePageItems = True
+                        excluded_lower = {value.lower() for value in exclude_phase_values}
+                        for item in phase_field.PivotItems():
+                            if str(item.Value).strip().lower() in excluded_lower:
+                                item.Visible = False
+                except Exception:
+                    pass
+
+                try:
+                    row_field = pt.PivotFields(target_header)
+                    row_field.Orientation = xl_row_field
+                    row_field.LayoutForm = xl_tabular_row
+                    if visible_row_items:
+                        visible_lower = {value.lower() for value in visible_row_items}
+                        for item in row_field.PivotItems():
+                            item_name = str(item.Name).strip()
+                            compare_name = target_month_label if item_name == source_month_label else item_name
+                            item.Visible = compare_name.lower() in visible_lower
+                except Exception:
+                    pass
+
+                try:
+                    count_field = pt.AddDataField(pt.PivotFields(QUO_HEADER), "Count of quo", xl_count)
+                    count_field.NumberFormat = "0"
+                except Exception:
+                    pass
+
+                try:
+                    pt.TableStyle2 = "PivotStyleMedium2"
+                except Exception:
+                    pass
+
+                pt.ManualUpdate = False
+                pt.RefreshTable()
+
+                if source_month_label and target_month_label:
+                    try:
+                        row_field = pt.PivotFields(target_header)
+                        for item in row_field.PivotItems():
+                            if str(item.Name).strip() == source_month_label:
+                                item.Caption = target_month_label
+                    except Exception:
+                        pass
+
+            _build_progress_pivot(
+                "A1",
+                f"PivotTable_{progress_sheet_name}_1",
+                visible_row_items={target_month_label, f"After {month_full}"} if month_full else None,
+            )
+            _build_progress_pivot(
+                "D1",
+                f"PivotTable_{progress_sheet_name}_2",
+                visible_row_items={f"Before {month_full}", "Target Not Yet Inputted"} if month_full else None,
+                exclude_phase_values={"cancel", "so complete"},
+            )
+
+        generated_wb.Close(SaveChanges=False)
+        generated_wb = None
+
+        data_range = data_sheet.Range(data_sheet.Cells(1, 1), data_sheet.Cells(row_count, column_count))
+        source_data = f"'{VLOOKUP_SHEET_NAME}'!{data_range.Address}"
+        refreshed_count = 0
+        pivot_tables = pivot_sheet.PivotTables()
+        for pivot_index in range(1, pivot_tables.Count + 1):
+            pivot_table = pivot_tables(pivot_index)
+            try:
+                pivot_cache = target_wb.PivotCaches().Create(SourceType=1, SourceData=source_data)
+                pivot_table.ChangePivotCache(pivot_cache)
+                pivot_table.RefreshTable()
+                refreshed_count += 1
+            except Exception as exc:
+                print(
+                    f"[warn] Could not refresh PivotTable '{pivot_table.Name}' on '{pivot_sheet.Name}': {exc}",
+                    file=sys.stderr,
+                )
+
+        if progress_sheet is not None:
+            _add_on_progress_pivots()
+
+        target_wb.Save()
+        print(f"[info] Refreshed {refreshed_count} template PivotTables in {output_path.name}")
+    except Exception as exc:
+        print(f"[warn] Could not update template workbook via COM: {exc}", file=sys.stderr)
+        raise
+    finally:
+        if generated_wb is not None:
+            try:
+                generated_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if target_wb is not None:
+            try:
+                target_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if xl is not None:
+            try:
+                xl.Quit()
+            except Exception:
+                pass
+
+
 def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> None:
     header_positions = {
         str(cell.value).strip(): cell.column
@@ -1071,6 +1949,7 @@ def resolve_output_path(input_path: Path, csv_files: list[Path], args: argparse.
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
+    lookup_workbook = resolve_vlookup_workbook()
     (
         dept_sd_lookup,
         service_delivery_div_lookup,
@@ -1081,28 +1960,39 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
         division_sales_lookup,
         segment_sales_lookup,
         phase_header,
-    ) = load_lookup_mappings(resolve_vlookup_workbook())
+    ) = load_lookup_mappings(lookup_workbook)
     progress_sheet_name = on_progress_sheet_name(csv_path)
-    target_header = next((col for col in df.columns if str(col).startswith("TARGET")), "")
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        output_df = write_excel_sheet(
-            writer,
-            df,
-            VLOOKUP_SHEET_NAME,
-            dept_sd_lookup,
-            service_delivery_div_lookup,
-            phase_lookup,
-            process_adjustment_lookup,
-            product_category_lookup,
-            group_sales_lookup,
-            division_sales_lookup,
-            segment_sales_lookup,
-            phase_header,
+
+    with tempfile.TemporaryDirectory(prefix="csv_to_excel_", dir=output_path.parent) as temp_dir:
+        generated_workbook_path = Path(temp_dir) / "today-data.xlsx"
+        with pd.ExcelWriter(generated_workbook_path, engine="openpyxl") as writer:
+            output_df, hidden_columns = write_all_order_sheet_for_template(
+                writer,
+                df,
+                csv_path,
+                dept_sd_lookup,
+                service_delivery_div_lookup,
+                phase_lookup,
+                process_adjustment_lookup,
+                product_category_lookup,
+                group_sales_lookup,
+                division_sales_lookup,
+                segment_sales_lookup,
+                phase_header,
+            )
+            write_on_progress_sheet(writer, output_df, csv_path, progress_sheet_name)
+
+        target_header = next((col for col in output_df.columns if str(col).startswith("TARGET")), "")
+        shutil.copy2(lookup_workbook, output_path)
+        update_template_workbook_via_com(
+            output_path,
+            generated_workbook_path,
+            progress_sheet_name,
+            target_header,
+            hidden_columns,
         )
-        write_on_progress_sheet(writer, output_df, csv_path, progress_sheet_name)
+
     print(f"Wrote {output_path}")
-    if target_header:
-        add_pivot_tables_via_com(output_path, progress_sheet_name, target_header)
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
