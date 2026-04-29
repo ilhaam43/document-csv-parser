@@ -113,15 +113,24 @@ class ConvertOptions:
 
 @dataclass(frozen=True)
 class LookupMappings:
+    quo_keys: set[str]
+    pm: dict[str, str]
     dept_sd: dict[str, str]
+    dept_sd_by_quo: dict[str, str]
     service_delivery_div: dict[str, str]
+    service_delivery_div_by_quo: dict[str, str]
     status: dict[str, str]
     phase: dict[str, str]
+    process: dict[str, str]
     process_adjustment: dict[str, str]
     product_category: dict[str, str]
+    sales: dict[str, str]
     group_sales: dict[str, str]
+    group_sales_by_quo: dict[str, str]
     division_sales: dict[str, str]
+    division_sales_by_quo: dict[str, str]
     segment_sales: dict[str, str]
+    segment_sales_by_quo: dict[str, str]
     phase_header: str
 
 
@@ -468,7 +477,7 @@ def phase_lookup_header(lookup_workbook: Path) -> str:
 
 
 def remember_first_mapping(mapping: dict[str, str], key: object, value: object) -> None:
-    key_text = str(key).strip()
+    key_text = re.sub(r"\s+", " ", str(key).strip())
     if key_text and key_text not in mapping and not pd.isna(value):
         mapping[key_text] = str(value).strip()
 
@@ -484,49 +493,79 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
             f"{', '.join(missing_headers)}"
         )
 
+    pm_mapping: dict[str, str] = {}
     dept_sd_mapping: dict[str, str] = {}
+    dept_sd_by_quo_mapping: dict[str, str] = {}
     service_delivery_div_mapping: dict[str, str] = {}
+    service_delivery_div_by_quo_mapping: dict[str, str] = {}
     status_mapping: dict[str, str] = {}
     phase_mapping: dict[str, str] = {}
+    process_mapping: dict[str, str] = {}
     process_adjustment_mapping: dict[str, str] = {}
     product_category_mapping: dict[str, str] = {}
+    sales_mapping: dict[str, str] = {}
     group_sales_mapping: dict[str, str] = {}
+    group_sales_by_quo_mapping: dict[str, str] = {}
     division_sales_mapping: dict[str, str] = {}
+    division_sales_by_quo_mapping: dict[str, str] = {}
     segment_sales_mapping: dict[str, str] = {}
+    segment_sales_by_quo_mapping: dict[str, str] = {}
+    quo_keys: set[str] = set()
     mapping_headers = list(LOOKUP_REQUIRED_HEADERS)
     if STATUS_HEADER in lookup_df.columns:
         mapping_headers.append(STATUS_HEADER)
+    if PROCESS_HEADER in lookup_df.columns:
+        mapping_headers.append(PROCESS_HEADER)
 
-    for _, row in lookup_df[mapping_headers].dropna(subset=[PM_HEADER]).iterrows():
+    for _, row in lookup_df[mapping_headers].iterrows():
         pm_value = str(row[PM_HEADER]).strip()
-        if not pm_value:
-            continue
+        if pm_value and not pd.isna(row[PM_HEADER]):
+            remember_first_mapping(dept_sd_mapping, pm_value, row[DEPT_SD_HEADER])
+            remember_first_mapping(service_delivery_div_mapping, pm_value, row[LOOKUP_SERVICE_DELIVERY_DIV_HEADER])
 
-        remember_first_mapping(dept_sd_mapping, pm_value, row[DEPT_SD_HEADER])
-        remember_first_mapping(service_delivery_div_mapping, pm_value, row[LOOKUP_SERVICE_DELIVERY_DIV_HEADER])
-
-        quo_value = str(row[QUO_HEADER]).strip()
+        quo_value = re.sub(r"\s+", " ", str(row[QUO_HEADER]).strip())
+        if quo_value and not pd.isna(row[QUO_HEADER]):
+            quo_keys.add(quo_value)
+        remember_first_mapping(pm_mapping, quo_value, row[PM_HEADER])
+        remember_first_mapping(dept_sd_by_quo_mapping, quo_value, row[DEPT_SD_HEADER])
+        remember_first_mapping(service_delivery_div_by_quo_mapping, quo_value, row[LOOKUP_SERVICE_DELIVERY_DIV_HEADER])
         if STATUS_HEADER in lookup_df.columns:
             remember_first_mapping(status_mapping, quo_value, row[STATUS_HEADER])
         remember_first_mapping(phase_mapping, quo_value, row[PHASE_HEADER_PREFIX])
+        if PROCESS_HEADER in lookup_df.columns:
+            remember_first_mapping(process_mapping, quo_value, row[PROCESS_HEADER])
         remember_first_mapping(process_adjustment_mapping, quo_value, row[PROCESS_ADJUSTMENT_HEADER])
         remember_first_mapping(product_category_mapping, quo_value, row[PRODUCT_CATEGORY_HEADER])
+        remember_first_mapping(sales_mapping, quo_value, row[SALES_HEADER])
+        remember_first_mapping(group_sales_by_quo_mapping, quo_value, row[LOOKUP_GROUP_SALES_HEADER])
+        remember_first_mapping(division_sales_by_quo_mapping, quo_value, row[LOOKUP_DIVISION_SALES_HEADER])
+        remember_first_mapping(segment_sales_by_quo_mapping, quo_value, row[LOOKUP_SEGMENT_SALES_HEADER])
 
         sales_value = str(row[SALES_HEADER]).strip()
-        remember_first_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
-        remember_first_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
-        remember_first_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+        if sales_value and not pd.isna(row[SALES_HEADER]):
+            remember_first_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
+            remember_first_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
+            remember_first_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
 
     return LookupMappings(
+        quo_keys=quo_keys,
+        pm=pm_mapping,
         dept_sd=dept_sd_mapping,
+        dept_sd_by_quo=dept_sd_by_quo_mapping,
         service_delivery_div=service_delivery_div_mapping,
+        service_delivery_div_by_quo=service_delivery_div_by_quo_mapping,
         status=status_mapping,
         phase=phase_mapping,
+        process=process_mapping,
         process_adjustment=process_adjustment_mapping,
         product_category=product_category_mapping,
+        sales=sales_mapping,
         group_sales=group_sales_mapping,
+        group_sales_by_quo=group_sales_by_quo_mapping,
         division_sales=division_sales_mapping,
+        division_sales_by_quo=division_sales_by_quo_mapping,
         segment_sales=segment_sales_mapping,
+        segment_sales_by_quo=segment_sales_by_quo_mapping,
         phase_header=phase_lookup_header(lookup_workbook),
     )
 
@@ -595,13 +634,18 @@ def apply_current_month_process_adjustment_overrides(result: pd.DataFrame, refer
     current_report_month = pd.Period(reference_date, freq="M")
 
     missing_process_adjustment = process_adjustment_values.eq("")
-    current_month_fab_upload = fab_upload_dates.dt.to_period("M").eq(current_report_month)
+    current_month_or_missing_fab_upload = fab_upload_dates.isna() | fab_upload_dates.dt.to_period("M").eq(current_report_month)
     inferred_new_registration = process_values.eq("newregistration")
+    has_process = process_values.notna() & process_values.ne("")
 
     result.loc[
-        missing_process_adjustment & current_month_fab_upload & inferred_new_registration,
+        missing_process_adjustment & current_month_or_missing_fab_upload & inferred_new_registration,
         PROCESS_ADJUSTMENT_HEADER,
     ] = "New Reg"
+    result.loc[
+        missing_process_adjustment & current_month_or_missing_fab_upload & has_process & ~inferred_new_registration,
+        PROCESS_ADJUSTMENT_HEADER,
+    ] = "Non New Reg"
 
 
 def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFrame:
@@ -609,65 +653,147 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
         return df
 
     result = df.copy()
+    quo_values = (
+        result[QUO_HEADER].astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
+        if QUO_HEADER in result.columns
+        else None
+    )
+
+    def overlay_lookup(existing: pd.Series, mapped: pd.Series) -> pd.Series:
+        mapped_values = pd.Series(mapped, index=existing.index, dtype="string")
+        has_mapping = mapped_values.notna()
+        return existing.astype("string").where(~has_mapping, mapped_values)
+
+    def prefer_quo_lookup(
+        quo_mapping: dict[str, str],
+        fallback: pd.Series | None = None,
+        preserve_known_blank: bool = False,
+    ) -> pd.Series:
+        if quo_values is None:
+            return pd.Series(pd.NA, index=result.index, dtype="string")
+
+        mapped_by_quo = pd.Series(quo_values.map(quo_mapping), index=result.index, dtype="string")
+        has_quo_value = mapped_by_quo.notna() & mapped_by_quo.astype("string").str.strip().ne("")
+        if fallback is None:
+            mapped = pd.Series(pd.NA, index=result.index, dtype="string")
+        else:
+            mapped = pd.Series(fallback, index=result.index, dtype="string")
+
+        mapped.loc[has_quo_value] = mapped_by_quo.loc[has_quo_value]
+        if preserve_known_blank:
+            known_quo = quo_values.isin(mappings.quo_keys)
+            mapped.loc[known_quo & ~has_quo_value] = ""
+        return mapped
+
+    if quo_values is not None and PM_HEADER in result.columns:
+        result[PM_HEADER] = prefer_quo_lookup(mappings.pm, result[PM_HEADER], preserve_known_blank=True)
+
     pm_values = result[PM_HEADER].astype("string").str.strip() if PM_HEADER in result.columns else None
 
     if DEPT_SD_HEADER in result.columns and pm_values is not None:
-        looked_up_dept_sd = pm_values.map(mappings.dept_sd)
-        result[DEPT_SD_HEADER] = pd.Series(looked_up_dept_sd, index=result.index, dtype="string")
+        looked_up_dept_sd = pd.Series(pm_values.map(mappings.dept_sd), index=result.index, dtype="string")
+        if quo_values is not None:
+            looked_up_dept_sd = prefer_quo_lookup(
+                mappings.dept_sd_by_quo,
+                looked_up_dept_sd,
+                preserve_known_blank=True,
+            )
+        result[DEPT_SD_HEADER] = overlay_lookup(result[DEPT_SD_HEADER], looked_up_dept_sd)
 
     if pm_values is not None:
         looked_up_service_delivery_div = pd.Series(pm_values.map(mappings.service_delivery_div), index=result.index, dtype="string")
+        if quo_values is not None:
+            looked_up_service_delivery_div = prefer_quo_lookup(
+                mappings.service_delivery_div_by_quo,
+                looked_up_service_delivery_div,
+                preserve_known_blank=True,
+            )
         if SERVICE_DELIVERY_DIV_HEADER in result.columns:
-            result[SERVICE_DELIVERY_DIV_HEADER] = looked_up_service_delivery_div
+            result[SERVICE_DELIVERY_DIV_HEADER] = overlay_lookup(
+                result[SERVICE_DELIVERY_DIV_HEADER],
+                looked_up_service_delivery_div,
+            )
         else:
             insert_at = result.columns.get_loc(DEPT_SD_HEADER) + 1 if DEPT_SD_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, SERVICE_DELIVERY_DIV_HEADER, looked_up_service_delivery_div)
 
+    if quo_values is not None and PROCESS_HEADER in result.columns:
+        result[PROCESS_HEADER] = prefer_quo_lookup(mappings.process, result[PROCESS_HEADER], preserve_known_blank=True)
+
+    if quo_values is not None and SALES_HEADER in result.columns:
+        result[SALES_HEADER] = prefer_quo_lookup(mappings.sales, result[SALES_HEADER], preserve_known_blank=True)
+
     if SALES_HEADER in result.columns:
+        sales_values = result[SALES_HEADER].astype("string").str.strip()
         looked_up_group_sales = pd.Series(
-            result[SALES_HEADER].astype("string").str.strip().map(mappings.group_sales),
+            sales_values.map(mappings.group_sales),
             index=result.index,
             dtype="string",
         )
+        if quo_values is not None:
+            looked_up_group_sales = prefer_quo_lookup(
+                mappings.group_sales_by_quo,
+                looked_up_group_sales,
+                preserve_known_blank=True,
+            )
         if GROUP_SALES_HEADER in result.columns:
-            result[GROUP_SALES_HEADER] = looked_up_group_sales
+            result[GROUP_SALES_HEADER] = overlay_lookup(result[GROUP_SALES_HEADER], looked_up_group_sales)
 
         looked_up_division_sales = pd.Series(
-            result[SALES_HEADER].astype("string").str.strip().map(mappings.division_sales),
+            sales_values.map(mappings.division_sales),
             index=result.index,
             dtype="string",
         )
+        if quo_values is not None:
+            looked_up_division_sales = prefer_quo_lookup(
+                mappings.division_sales_by_quo,
+                looked_up_division_sales,
+                preserve_known_blank=True,
+            )
         if DIVISION_SALES_HEADER in result.columns:
-            result[DIVISION_SALES_HEADER] = looked_up_division_sales
+            result[DIVISION_SALES_HEADER] = overlay_lookup(result[DIVISION_SALES_HEADER], looked_up_division_sales)
         else:
             insert_at = result.columns.get_loc(GROUP_SALES_HEADER) + 1 if GROUP_SALES_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, DIVISION_SALES_HEADER, looked_up_division_sales)
 
         looked_up_segment_sales = pd.Series(
-            result[SALES_HEADER].astype("string").str.strip().map(mappings.segment_sales),
+            sales_values.map(mappings.segment_sales),
             index=result.index,
             dtype="string",
         )
+        if quo_values is not None:
+            looked_up_segment_sales = prefer_quo_lookup(
+                mappings.segment_sales_by_quo,
+                looked_up_segment_sales,
+                preserve_known_blank=True,
+            )
         if SEGMENT_SALES_HEADER in result.columns:
-            result[SEGMENT_SALES_HEADER] = looked_up_segment_sales
+            result[SEGMENT_SALES_HEADER] = overlay_lookup(result[SEGMENT_SALES_HEADER], looked_up_segment_sales)
 
-    if QUO_HEADER in result.columns:
-        quo_values = result[QUO_HEADER].astype("string").str.strip()
+    if quo_values is not None:
         looked_up_phase = pd.Series(quo_values.map(mappings.phase), index=result.index, dtype="string")
         looked_up_status = pd.Series(quo_values.map(mappings.status), index=result.index, dtype="string")
         if mappings.phase_header in result.columns:
-            result[mappings.phase_header] = looked_up_phase
+            result[mappings.phase_header] = overlay_lookup(result[mappings.phase_header], looked_up_phase)
         else:
             insert_at = result.columns.get_loc(STATUS_HEADER) + 1 if STATUS_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, mappings.phase_header, looked_up_phase)
 
-        looked_up_process_adjustment = pd.Series(
-            quo_values.map(mappings.process_adjustment),
-            index=result.index,
-            dtype="string",
+        process_adjustment_fallback = (
+            result[PROCESS_ADJUSTMENT_HEADER]
+            if PROCESS_ADJUSTMENT_HEADER in result.columns
+            else pd.Series(pd.NA, index=result.index, dtype="string")
+        )
+        looked_up_process_adjustment = prefer_quo_lookup(
+            mappings.process_adjustment,
+            process_adjustment_fallback,
+            preserve_known_blank=True,
         )
         if PROCESS_ADJUSTMENT_HEADER in result.columns:
-            result[PROCESS_ADJUSTMENT_HEADER] = looked_up_process_adjustment
+            result[PROCESS_ADJUSTMENT_HEADER] = overlay_lookup(
+                result[PROCESS_ADJUSTMENT_HEADER],
+                looked_up_process_adjustment,
+            )
         else:
             insert_at = result.columns.get_loc(PROCESS_HEADER) + 1 if PROCESS_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, PROCESS_ADJUSTMENT_HEADER, looked_up_process_adjustment)
@@ -675,10 +801,13 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
         apply_current_status_phase_overrides(result, mappings.phase_header, looked_up_status)
 
         if PRODUCT_CATEGORY_HEADER in result.columns:
-            result[PRODUCT_CATEGORY_HEADER] = pd.Series(
-                quo_values.map(mappings.product_category),
-                index=result.index,
-                dtype="string",
+            result[PRODUCT_CATEGORY_HEADER] = overlay_lookup(
+                result[PRODUCT_CATEGORY_HEADER],
+                prefer_quo_lookup(
+                    mappings.product_category,
+                    result[PRODUCT_CATEGORY_HEADER],
+                    preserve_known_blank=True,
+                ),
             )
 
     return result
