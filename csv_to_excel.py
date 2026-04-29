@@ -12,6 +12,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
 
@@ -523,6 +524,73 @@ def remember_canonical_sales_name(mapping: dict[str, str], sales_name: object) -
             mapping[key] = display_name
 
 
+def sales_alias_match_score(alias: str, canonical: str) -> float:
+    alias_key = normalize_sales_name_key(alias)
+    canonical_key = normalize_sales_name_key(canonical)
+    if not alias_key or not canonical_key or alias_key == "-":
+        return 0.0
+
+    if alias_key == canonical_key:
+        return 1.0
+
+    alias_tokens = alias_key.split()
+    canonical_tokens = canonical_key.split()
+    if len(alias_tokens) >= 2 and len(alias_tokens) <= len(canonical_tokens):
+        token_match = True
+        for index, token in enumerate(alias_tokens):
+            canonical_token = canonical_tokens[index]
+            if token == canonical_token:
+                continue
+            if index == len(alias_tokens) - 1 and len(token) == 1 and canonical_token.startswith(token):
+                continue
+            token_match = False
+            break
+        if token_match:
+            return max(0.90, len(alias_tokens) / len(canonical_tokens))
+
+    similarity = SequenceMatcher(None, alias_key, canonical_key).ratio()
+    return similarity if similarity >= 0.92 else 0.0
+
+
+def add_sales_alias_if_unique(
+    alias_name: object,
+    complete_sales: list[dict[str, str]],
+    canonical_sales_mapping: dict[str, str],
+    group_sales_mapping: dict[str, str],
+    division_sales_mapping: dict[str, str],
+    segment_sales_mapping: dict[str, str],
+) -> None:
+    alias_key = normalize_sales_name_key(alias_name)
+    if not alias_key or alias_key in canonical_sales_mapping:
+        return
+
+    scored_by_sales: dict[str, tuple[float, dict[str, str]]] = {}
+    for record in complete_sales:
+        score = sales_alias_match_score(alias_name, record[SALES_HEADER])
+        if score <= 0:
+            continue
+
+        sales_key = normalize_sales_name_key(record[SALES_HEADER])
+        current = scored_by_sales.get(sales_key)
+        if current is None or score > current[0]:
+            scored_by_sales[sales_key] = (score, record)
+
+    scored = sorted(scored_by_sales.values(), key=lambda item: item[0], reverse=True)
+    if not scored:
+        return
+
+    best_score, best_record = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score < 0.90 or best_score - second_score < 0.03:
+        return
+
+    for key in sales_name_alias_keys(alias_name):
+        canonical_sales_mapping[key] = best_record[SALES_HEADER]
+        group_sales_mapping[key] = best_record[LOOKUP_GROUP_SALES_HEADER]
+        division_sales_mapping[key] = best_record[LOOKUP_DIVISION_SALES_HEADER]
+        segment_sales_mapping[key] = best_record[LOOKUP_SEGMENT_SALES_HEADER]
+
+
 def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     lookup_df = pd.read_excel(lookup_workbook, sheet_name=VLOOKUP_SHEET_NAME, dtype="string")
     lookup_df.columns = make_unique_columns(lookup_df.columns, normalize=True)
@@ -553,6 +621,8 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     segment_sales_mapping: dict[str, str] = {}
     segment_sales_by_quo_mapping: dict[str, str] = {}
     quo_keys: set[str] = set()
+    complete_sales_records: list[dict[str, str]] = []
+    sales_alias_candidates: set[str] = set()
     mapping_headers = list(LOOKUP_REQUIRED_HEADERS)
     if STATUS_HEADER in lookup_df.columns:
         mapping_headers.append(STATUS_HEADER)
@@ -585,10 +655,35 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
 
         sales_value = str(row[SALES_HEADER]).strip()
         if sales_value and not pd.isna(row[SALES_HEADER]):
-            remember_canonical_sales_name(canonical_sales_mapping, sales_value)
-            remember_sales_alias_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
-            remember_sales_alias_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
-            remember_sales_alias_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+            has_complete_sales_hierarchy = (
+                not pd.isna(row[LOOKUP_GROUP_SALES_HEADER])
+                and not pd.isna(row[LOOKUP_DIVISION_SALES_HEADER])
+                and not pd.isna(row[LOOKUP_SEGMENT_SALES_HEADER])
+            )
+            if has_complete_sales_hierarchy:
+                complete_record = {
+                    SALES_HEADER: sales_value,
+                    LOOKUP_GROUP_SALES_HEADER: str(row[LOOKUP_GROUP_SALES_HEADER]).strip(),
+                    LOOKUP_DIVISION_SALES_HEADER: str(row[LOOKUP_DIVISION_SALES_HEADER]).strip(),
+                    LOOKUP_SEGMENT_SALES_HEADER: str(row[LOOKUP_SEGMENT_SALES_HEADER]).strip(),
+                }
+                complete_sales_records.append(complete_record)
+                remember_canonical_sales_name(canonical_sales_mapping, sales_value)
+                remember_sales_alias_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
+                remember_sales_alias_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
+                remember_sales_alias_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+            else:
+                sales_alias_candidates.add(sales_value)
+
+    for sales_alias in sales_alias_candidates:
+        add_sales_alias_if_unique(
+            sales_alias,
+            complete_sales_records,
+            canonical_sales_mapping,
+            group_sales_mapping,
+            division_sales_mapping,
+            segment_sales_mapping,
+        )
 
     return LookupMappings(
         quo_keys=quo_keys,
