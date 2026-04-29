@@ -125,6 +125,7 @@ class LookupMappings:
     process_adjustment: dict[str, str]
     product_category: dict[str, str]
     sales: dict[str, str]
+    canonical_sales: dict[str, str]
     group_sales: dict[str, str]
     group_sales_by_quo: dict[str, str]
     division_sales: dict[str, str]
@@ -482,6 +483,46 @@ def remember_first_mapping(mapping: dict[str, str], key: object, value: object) 
         mapping[key_text] = str(value).strip()
 
 
+def normalize_sales_name_key(value: object) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def sales_name_alias_keys(value: object) -> set[str]:
+    normalized = normalize_sales_name_key(value)
+    if not normalized:
+        return set()
+
+    keys = {normalized}
+    tokens = normalized.split()
+    if len(tokens) >= 2 and len(tokens[-1]) > 1:
+        keys.add(" ".join([*tokens[:-1], tokens[-1][0]]))
+    return keys
+
+
+def remember_sales_alias_mapping(mapping: dict[str, str], sales_name: object, value: object) -> None:
+    for key in sales_name_alias_keys(sales_name):
+        remember_first_mapping(mapping, key, value)
+
+
+def remember_canonical_sales_name(mapping: dict[str, str], sales_name: object) -> None:
+    if pd.isna(sales_name):
+        return
+
+    display_name = str(sales_name).strip()
+    if not display_name:
+        return
+
+    for key in sales_name_alias_keys(display_name):
+        current = mapping.get(key)
+        if (
+            current is None
+            or len(display_name) > len(current)
+            or (current.isupper() and not display_name.isupper() and len(display_name) == len(current))
+        ):
+            mapping[key] = display_name
+
+
 def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     lookup_df = pd.read_excel(lookup_workbook, sheet_name=VLOOKUP_SHEET_NAME, dtype="string")
     lookup_df.columns = make_unique_columns(lookup_df.columns, normalize=True)
@@ -504,6 +545,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     process_adjustment_mapping: dict[str, str] = {}
     product_category_mapping: dict[str, str] = {}
     sales_mapping: dict[str, str] = {}
+    canonical_sales_mapping: dict[str, str] = {}
     group_sales_mapping: dict[str, str] = {}
     group_sales_by_quo_mapping: dict[str, str] = {}
     division_sales_mapping: dict[str, str] = {}
@@ -543,9 +585,10 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
 
         sales_value = str(row[SALES_HEADER]).strip()
         if sales_value and not pd.isna(row[SALES_HEADER]):
-            remember_first_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
-            remember_first_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
-            remember_first_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+            remember_canonical_sales_name(canonical_sales_mapping, sales_value)
+            remember_sales_alias_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
+            remember_sales_alias_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
+            remember_sales_alias_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
 
     return LookupMappings(
         quo_keys=quo_keys,
@@ -560,6 +603,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         process_adjustment=process_adjustment_mapping,
         product_category=product_category_mapping,
         sales=sales_mapping,
+        canonical_sales=canonical_sales_mapping,
         group_sales=group_sales_mapping,
         group_sales_by_quo=group_sales_by_quo_mapping,
         division_sales=division_sales_mapping,
@@ -725,31 +769,46 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
 
     if SALES_HEADER in result.columns:
         sales_values = result[SALES_HEADER].astype("string").str.strip()
+        sales_alias_keys = sales_values.map(normalize_sales_name_key)
+        canonical_sales = pd.Series(sales_alias_keys.map(mappings.canonical_sales), index=result.index, dtype="string")
+        result[SALES_HEADER] = overlay_lookup(result[SALES_HEADER], canonical_sales)
+        sales_values = result[SALES_HEADER].astype("string").str.strip()
+        sales_alias_keys = sales_values.map(normalize_sales_name_key)
         looked_up_group_sales = pd.Series(
-            sales_values.map(mappings.group_sales),
+            sales_alias_keys.map(mappings.group_sales),
             index=result.index,
             dtype="string",
         )
+        sales_group_sales = looked_up_group_sales.copy()
         if quo_values is not None:
             looked_up_group_sales = prefer_quo_lookup(
                 mappings.group_sales_by_quo,
                 looked_up_group_sales,
                 preserve_known_blank=True,
             )
+            blank_group_sales = looked_up_group_sales.astype("string").str.strip().eq("")
+            looked_up_group_sales.loc[blank_group_sales & sales_group_sales.notna()] = sales_group_sales.loc[
+                blank_group_sales & sales_group_sales.notna()
+            ]
         if GROUP_SALES_HEADER in result.columns:
             result[GROUP_SALES_HEADER] = overlay_lookup(result[GROUP_SALES_HEADER], looked_up_group_sales)
 
         looked_up_division_sales = pd.Series(
-            sales_values.map(mappings.division_sales),
+            sales_alias_keys.map(mappings.division_sales),
             index=result.index,
             dtype="string",
         )
+        sales_division_sales = looked_up_division_sales.copy()
         if quo_values is not None:
             looked_up_division_sales = prefer_quo_lookup(
                 mappings.division_sales_by_quo,
                 looked_up_division_sales,
                 preserve_known_blank=True,
             )
+            blank_division_sales = looked_up_division_sales.astype("string").str.strip().eq("")
+            looked_up_division_sales.loc[blank_division_sales & sales_division_sales.notna()] = sales_division_sales.loc[
+                blank_division_sales & sales_division_sales.notna()
+            ]
         if DIVISION_SALES_HEADER in result.columns:
             result[DIVISION_SALES_HEADER] = overlay_lookup(result[DIVISION_SALES_HEADER], looked_up_division_sales)
         else:
@@ -757,16 +816,21 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
             result.insert(insert_at, DIVISION_SALES_HEADER, looked_up_division_sales)
 
         looked_up_segment_sales = pd.Series(
-            sales_values.map(mappings.segment_sales),
+            sales_alias_keys.map(mappings.segment_sales),
             index=result.index,
             dtype="string",
         )
+        sales_segment_sales = looked_up_segment_sales.copy()
         if quo_values is not None:
             looked_up_segment_sales = prefer_quo_lookup(
                 mappings.segment_sales_by_quo,
                 looked_up_segment_sales,
                 preserve_known_blank=True,
             )
+            blank_segment_sales = looked_up_segment_sales.astype("string").str.strip().eq("")
+            looked_up_segment_sales.loc[blank_segment_sales & sales_segment_sales.notna()] = sales_segment_sales.loc[
+                blank_segment_sales & sales_segment_sales.notna()
+            ]
         if SEGMENT_SALES_HEADER in result.columns:
             result[SEGMENT_SALES_HEADER] = overlay_lookup(result[SEGMENT_SALES_HEADER], looked_up_segment_sales)
 
