@@ -622,6 +622,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     segment_sales_by_quo_mapping: dict[str, str] = {}
     quo_keys: set[str] = set()
     complete_sales_records: list[dict[str, str]] = []
+    complete_sales_record_keys: set[str] = set()
     sales_alias_candidates: set[str] = set()
     mapping_headers = list(LOOKUP_REQUIRED_HEADERS)
     if STATUS_HEADER in lookup_df.columns:
@@ -661,13 +662,16 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
                 and not pd.isna(row[LOOKUP_SEGMENT_SALES_HEADER])
             )
             if has_complete_sales_hierarchy:
+                sales_record_key = normalize_sales_name_key(sales_value)
                 complete_record = {
                     SALES_HEADER: sales_value,
                     LOOKUP_GROUP_SALES_HEADER: str(row[LOOKUP_GROUP_SALES_HEADER]).strip(),
                     LOOKUP_DIVISION_SALES_HEADER: str(row[LOOKUP_DIVISION_SALES_HEADER]).strip(),
                     LOOKUP_SEGMENT_SALES_HEADER: str(row[LOOKUP_SEGMENT_SALES_HEADER]).strip(),
                 }
-                complete_sales_records.append(complete_record)
+                if sales_record_key not in complete_sales_record_keys:
+                    complete_sales_records.append(complete_record)
+                    complete_sales_record_keys.add(sales_record_key)
                 remember_canonical_sales_name(canonical_sales_mapping, sales_value)
                 remember_sales_alias_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
                 remember_sales_alias_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
@@ -857,7 +861,13 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
             result.insert(insert_at, SERVICE_DELIVERY_DIV_HEADER, looked_up_service_delivery_div)
 
     if quo_values is not None and PROCESS_HEADER in result.columns:
-        result[PROCESS_HEADER] = prefer_quo_lookup(mappings.process, result[PROCESS_HEADER], preserve_known_blank=True)
+        process_values = result[PROCESS_HEADER].astype("string").str.strip()
+        missing_process = process_values.isna() | process_values.eq("")
+        looked_up_process = pd.Series(quo_values.map(mappings.process), index=result.index, dtype="string")
+        has_lookup_process = looked_up_process.notna() & looked_up_process.astype("string").str.strip().ne("")
+        result.loc[missing_process & has_lookup_process, PROCESS_HEADER] = looked_up_process.loc[
+            missing_process & has_lookup_process
+        ]
 
     if quo_values is not None and SALES_HEADER in result.columns:
         result[SALES_HEADER] = prefer_quo_lookup(mappings.sales, result[SALES_HEADER], preserve_known_blank=True)
