@@ -1790,9 +1790,16 @@ def add_pivot_sheet_via_com(
                 result = chr(65 + remainder) + result
             return result
 
+        def _column_number(column_letter: str) -> int:
+            result = 0
+            for character in column_letter.upper():
+                if character.isalpha():
+                    result = result * 26 + ord(character) - ord("A") + 1
+            return result
+
         def _header_column(pt, header_row: int, header_text: str) -> int | None:
             start_col = pt.TableRange2.Column
-            end_col = start_col + pt.TableRange2.Columns.Count - 1
+            end_col = start_col + pt.TableRange2.Columns.Count + 5
             target_normalized = str(header_text).strip().lower()
             for column_index in range(start_col, end_col + 1):
                 value = pivot_sheet.Cells(header_row, column_index).Value
@@ -1804,15 +1811,35 @@ def add_pivot_sheet_via_com(
             header_row = pt.TableRange2.Row + page_field_count + 2
             data_row_start = header_row + 1
             data_row_end = pt.TableRange2.Row + pt.TableRange2.Rows.Count - 1
-            formula_col = pt.TableRange2.Column + pt.TableRange2.Columns.Count
-            formula_letter = _column_letter(formula_col)
             cancel_col = _header_column(pt, header_row, "Cancel")
             so_col = _header_column(pt, header_row, "SO Complete")
+            if so_col is None:
+                return
+
+            formula_col = max(column for column in (cancel_col, so_col) if column is not None) + 1
+            formula_letter = _column_letter(formula_col)
+            left_count_col_num = _column_number(left_count_column)
+
+            for scan_row in range(data_row_end + 1, header_row + 101):
+                has_count = pivot_sheet.Cells(scan_row, left_count_col_num).Value is not None
+                has_so = pivot_sheet.Cells(scan_row, so_col).Value is not None
+                has_cancel = cancel_col is not None and pivot_sheet.Cells(scan_row, cancel_col).Value is not None
+                if has_count or has_so or has_cancel:
+                    data_row_end = scan_row
+                    continue
+                if scan_row > data_row_start:
+                    break
+
+            for column_index in range(formula_col, formula_col + 6):
+                value = pivot_sheet.Cells(header_row, column_index).Value
+                if str(value).strip().lower() == "percentage of completion (so complete, cancel & change target)":
+                    pivot_sheet.Range(
+                        pivot_sheet.Cells(header_row, column_index),
+                        pivot_sheet.Cells(data_row_end, column_index),
+                    ).Clear()
 
             pivot_sheet.Cells(header_row, formula_col).Value = "Percentage of Completion (SO Complete, Cancel & Change Target)"
             for row_index in range(data_row_start, data_row_end + 1):
-                if so_col is None:
-                    continue
                 so_letter = _column_letter(so_col)
                 cancel_letter = _column_letter(cancel_col) if cancel_col is not None else None
                 if mode == "sum_cancel_so":
@@ -1825,14 +1852,45 @@ def add_pivot_sheet_via_com(
                         formula = f"=({cancel_letter}{row_index}+{so_letter}{row_index}/{left_count_column}{row_index})"
                     else:
                         formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
+                elif mode == "target_after":
+                    if cancel_letter is not None:
+                        formula = f"=({so_letter}{row_index}+{cancel_letter}{row_index}/{left_count_column}{row_index})"
+                    else:
+                        formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 else:
                     formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
                 pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0,00%"
 
+        def _format_percentage_completion_columns() -> None:
+            normalized_header = "percentage of completion (so complete, cancel & change target)"
+            for header_row in (9, 114, 377):
+                for column_index in range(4, 20):
+                    value = pivot_sheet.Cells(header_row, column_index).Value
+                    if str(value).strip().lower() != normalized_header:
+                        continue
+
+                    last_row = header_row
+                    for scan_row in range(header_row + 1, header_row + 101):
+                        has_count = pivot_sheet.Cells(scan_row, 3).Value is not None
+                        has_percentage = pivot_sheet.Cells(scan_row, column_index).Value is not None
+                        if has_count or has_percentage:
+                            last_row = scan_row
+                            continue
+                        if scan_row > header_row + 1:
+                            break
+
+                    if last_row > header_row:
+                        pivot_sheet.Range(
+                            pivot_sheet.Cells(header_row + 1, column_index),
+                            pivot_sheet.Cells(last_row, column_index),
+                        ).NumberFormat = "0.00%"
+                    break
+
         _write_side_percentage(pt4, 3, "C", "sum_cancel_so")
         _write_side_percentage(pt9, 3, "C", "source_non_new")
-        _write_side_percentage(pt10, 2, "C", "so_only")
+        _write_side_percentage(pt10, 2, "C", "target_after")
+        _format_percentage_completion_columns()
 
         target_wb.Save()
         print(f"[info] Added '{PIVOT_SHEET_NAME}' sheet to {output_path.name}")
@@ -2011,9 +2069,16 @@ def update_template_workbook_via_com(
                 result = chr(65 + remainder) + result
             return result
 
+        def _column_number(column_letter: str) -> int:
+            result = 0
+            for character in column_letter.upper():
+                if character.isalpha():
+                    result = result * 26 + ord(character) - ord("A") + 1
+            return result
+
         def _pivot_header_column(pivot_table, header_row: int, header_text: str) -> int | None:
             start_col = pivot_table.TableRange2.Column
-            end_col = start_col + pivot_table.TableRange2.Columns.Count - 1
+            end_col = start_col + pivot_table.TableRange2.Columns.Count + 5
             normalized_header = str(header_text).strip().lower()
             for column_index in range(start_col, end_col + 1):
                 value = pivot_sheet.Cells(header_row, column_index).Value
@@ -2022,75 +2087,140 @@ def update_template_workbook_via_com(
             return None
 
         percentage_completion_header = "Percentage of Completion (SO Complete, Cancel & Change Target)"
-        target_after_percentage_format_source = None
+        percentage_format_sources = {}
+        percentage_column_widths = {}
         target_after_percentage_format_sheet = None
-        target_after_percentage_column_width = None
 
-        def _capture_target_after_percentage_format():
-            nonlocal target_after_percentage_format_sheet, target_after_percentage_column_width
+        def _capture_percentage_formats():
+            nonlocal target_after_percentage_format_sheet
             if pivot_sheet is None:
-                return None
-
-            header_row = 377
-            normalized_header = percentage_completion_header.lower()
-            for column_index in range(4, 15):
-                value = pivot_sheet.Cells(header_row, column_index).Value
-                if str(value).strip().lower() == normalized_header:
-                    target_after_percentage_column_width = pivot_sheet.Columns(column_index).ColumnWidth
-                    source_range = pivot_sheet.Range(
-                        pivot_sheet.Cells(header_row, column_index),
-                        pivot_sheet.Cells(387, column_index),
-                    )
-                    try:
-                        target_after_percentage_format_sheet = target_wb.Worksheets.Add()
-                        target_after_percentage_format_sheet.Name = "__codex_pct_fmt"
-                        target_after_percentage_format_sheet.Visible = 0
-                        source_range.Copy()
-                        target_after_percentage_format_sheet.Range("A1").PasteSpecial(Paste=-4122)  # xlPasteFormats
-                        xl.CutCopyMode = False
-                        return target_after_percentage_format_sheet.Range("A1:A11")
-                    except Exception:
-                        return source_range
-            return None
-
-        def _repair_target_after_completion_formula(pivot_table) -> None:
-            if pivot_table.TableRange2.Row != 373:
                 return
 
-            page_field_count = 2
+            normalized_header = percentage_completion_header.lower()
+            format_rows = {9: 20, 114: 124, 377: 387}
+            for header_row, last_row in format_rows.items():
+                for column_index in range(4, 15):
+                    value = pivot_sheet.Cells(header_row, column_index).Value
+                    if str(value).strip().lower() != normalized_header:
+                        continue
+
+                    percentage_column_widths[header_row] = pivot_sheet.Columns(column_index).ColumnWidth
+                    source_range = pivot_sheet.Range(
+                        pivot_sheet.Cells(header_row, column_index),
+                        pivot_sheet.Cells(last_row, column_index),
+                    )
+                    try:
+                        if target_after_percentage_format_sheet is None:
+                            target_after_percentage_format_sheet = target_wb.Worksheets.Add()
+                            target_after_percentage_format_sheet.Name = "__codex_pct_fmt"
+                            target_after_percentage_format_sheet.Visible = 0
+
+                        destination_column = len(percentage_format_sources) + 1
+                        target_range = target_after_percentage_format_sheet.Range(
+                            target_after_percentage_format_sheet.Cells(1, destination_column),
+                            target_after_percentage_format_sheet.Cells(last_row - header_row + 1, destination_column),
+                        )
+                        source_range.Copy()
+                        target_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
+                        xl.CutCopyMode = False
+                        percentage_format_sources[header_row] = target_range
+                    except Exception:
+                        percentage_format_sources[header_row] = source_range
+                    break
+
+        def _repair_completion_formula(
+            pivot_table,
+            pivot_top_row: int,
+            page_field_count: int,
+            left_count_column: str,
+            mode: str,
+        ) -> None:
+            if pivot_table.TableRange2.Row != pivot_top_row:
+                return
+
             header_row = pivot_table.TableRange2.Row + page_field_count + 2
             data_row_start = header_row + 1
             data_row_end = pivot_table.TableRange2.Row + pivot_table.TableRange2.Rows.Count - 1
-            formula_col = pivot_table.TableRange2.Column + pivot_table.TableRange2.Columns.Count
-            formula_letter = _column_letter(formula_col)
             cancel_col = _pivot_header_column(pivot_table, header_row, "Cancel")
             so_col = _pivot_header_column(pivot_table, header_row, "SO Complete")
             if so_col is None:
                 return
 
+            formula_col = max(column for column in (cancel_col, so_col) if column is not None) + 1
+            formula_letter = _column_letter(formula_col)
+            left_count_col_num = _column_number(left_count_column)
             so_letter = _column_letter(so_col)
             cancel_letter = _column_letter(cancel_col) if cancel_col is not None else None
+
+            for scan_row in range(data_row_end + 1, header_row + 101):
+                has_count = pivot_sheet.Cells(scan_row, left_count_col_num).Value is not None
+                has_so = pivot_sheet.Cells(scan_row, so_col).Value is not None
+                has_cancel = cancel_col is not None and pivot_sheet.Cells(scan_row, cancel_col).Value is not None
+                if has_count or has_so or has_cancel:
+                    data_row_end = scan_row
+                    continue
+                if scan_row > data_row_start:
+                    break
+
+            for column_index in range(formula_col, formula_col + 6):
+                value = pivot_sheet.Cells(header_row, column_index).Value
+                if str(value).strip().lower() == percentage_completion_header.lower():
+                    pivot_sheet.Range(
+                        pivot_sheet.Cells(header_row, column_index),
+                        pivot_sheet.Cells(data_row_end, column_index),
+                    ).Clear()
+
             pivot_sheet.Cells(header_row, formula_col).Value = percentage_completion_header
             for row_index in range(data_row_start, data_row_end + 1):
-                if cancel_letter is not None:
-                    formula = f"=({so_letter}{row_index}+{cancel_letter}{row_index}/C{row_index})"
+                if mode == "sum_cancel_so" and cancel_letter is not None:
+                    formula = f"=({so_letter}{row_index}+{cancel_letter}{row_index})/{left_count_column}{row_index}"
+                elif mode == "source_non_new" and cancel_letter is not None:
+                    formula = f"=({cancel_letter}{row_index}+{so_letter}{row_index}/{left_count_column}{row_index})"
+                elif mode == "target_after" and cancel_letter is not None:
+                    formula = f"=({so_letter}{row_index}+{cancel_letter}{row_index}/{left_count_column}{row_index})"
                 else:
-                    formula = f"={so_letter}{row_index}/C{row_index}"
+                    formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
                 pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
-            if target_after_percentage_format_source is not None:
+            format_source = percentage_format_sources.get(header_row)
+            if format_source is not None:
                 try:
-                    target_after_percentage_format_source.Copy()
+                    format_source.Copy()
                     pivot_sheet.Range(
                         pivot_sheet.Cells(header_row, formula_col),
                         pivot_sheet.Cells(data_row_end, formula_col),
                     ).PasteSpecial(Paste=-4122)  # xlPasteFormats
                     xl.CutCopyMode = False
-                    if target_after_percentage_column_width is not None:
-                        pivot_sheet.Columns(formula_col).ColumnWidth = target_after_percentage_column_width
+                    if header_row in percentage_column_widths:
+                        pivot_sheet.Columns(formula_col).ColumnWidth = percentage_column_widths[header_row]
                 except Exception:
                     pass
+
+        def _format_percentage_completion_columns() -> None:
+            normalized_header = percentage_completion_header.lower()
+            for header_row in (9, 114, 377):
+                for column_index in range(4, 20):
+                    value = pivot_sheet.Cells(header_row, column_index).Value
+                    if str(value).strip().lower() != normalized_header:
+                        continue
+
+                    last_row = header_row
+                    for scan_row in range(header_row + 1, header_row + 101):
+                        has_count = pivot_sheet.Cells(scan_row, 3).Value is not None
+                        has_percentage = pivot_sheet.Cells(scan_row, column_index).Value is not None
+                        if has_count or has_percentage:
+                            last_row = scan_row
+                            continue
+                        if scan_row > header_row + 1:
+                            break
+
+                    if last_row > header_row:
+                        pivot_sheet.Range(
+                            pivot_sheet.Cells(header_row + 1, column_index),
+                            pivot_sheet.Cells(last_row, column_index),
+                        ).NumberFormat = "0.00%"
+                    break
 
         data_sheet = _sheet_by_name(target_wb, VLOOKUP_SHEET_NAME)
         generated_data_sheet = _sheet_by_name(generated_wb, VLOOKUP_SHEET_NAME)
@@ -2100,7 +2230,7 @@ def update_template_workbook_via_com(
         if data_sheet is None or generated_data_sheet is None or pivot_sheet is None:
             raise RuntimeError("Could not find required sheets for template update.")
 
-        target_after_percentage_format_source = _capture_target_after_percentage_format()
+        _capture_percentage_formats()
 
         row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet, preserve_first_table=True)
         _ensure_table(data_sheet, row_count, column_count)
@@ -2235,13 +2365,17 @@ def update_template_workbook_via_com(
                 pivot_table.RefreshTable()
                 _restore_template_specific_pivot_filters(pivot_table)
                 pivot_table.RefreshTable()
-                _repair_target_after_completion_formula(pivot_table)
+                _repair_completion_formula(pivot_table, 4, 3, "C", "sum_cancel_so")
+                _repair_completion_formula(pivot_table, 109, 3, "C", "source_non_new")
+                _repair_completion_formula(pivot_table, 373, 2, "C", "target_after")
                 refreshed_count += 1
             except Exception as exc:
                 print(
                     f"[warn] Could not refresh PivotTable '{pivot_table.Name}' on '{pivot_sheet.Name}': {exc}",
                     file=sys.stderr,
                 )
+
+        _format_percentage_completion_columns()
 
         if progress_sheet is not None:
             on_progress_cache = pivot_sheet.PivotTables()(1).PivotCache()
