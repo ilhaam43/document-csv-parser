@@ -1140,12 +1140,12 @@ def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: 
 
 
 def write_on_progress_filters(worksheet, start_col: int, phase_value: str) -> None:
-    worksheet.cell(row=1, column=start_col, value=PHASE_HEADER_PREFIX)
-    worksheet.cell(row=1, column=start_col + 1, value=phase_value)
+    worksheet.cell(row=1, column=start_col, value=YEAR_FAB_UPLOAD_HEADER)
+    worksheet.cell(row=1, column=start_col + 1, value="(Multiple Items)")
     worksheet.cell(row=2, column=start_col, value=PROCESS_ADJUSTMENT_HEADER)
     worksheet.cell(row=2, column=start_col + 1, value="(All)")
-    worksheet.cell(row=3, column=start_col, value=YEAR_FAB_UPLOAD_HEADER)
-    worksheet.cell(row=3, column=start_col + 1, value="(Multiple Items)")
+    worksheet.cell(row=3, column=start_col, value=PHASE_HEADER_PREFIX)
+    worksheet.cell(row=3, column=start_col + 1, value=phase_value)
 
 
 def write_on_progress_table(
@@ -1243,6 +1243,7 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
             try:
                 year_field = pt.PivotFields(YEAR_FAB_UPLOAD_HEADER)
                 year_field.Orientation = xlPageField
+                year_field.Position = 1
                 year_field.EnableMultiplePageItems = True
                 for item in year_field.PivotItems():
                     if is_excluded_year_fab_upload_value(item.Value):
@@ -1252,7 +1253,9 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
 
             # --- Filter: Process Adjustment (All) ---
             try:
-                pt.PivotFields(PROCESS_ADJUSTMENT_HEADER).Orientation = xlPageField
+                process_field = pt.PivotFields(PROCESS_ADJUSTMENT_HEADER)
+                process_field.Orientation = xlPageField
+                process_field.Position = 2
             except Exception:
                 pass
 
@@ -1260,6 +1263,7 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
             try:
                 phase_field = pt.PivotFields(PHASE_HEADER_PREFIX)
                 phase_field.Orientation = xlPageField
+                phase_field.Position = 3
                 if exclude_phase_values:
                     phase_field.EnableMultiplePageItems = True
                     excluded_lower = {value.lower() for value in exclude_phase_values}
@@ -1329,6 +1333,19 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
             visible_row_items=[f"Before {month_full}", "Target Not Yet Inputted"] if month_full else None,
             exclude_phase_values={"cancel", "so complete"},
         )
+
+        progress_sheet.Range("A1").Value = YEAR_FAB_UPLOAD_HEADER
+        progress_sheet.Range("B1").Value = "(Multiple Items)"
+        progress_sheet.Range("A2").Value = PROCESS_ADJUSTMENT_HEADER
+        progress_sheet.Range("B2").Value = "(All)"
+        progress_sheet.Range("A3").Value = PHASE_HEADER_PREFIX
+        progress_sheet.Range("B3").Value = "(All)"
+        progress_sheet.Range("D1").Value = YEAR_FAB_UPLOAD_HEADER
+        progress_sheet.Range("E1").Value = "(Multiple Items)"
+        progress_sheet.Range("D2").Value = PROCESS_ADJUSTMENT_HEADER
+        progress_sheet.Range("E2").Value = "(All)"
+        progress_sheet.Range("D3").Value = PHASE_HEADER_PREFIX
+        progress_sheet.Range("E3").Value = "(Multiple Items)"
 
         wb.Save()
         print(f"[info] Added PivotTables to '{on_progress_name}' in {output_path.name}")
@@ -2272,6 +2289,7 @@ def update_template_workbook_via_com(
                 try:
                     year_field = pt.PivotFields(YEAR_FAB_UPLOAD_HEADER)
                     year_field.Orientation = xl_page_field
+                    year_field.Position = 1
                     year_field.EnableMultiplePageItems = True
                     for item in year_field.PivotItems():
                         if is_excluded_year_fab_upload_value(item.Value):
@@ -2280,13 +2298,16 @@ def update_template_workbook_via_com(
                     pass
 
                 try:
-                    pt.PivotFields(PROCESS_ADJUSTMENT_HEADER).Orientation = xl_page_field
+                    process_field = pt.PivotFields(PROCESS_ADJUSTMENT_HEADER)
+                    process_field.Orientation = xl_page_field
+                    process_field.Position = 2
                 except Exception:
                     pass
 
                 try:
                     phase_field = pt.PivotFields(PHASE_HEADER_PREFIX)
                     phase_field.Orientation = xl_page_field
+                    phase_field.Position = 3
                     if exclude_phase_values:
                         phase_field.EnableMultiplePageItems = True
                         excluded_lower = {value.lower() for value in exclude_phase_values}
@@ -2350,6 +2371,19 @@ def update_template_workbook_via_com(
                 visible_row_items=[f"Before {month_full}", "Target Not Yet Inputted"] if month_full else None,
                 exclude_phase_values={"cancel", "so complete"},
             )
+
+            progress_sheet.Range("A1").Value = YEAR_FAB_UPLOAD_HEADER
+            progress_sheet.Range("B1").Value = "(Multiple Items)"
+            progress_sheet.Range("A2").Value = PROCESS_ADJUSTMENT_HEADER
+            progress_sheet.Range("B2").Value = "(All)"
+            progress_sheet.Range("A3").Value = PHASE_HEADER_PREFIX
+            progress_sheet.Range("B3").Value = "(All)"
+            progress_sheet.Range("D1").Value = YEAR_FAB_UPLOAD_HEADER
+            progress_sheet.Range("E1").Value = "(Multiple Items)"
+            progress_sheet.Range("D2").Value = PROCESS_ADJUSTMENT_HEADER
+            progress_sheet.Range("E2").Value = "(All)"
+            progress_sheet.Range("D3").Value = PHASE_HEADER_PREFIX
+            progress_sheet.Range("E3").Value = "(Multiple Items)"
 
         generated_wb.Close(SaveChanges=False)
         generated_wb = None
