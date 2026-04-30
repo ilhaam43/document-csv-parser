@@ -778,20 +778,16 @@ def apply_current_month_process_adjustment_overrides(result: pd.DataFrame, refer
 
     process_values = result[PROCESS_HEADER].astype("string").str.strip().map(normalize_header_key)
     process_adjustment_values = result[PROCESS_ADJUSTMENT_HEADER].astype("string").str.strip().fillna("")
-    fab_upload_dates = pd.to_datetime(result[FAB_UPLOAD_HEADER], errors="coerce", format="mixed")
-    current_report_month = pd.Period(reference_date, freq="M")
-
     missing_process_adjustment = process_adjustment_values.eq("")
-    current_month_or_missing_fab_upload = fab_upload_dates.isna() | fab_upload_dates.dt.to_period("M").eq(current_report_month)
     inferred_new_registration = process_values.eq("newregistration")
     has_process = process_values.notna() & process_values.ne("")
 
     result.loc[
-        missing_process_adjustment & current_month_or_missing_fab_upload & inferred_new_registration,
+        missing_process_adjustment & has_process & inferred_new_registration,
         PROCESS_ADJUSTMENT_HEADER,
     ] = "New Reg"
     result.loc[
-        missing_process_adjustment & current_month_or_missing_fab_upload & has_process & ~inferred_new_registration,
+        missing_process_adjustment & has_process & ~inferred_new_registration,
         PROCESS_ADJUSTMENT_HEADER,
     ] = "Non New Reg"
 
