@@ -33,7 +33,6 @@ TARGET_HEADER_INSERT_AFTER = "Quo"
 TARGET_SOURCE_HEADER = "Target + On Hold Duration"
 MIN_VALID_TARGET_DATE = date(2000, 1, 1)
 UNKNOWN_YEAR_FAB_UPLOAD = "1900"
-MIN_REPORTING_YEAR_FAB_UPLOAD = 2023
 YEAR_FAB_UPLOAD_BLANK_LIKE_VALUES = {"", UNKNOWN_YEAR_FAB_UPLOAD, "nan", "none", "n/a", "(blank)", "null"}
 QUO_EXCLUDE_TERM = "XBOT"
 DEPT_SD_HEADER = "Dept SD"
@@ -89,13 +88,7 @@ LOOKUP_REQUIRED_HEADERS = (
 
 def is_excluded_year_fab_upload_value(value: object) -> bool:
     normalized = str(value).strip()
-    if normalized.lower() in YEAR_FAB_UPLOAD_BLANK_LIKE_VALUES:
-        return True
-
-    if re.fullmatch(r"\d{4}(?:\.0+)?", normalized):
-        return int(float(normalized)) < MIN_REPORTING_YEAR_FAB_UPLOAD
-
-    return False
+    return normalized.lower() in YEAR_FAB_UPLOAD_BLANK_LIKE_VALUES
 
 
 @dataclass(frozen=True)
@@ -223,15 +216,13 @@ def escape_excel_formulas(df: pd.DataFrame) -> pd.DataFrame:
     return escaped
 
 
-def current_target_header() -> str:
-    today = date.today()
-    return f"TARGET  Detemined as 1 {today.strftime('%B %Y')}"
+def current_target_header(reference_date: date) -> str:
+    return f"TARGET  Detemined as 1 {reference_date.strftime('%B %Y')}"
 
 
-def current_target_values(source: pd.Series) -> pd.Series:
-    today = date.today()
-    month_name = today.strftime("%B")
-    target_month = pd.Period(today, freq="M")
+def current_target_values(source: pd.Series, reference_date: date) -> pd.Series:
+    month_name = reference_date.strftime("%B")
+    target_month = pd.Period(reference_date, freq="M")
     source_dates = pd.to_datetime(source, errors="coerce", format="mixed")
     valid_source_dates = source_dates.where(source_dates.dt.date >= MIN_VALID_TARGET_DATE)
     source_months = valid_source_dates.dt.to_period("M")
@@ -244,18 +235,18 @@ def current_target_values(source: pd.Series) -> pd.Series:
     return values
 
 
-def add_target_header(df: pd.DataFrame) -> pd.DataFrame:
+def add_target_header(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
     if TARGET_HEADER_INSERT_AFTER not in df.columns or TARGET_SOURCE_HEADER not in df.columns:
         return df
 
     result = df.copy()
-    target_header = current_target_header()
+    target_header = current_target_header(reference_date)
     if target_header in result.columns:
-        result[target_header] = current_target_values(result[TARGET_SOURCE_HEADER])
+        result[target_header] = current_target_values(result[TARGET_SOURCE_HEADER], reference_date)
         return result
 
     insert_at = result.columns.get_loc(TARGET_HEADER_INSERT_AFTER) + 1
-    result.insert(insert_at, target_header, current_target_values(result[TARGET_SOURCE_HEADER]))
+    result.insert(insert_at, target_header, current_target_values(result[TARGET_SOURCE_HEADER], reference_date))
     return result
 
 
@@ -343,7 +334,8 @@ def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -
     df = df.copy()
     df.columns = make_unique_columns(df.columns, options.normalize_headers)
     df = rename_output_headers(df)
-    df = add_target_header(df)
+    reference_date = reference_date_from_csv_path(csv_path)
+    df = add_target_header(df, reference_date)
 
     for column in df.columns:
         if pd.api.types.is_object_dtype(df[column]) or pd.api.types.is_string_dtype(df[column]):
@@ -358,7 +350,7 @@ def clean_dataframe(df: pd.DataFrame, options: ConvertOptions, csv_path: Path) -
 
     df = drop_excluded_quo_rows(df)
     df = add_year_fab_upload_column(df)
-    df = add_aging_of_rfs_column(df, reference_date_from_csv_path(csv_path))
+    df = add_aging_of_rfs_column(df, reference_date)
     df = add_status_order_column(df)
 
     if not options.keep_empty:
@@ -1121,6 +1113,12 @@ def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: 
     if source_month_label in counts_table_2:
         counts_table_2[target_month_label] = counts_table_2.pop(source_month_label)
 
+    left_labels = ordered_progress_labels(filtered_all[target_header], [target_month_label, f"After {month_name}"])
+    right_labels = ordered_progress_labels(
+        filtered_table_2[target_header],
+        [f"Before {month_name}", "Target Not Yet Inputted"],
+    )
+
     worksheet = writer.book.create_sheet(title=sheet_name)
     writer.sheets[sheet_name] = worksheet
     worksheet.sheet_properties.tabColor = EXCEL_ON_PROGRESS_TAB_COLOR
@@ -1130,18 +1128,32 @@ def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: 
         worksheet,
         start_row=5,
         start_col=1,
-        labels=[target_month_label, f"After {month_name}"],
+        labels=left_labels,
         counts=counts_all,
     )
     write_on_progress_table(
         worksheet,
         start_row=5,
         start_col=4,
-        labels=[f"Before {month_name}", "Target Not Yet Inputted"],
+        labels=right_labels,
         counts=counts_table_2,
     )
 
     autofit_worksheet_columns(worksheet)
+
+
+def ordered_progress_labels(source: pd.Series, allowed_labels: list[str]) -> list[str]:
+    allowed_lookup = {label.lower(): label for label in allowed_labels}
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    for value in source.dropna().astype("string").str.strip():
+        label = allowed_lookup.get(str(value).lower())
+        if label is not None and label not in seen:
+            ordered.append(label)
+            seen.add(label)
+
+    return [*ordered, *(label for label in allowed_labels if label not in seen)]
 
 
 def write_on_progress_filters(worksheet, start_col: int, phase_value: str) -> None:
@@ -1285,13 +1297,6 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
                         item_name = str(item.Name).strip()
                         compare_name = target_month_label if item_name == source_month_label else item_name
                         item.Visible = compare_name.lower() in visible_lower
-                    for position, label in enumerate(visible_row_items, start=1):
-                        for item in rf.PivotItems():
-                            item_name = str(item.Name).strip()
-                            compare_name = target_month_label if item_name == source_month_label else item_name
-                            if compare_name.lower() == label.lower():
-                                item.Position = position
-                                break
             except Exception:
                 pass
 
@@ -1331,7 +1336,7 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
         _build_pivot(
             "D1",
             f"PivotTable_{on_progress_name}_2",
-            visible_row_items=[f"Before {month_full}", "Target Not Yet Inputted"] if month_full else None,
+            visible_row_items=["Target Not Yet Inputted", f"Before {month_full}"] if month_full else None,
             exclude_phase_values={"cancel", "so complete"},
         )
 
@@ -1988,6 +1993,76 @@ def update_template_workbook_via_com(
         def _normalized_pivot_item_name(value: object) -> str:
             return str(value).strip().lower()
 
+        def _capture_template_progress_state() -> tuple[set[str], list[str], list[str]]:
+            hidden_year_values: set[str] = set()
+            left_row_order: list[str] = []
+            right_row_order: list[str] = []
+
+            def _remember_order(target: list[str], values: list[str]) -> None:
+                for value in values:
+                    if value not in target:
+                        target.append(value)
+
+            def _visible_labels_from_sheet(sheet, column: int) -> list[str]:
+                labels: list[str] = []
+                for row_index in range(6, min(sheet.UsedRange.Rows.Count + 1, 60)):
+                    value = sheet.Cells(row_index, column).Value
+                    text = str(value).strip() if value is not None else ""
+                    if not text:
+                        continue
+                    if text.lower() == "grand total":
+                        break
+                    labels.append(text)
+                return labels
+
+            for sheet_index in range(1, target_wb.Sheets.Count + 1):
+                sheet = target_wb.Sheets(sheet_index)
+                if not str(sheet.Name).startswith(ON_PROGRESS_SHEET_PREFIX):
+                    continue
+
+                _remember_order(left_row_order, _visible_labels_from_sheet(sheet, 1))
+                _remember_order(right_row_order, _visible_labels_from_sheet(sheet, 4))
+
+                for pivot_index in range(1, sheet.PivotTables().Count + 1):
+                    pivot_table = sheet.PivotTables()(pivot_index)
+                    try:
+                        year_field = pivot_table.PivotFields(YEAR_FAB_UPLOAD_HEADER)
+                        for item in year_field.PivotItems():
+                            if not bool(item.Visible):
+                                hidden_year_values.add(str(item.Name).strip())
+                    except Exception:
+                        pass
+
+            return hidden_year_values, left_row_order, right_row_order
+
+        def _adapt_progress_row_order(
+            template_order: list[str],
+            default_order: list[str],
+            target_month_label: str,
+            after_month_label: str,
+            before_month_label: str,
+        ) -> list[str]:
+            adapted: list[str] = []
+            for value in template_order:
+                normalized = _normalized_pivot_item_name(value)
+                if normalized.startswith("target "):
+                    label = target_month_label
+                elif normalized.startswith("after "):
+                    label = after_month_label
+                elif normalized.startswith("before "):
+                    label = before_month_label
+                elif normalized == "target not yet inputted":
+                    label = "Target Not Yet Inputted"
+                else:
+                    continue
+
+                if label not in default_order:
+                    continue
+                if label not in adapted:
+                    adapted.append(label)
+
+            return [*adapted, *(label for label in default_order if label not in adapted)]
+
         def _hide_pivot_items(pivot_table, field_name: str, hidden_values: set[str]) -> None:
             hidden_normalized = {_normalized_pivot_item_name(value) for value in hidden_values}
             try:
@@ -2106,6 +2181,7 @@ def update_template_workbook_via_com(
             raise RuntimeError("Could not find required sheets for template update.")
 
         target_after_percentage_format_source = _capture_target_after_percentage_format()
+        hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
 
         row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet, preserve_first_table=True)
         _ensure_table(data_sheet, row_count, column_count)
@@ -2131,6 +2207,22 @@ def update_template_workbook_via_com(
             month_full = date_match.group(1) if date_match else ""
             target_month_label = f"Target {month_full}" if month_full else ""
             source_month_label = f"This {month_full}" if month_full else ""
+            after_month_label = f"After {month_full}" if month_full else ""
+            before_month_label = f"Before {month_full}" if month_full else ""
+            left_order = _adapt_progress_row_order(
+                template_left_order,
+                [target_month_label, after_month_label],
+                target_month_label,
+                after_month_label,
+                before_month_label,
+            )
+            right_order = _adapt_progress_row_order(
+                template_right_order,
+                [before_month_label, "Target Not Yet Inputted"],
+                target_month_label,
+                after_month_label,
+                before_month_label,
+            )
 
             def _build_progress_pivot(
                 top_left_cell,
@@ -2149,7 +2241,10 @@ def update_template_workbook_via_com(
                     year_field.Orientation = xl_page_field
                     year_field.EnableMultiplePageItems = True
                     for item in year_field.PivotItems():
-                        if is_excluded_year_fab_upload_value(item.Value):
+                        if (
+                            str(item.Name).strip() in hidden_progress_year_values
+                            or is_excluded_year_fab_upload_value(item.Value)
+                        ):
                             item.Visible = False
                 except Exception:
                     pass
@@ -2175,21 +2270,46 @@ def update_template_workbook_via_com(
                     row_field = pt.PivotFields(target_header)
                     row_field.Orientation = xl_row_field
                     row_field.LayoutForm = xl_tabular_row
-                    if visible_row_items:
+                except Exception:
+                    pass
+
+                def _apply_row_filter() -> None:
+                    if not visible_row_items:
+                        return
+
+                    try:
+                        row_field = pt.PivotFields(target_header)
                         visible_lower = {value.lower() for value in visible_row_items}
                         for item in row_field.PivotItems():
                             item_name = str(item.Name).strip()
                             compare_name = target_month_label if item_name == source_month_label else item_name
-                            item.Visible = compare_name.lower() in visible_lower
+                            if compare_name.lower() in visible_lower:
+                                try:
+                                    item.Visible = True
+                                except Exception:
+                                    pass
+                        for item in row_field.PivotItems():
+                            item_name = str(item.Name).strip()
+                            compare_name = target_month_label if item_name == source_month_label else item_name
+                            if compare_name.lower() not in visible_lower:
+                                try:
+                                    item.Visible = False
+                                except Exception:
+                                    pass
                         for position, label in enumerate(visible_row_items, start=1):
                             for item in row_field.PivotItems():
                                 item_name = str(item.Name).strip()
                                 compare_name = target_month_label if item_name == source_month_label else item_name
                                 if compare_name.lower() == label.lower():
-                                    item.Position = position
+                                    try:
+                                        item.Position = position
+                                    except Exception:
+                                        pass
                                     break
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+
+                _apply_row_filter()
 
                 try:
                     count_field = pt.AddDataField(pt.PivotFields(QUO_HEADER), "Count of quo", xl_count)
@@ -2214,15 +2334,17 @@ def update_template_workbook_via_com(
                     except Exception:
                         pass
 
+                _apply_row_filter()
+
             _build_progress_pivot(
                 "A1",
                 f"PivotTable_{progress_sheet_name}_1",
-                visible_row_items=[target_month_label, f"After {month_full}"] if month_full else None,
+                visible_row_items=left_order if month_full else None,
             )
             _build_progress_pivot(
                 "D1",
                 f"PivotTable_{progress_sheet_name}_2",
-                visible_row_items=[f"Before {month_full}", "Target Not Yet Inputted"] if month_full else None,
+                visible_row_items=right_order if month_full else None,
                 exclude_phase_values={"cancel", "so complete"},
             )
 

@@ -350,14 +350,27 @@ def header_column(sheet, header_row: int, header_text: str, start_col: int = 5, 
     return None
 
 
+def formula_column_offsets(formula_r1c1: str) -> list[int]:
+    offsets: list[int] = []
+    for match in re.finditer(r"RC(?:\[(-?\d+)\]|(\d+))?", formula_r1c1 or ""):
+        relative_offset, absolute_column = match.groups()
+        if absolute_column is not None:
+            continue
+
+        offsets.append(int(relative_offset) if relative_offset is not None else 0)
+
+    return offsets
+
+
 def capture_percentage_completion_formats(workbook, xl):
     pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
     if pivot_sheet is None:
-        return None, {}, {}
+        return None, {}, {}, {}
 
     format_sheet = None
     format_sources = {}
     column_widths = {}
+    formula_offsets = {}
     for header_row in (9, 56, 167):
         percentage_col = header_column(pivot_sheet, header_row, PERCENTAGE_COMPLETION_HEADER)
         if percentage_col is None:
@@ -382,32 +395,43 @@ def capture_percentage_completion_formats(workbook, xl):
         xl.CutCopyMode = False
         format_sources[header_row] = target_range
         column_widths[header_row] = pivot_sheet.Columns(percentage_col).ColumnWidth
+        formula_offsets[header_row] = [
+            offset
+            for offset in formula_column_offsets(str(pivot_sheet.Cells(header_row + 1, percentage_col).FormulaR1C1))
+            if percentage_col + offset != 3
+        ]
 
-    return format_sheet, format_sources, column_widths
+    return format_sheet, format_sources, column_widths, formula_offsets
 
 
-def repair_percentage_completion_columns(workbook, xl, format_sources=None, column_widths=None) -> None:
+def repair_percentage_completion_columns(
+    workbook,
+    xl,
+    format_sources=None,
+    column_widths=None,
+    formula_offsets=None,
+) -> None:
     pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
     if pivot_sheet is None:
         return
 
     format_sources = format_sources or {}
     column_widths = column_widths or {}
+    formula_offsets = formula_offsets or {}
 
     for header_row in (9, 56, 167):
-        cancel_col = header_column(pivot_sheet, header_row, "Cancel")
         so_col = header_column(pivot_sheet, header_row, "SO Complete")
         if so_col is None:
             continue
 
-        formula_col = max(column for column in (cancel_col, so_col) if column is not None) + 1
+        formula_col = so_col + 1
         data_row_start = header_row + 1
         data_row_end = data_row_start
         for row_index in range(data_row_start, header_row + 80):
             has_count = pivot_sheet.Cells(row_index, 3).Value is not None
             has_so = pivot_sheet.Cells(row_index, so_col).Value is not None
-            has_cancel = cancel_col is not None and pivot_sheet.Cells(row_index, cancel_col).Value is not None
-            if has_count or has_so or has_cancel:
+            has_change_target = pivot_sheet.Cells(row_index, formula_col + 1).Value is not None
+            if has_count or has_so or has_change_target:
                 data_row_end = row_index
                 continue
             if row_index > data_row_start:
@@ -423,15 +447,15 @@ def repair_percentage_completion_columns(workbook, xl, format_sources=None, colu
                 ).Clear()
 
         pivot_sheet.Cells(header_row, formula_col).Value = PERCENTAGE_COMPLETION_HEADER
-        so_letter = column_letter(so_col)
-        cancel_letter = column_letter(cancel_col) if cancel_col is not None else None
         formula_letter = column_letter(formula_col)
+        source_offsets = formula_offsets.get(header_row) or [-1, 1]
+        if not source_offsets:
+            source_offsets = [-1]
+        numerator_terms = [f"{column_letter(formula_col + offset)}{{row}}" for offset in source_offsets]
 
         for row_index in range(data_row_start, data_row_end + 1):
-            if cancel_letter is not None:
-                formula = f"=({so_letter}{row_index}+{cancel_letter}{row_index})/C{row_index}"
-            else:
-                formula = f"={so_letter}{row_index}/C{row_index}"
+            numerator = "+".join(term.format(row=row_index) for term in numerator_terms)
+            formula = f"=({numerator})/C{row_index}"
             pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
             pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
@@ -485,7 +509,9 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         if source_all_order is None or target_all_order is None or target_iphone is None:
             raise ValueError("Input/reference workbook must contain ALL ORDER and ALL ORDER IPHONE sheets.")
 
-        pct_format_sheet, pct_format_sources, pct_column_widths = capture_percentage_completion_formats(target_wb, xl)
+        pct_format_sheet, pct_format_sources, pct_column_widths, pct_formula_offsets = (
+            capture_percentage_completion_formats(target_wb, xl)
+        )
         row_count, column_count = copy_used_range(source_all_order, target_all_order, xl)
         ensure_table(target_all_order, ALL_ORDER_TABLE_NAME, row_count, column_count)
         mappings = previous_iphone_mappings(reference_workbook)
@@ -493,7 +519,13 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         iphone_rows, _ = build_iphone_sheet(target_all_order, target_iphone, xl)
         progress_name = rename_progress_sheet(target_wb, report_date)
         refreshed_count = refresh_pivots(target_wb)
-        repair_percentage_completion_columns(target_wb, xl, pct_format_sources, pct_column_widths)
+        repair_percentage_completion_columns(
+            target_wb,
+            xl,
+            pct_format_sources,
+            pct_column_widths,
+            pct_formula_offsets,
+        )
 
         if pct_format_sheet is not None:
             try:
