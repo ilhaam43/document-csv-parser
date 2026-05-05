@@ -59,7 +59,17 @@ RFS_COMMMIT_HEADER = "RFS Commmit"
 AGING_OF_RFS_HEADER = "Aging Of RFS"
 STATUS_ORDER_HEADER = "STATUS ORDER"
 TARGET_SO_COMPLETE_DATE_HEADERS = ("Target SO Complete Date", "Target SO Completion Date")
-EXCEL_DATE_DISPLAY_FORMAT = "yyyy-mm-dd"
+EXCEL_DATE_SOURCE_HEADERS = (
+    "BA Create",
+    "BA Sign",
+    FAB_UPLOAD_HEADER,
+    "Link Ready",
+    RFS_COMMMIT_HEADER,
+    TARGET_SOURCE_HEADER,
+    *TARGET_SO_COMPLETE_DATE_HEADERS,
+)
+EXCEL_DATE_DISPLAY_FORMAT = "dd/mm/yyyy"
+EXCEL_DATETIME_DISPLAY_FORMAT = "dd/mm/yyyy hh:mm"
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 EXCEL_HEADER_FONT_COLOR = "FFFFFF"
 EXCEL_RED_FONT_COLOR = "FF0000"
@@ -80,6 +90,8 @@ LOOKUP_REQUIRED_HEADERS = (
     PROCESS_ADJUSTMENT_HEADER,
     PRODUCT_CATEGORY_HEADER,
     SALES_HEADER,
+)
+LOOKUP_OPTIONAL_HEADERS = (
     LOOKUP_GROUP_SALES_HEADER,
     LOOKUP_DIVISION_SALES_HEADER,
     LOOKUP_SEGMENT_SALES_HEADER,
@@ -476,6 +488,10 @@ def remember_first_mapping(mapping: dict[str, str], key: object, value: object) 
         mapping[key_text] = str(value).strip()
 
 
+def row_value(row: pd.Series, header: str) -> object:
+    return row[header] if header in row.index else pd.NA
+
+
 def normalize_sales_name_key(value: object) -> str:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
     return re.sub(r"\s+", " ", normalized)
@@ -593,6 +609,9 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
             f"Lookup workbook sheet '{VLOOKUP_SHEET_NAME}' is missing required columns: "
             f"{', '.join(missing_headers)}"
         )
+    for optional_header in LOOKUP_OPTIONAL_HEADERS:
+        if optional_header not in lookup_df.columns:
+            lookup_df[optional_header] = pd.NA
 
     pm_mapping: dict[str, str] = {}
     dept_sd_mapping: dict[str, str] = {}
@@ -617,6 +636,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     complete_sales_record_keys: set[str] = set()
     sales_alias_candidates: set[str] = set()
     mapping_headers = list(LOOKUP_REQUIRED_HEADERS)
+    mapping_headers.extend(header for header in LOOKUP_OPTIONAL_HEADERS if header in lookup_df.columns)
     if STATUS_HEADER in lookup_df.columns:
         mapping_headers.append(STATUS_HEADER)
     if PROCESS_HEADER in lookup_df.columns:
@@ -642,32 +662,35 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         remember_first_mapping(process_adjustment_mapping, quo_value, row[PROCESS_ADJUSTMENT_HEADER])
         remember_first_mapping(product_category_mapping, quo_value, row[PRODUCT_CATEGORY_HEADER])
         remember_first_mapping(sales_mapping, quo_value, row[SALES_HEADER])
-        remember_first_mapping(group_sales_by_quo_mapping, quo_value, row[LOOKUP_GROUP_SALES_HEADER])
-        remember_first_mapping(division_sales_by_quo_mapping, quo_value, row[LOOKUP_DIVISION_SALES_HEADER])
-        remember_first_mapping(segment_sales_by_quo_mapping, quo_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+        remember_first_mapping(group_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_GROUP_SALES_HEADER))
+        remember_first_mapping(division_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_DIVISION_SALES_HEADER))
+        remember_first_mapping(segment_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_SEGMENT_SALES_HEADER))
 
         sales_value = str(row[SALES_HEADER]).strip()
         if sales_value and not pd.isna(row[SALES_HEADER]):
+            group_sales_value = row_value(row, LOOKUP_GROUP_SALES_HEADER)
+            division_sales_value = row_value(row, LOOKUP_DIVISION_SALES_HEADER)
+            segment_sales_value = row_value(row, LOOKUP_SEGMENT_SALES_HEADER)
             has_complete_sales_hierarchy = (
-                not pd.isna(row[LOOKUP_GROUP_SALES_HEADER])
-                and not pd.isna(row[LOOKUP_DIVISION_SALES_HEADER])
-                and not pd.isna(row[LOOKUP_SEGMENT_SALES_HEADER])
+                not pd.isna(group_sales_value)
+                and not pd.isna(division_sales_value)
+                and not pd.isna(segment_sales_value)
             )
             if has_complete_sales_hierarchy:
                 sales_record_key = normalize_sales_name_key(sales_value)
                 complete_record = {
                     SALES_HEADER: sales_value,
-                    LOOKUP_GROUP_SALES_HEADER: str(row[LOOKUP_GROUP_SALES_HEADER]).strip(),
-                    LOOKUP_DIVISION_SALES_HEADER: str(row[LOOKUP_DIVISION_SALES_HEADER]).strip(),
-                    LOOKUP_SEGMENT_SALES_HEADER: str(row[LOOKUP_SEGMENT_SALES_HEADER]).strip(),
+                    LOOKUP_GROUP_SALES_HEADER: str(group_sales_value).strip(),
+                    LOOKUP_DIVISION_SALES_HEADER: str(division_sales_value).strip(),
+                    LOOKUP_SEGMENT_SALES_HEADER: str(segment_sales_value).strip(),
                 }
                 if sales_record_key not in complete_sales_record_keys:
                     complete_sales_records.append(complete_record)
                     complete_sales_record_keys.add(sales_record_key)
                 remember_canonical_sales_name(canonical_sales_mapping, sales_value)
-                remember_sales_alias_mapping(group_sales_mapping, sales_value, row[LOOKUP_GROUP_SALES_HEADER])
-                remember_sales_alias_mapping(division_sales_mapping, sales_value, row[LOOKUP_DIVISION_SALES_HEADER])
-                remember_sales_alias_mapping(segment_sales_mapping, sales_value, row[LOOKUP_SEGMENT_SALES_HEADER])
+                remember_sales_alias_mapping(group_sales_mapping, sales_value, group_sales_value)
+                remember_sales_alias_mapping(division_sales_mapping, sales_value, division_sales_value)
+                remember_sales_alias_mapping(segment_sales_mapping, sales_value, segment_sales_value)
             else:
                 sales_alias_candidates.add(sales_value)
 
@@ -2054,6 +2077,51 @@ def update_template_workbook_via_com(
                     except Exception:
                         pass
 
+        def _capture_template_date_number_formats(sheet) -> dict[str, str]:
+            formats: dict[str, str] = {}
+            used_range = sheet.UsedRange
+            row_count = used_range.Rows.Count
+            column_count = used_range.Columns.Count
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                header_text = str(header_value).strip() if header_value is not None else ""
+                if not header_text or not is_excel_date_source_header(header_text):
+                    continue
+
+                for row_index in range(2, min(row_count, 500) + 1):
+                    cell = sheet.Cells(row_index, column_index)
+                    if cell.Value is None:
+                        continue
+
+                    number_format = str(cell.NumberFormat)
+                    if number_format and number_format.lower() != "general":
+                        formats[normalize_header_key(header_text)] = number_format
+                    break
+            return formats
+
+        def _apply_template_date_number_formats(
+            sheet,
+            row_count: int,
+            column_count: int,
+            number_formats: dict[str, str],
+        ) -> None:
+            if not number_formats or row_count < 2:
+                return
+
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                header_key = normalize_header_key(header_value)
+                number_format = number_formats.get(header_key)
+                if not number_format:
+                    continue
+
+                try:
+                    sheet.Range(sheet.Cells(2, column_index), sheet.Cells(row_count, column_index)).NumberFormat = (
+                        number_format
+                    )
+                except Exception:
+                    pass
+
         def _delete_on_progress_sheets() -> None:
             for sheet_index in range(target_wb.Sheets.Count, 0, -1):
                 sheet = target_wb.Sheets(sheet_index)
@@ -2238,6 +2306,47 @@ def update_template_workbook_via_com(
             if so_col is None:
                 return
 
+            def _apply_percentage_presentation(format_source) -> None:
+                try:
+                    if format_source is not None:
+                        format_source.Copy()
+                        pivot_sheet.Range(
+                            pivot_sheet.Cells(header_row, formula_col),
+                            pivot_sheet.Cells(data_row_end, formula_col),
+                        ).PasteSpecial(Paste=-4122)  # xlPasteFormats
+                        xl.CutCopyMode = False
+
+                        if format_source.Rows.Count >= 2 and data_row_end >= data_row_start:
+                            format_source.Cells(2, 1).Copy()
+                            pivot_sheet.Range(
+                                pivot_sheet.Cells(data_row_start, formula_col),
+                                pivot_sheet.Cells(data_row_end, formula_col),
+                            ).PasteSpecial(Paste=-4122)  # xlPasteFormats
+                            xl.CutCopyMode = False
+                except Exception:
+                    pass
+
+                try:
+                    percentage_range = pivot_sheet.Range(
+                        pivot_sheet.Cells(header_row, formula_col),
+                        pivot_sheet.Cells(data_row_end, formula_col),
+                    )
+                    for border_index in (7, 8, 9, 10):  # left, top, bottom, right
+                        border = percentage_range.Borders(border_index)
+                        border.LineStyle = 1
+                        border.Weight = 2
+                        border.Color = 255
+                except Exception:
+                    pass
+
+                try:
+                    pivot_sheet.Range(
+                        pivot_sheet.Cells(data_row_start, formula_col),
+                        pivot_sheet.Cells(data_row_end, formula_col),
+                    ).NumberFormat = "0.00%"
+                except Exception:
+                    pass
+
             formula_col = max(column for column in (cancel_col, so_col) if column is not None) + 1
             formula_letter = _column_letter(formula_col)
             left_count_col_num = _column_number(left_count_column)
@@ -2276,16 +2385,10 @@ def update_template_workbook_via_com(
                 pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
             format_source = percentage_format_sources.get(header_row)
-            if format_source is not None:
+            _apply_percentage_presentation(format_source)
+            if header_row in percentage_column_widths:
                 try:
-                    format_source.Copy()
-                    pivot_sheet.Range(
-                        pivot_sheet.Cells(header_row, formula_col),
-                        pivot_sheet.Cells(data_row_end, formula_col),
-                    ).PasteSpecial(Paste=-4122)  # xlPasteFormats
-                    xl.CutCopyMode = False
-                    if header_row in percentage_column_widths:
-                        pivot_sheet.Columns(formula_col).ColumnWidth = percentage_column_widths[header_row]
+                    pivot_sheet.Columns(formula_col).ColumnWidth = percentage_column_widths[header_row]
                 except Exception:
                     pass
 
@@ -2324,10 +2427,12 @@ def update_template_workbook_via_com(
 
         _capture_percentage_formats()
         hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
+        template_date_number_formats = _capture_template_date_number_formats(data_sheet)
 
         row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet, preserve_first_table=True)
         _ensure_table(data_sheet, row_count, column_count)
         _hide_columns_by_header(data_sheet, row_count, column_count)
+        _apply_template_date_number_formats(data_sheet, row_count, column_count, template_date_number_formats)
 
         _delete_on_progress_sheets()
         progress_sheet = None
@@ -2572,23 +2677,41 @@ def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> 
         for cell in worksheet[1]
         if cell.value is not None and str(cell.value).strip()
     }
-    target_header = next(
-        (header for header in TARGET_SO_COMPLETE_DATE_HEADERS if header in df.columns and header in header_positions),
-        None,
-    )
-    if target_header is None:
-        return
-
-    target_dates = pd.to_datetime(df[target_header], errors="coerce", format="mixed")
-    target_column = header_positions[target_header]
-
-    for row_index, target_date in enumerate(target_dates, start=2):
-        if pd.isna(target_date):
+    for header in df.columns:
+        header_text = str(header).strip()
+        if header_text not in header_positions or not is_excel_date_source_header(header_text):
             continue
 
-        cell = worksheet.cell(row=row_index, column=target_column)
-        cell.value = target_date.to_pydatetime()
-        cell.number_format = EXCEL_DATE_DISPLAY_FORMAT
+        source_values = df[header].dropna()
+        if source_values.empty:
+            continue
+
+        parsed_source_dates = pd.to_datetime(source_values, errors="coerce", format="mixed")
+        if parsed_source_dates.notna().mean() < 0.8:
+            continue
+
+        target_dates = pd.to_datetime(df[header], errors="coerce", format="mixed")
+        target_column = header_positions[header_text]
+        has_time_component = (
+            target_dates.dropna().dt.hour.ne(0)
+            | target_dates.dropna().dt.minute.ne(0)
+            | target_dates.dropna().dt.second.ne(0)
+        ).any()
+        number_format = EXCEL_DATETIME_DISPLAY_FORMAT if has_time_component else EXCEL_DATE_DISPLAY_FORMAT
+
+        for row_index, target_date in enumerate(target_dates, start=2):
+            if pd.isna(target_date):
+                continue
+
+            cell = worksheet.cell(row=row_index, column=target_column)
+            cell.value = target_date.to_pydatetime()
+            cell.number_format = number_format
+
+
+def is_excel_date_source_header(header: str) -> bool:
+    normalized = normalize_header_key(header)
+    explicit_headers = {normalize_header_key(value) for value in EXCEL_DATE_SOURCE_HEADERS}
+    return normalized in explicit_headers or "date" in normalized
 
 
 def apply_worksheet_presentation(worksheet) -> None:
