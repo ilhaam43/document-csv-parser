@@ -370,15 +370,30 @@ def is_dated_phase_header(header_value: object) -> bool:
     return bool(re.match(r"^phase\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}$", text, flags=re.IGNORECASE))
 
 
+def date_from_dated_phase_header(header_value: object) -> date | None:
+    match = re.match(r"^phase\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})$", str(header_value).strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%d %B %Y").date()
+    except ValueError:
+        return None
+
+
 def find_source_dynamic_headers(source_headers: list[object], reference_date: date) -> tuple[str, str]:
     target_header = None
     phase_header = None
+    expected_phase_date = reference_date - timedelta(days=1)
     for header_value in source_headers:
         if header_value is None:
             continue
         if target_header is None and is_target_determined_header(header_value):
             target_header = str(header_value)
-        if phase_header is None and is_dated_phase_header(header_value):
+        if (
+            phase_header is None
+            and is_dated_phase_header(header_value)
+            and date_from_dated_phase_header(header_value) == expected_phase_date
+        ):
             phase_header = str(header_value)
         if target_header is not None and phase_header is not None:
             break
