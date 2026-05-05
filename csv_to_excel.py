@@ -2248,6 +2248,7 @@ def update_template_workbook_via_com(
 
         percentage_completion_header = "Percentage of Completion (SO Complete, Cancel & Change Target)"
         percentage_format_sources = {}
+        percentage_format_roles = {}
         percentage_column_widths = {}
         target_after_percentage_format_sheet = None
 
@@ -2264,6 +2265,24 @@ def update_template_workbook_via_com(
                     if str(value).strip().lower() != normalized_header:
                         continue
 
+                    grand_total_row = None
+                    for row_index in range(header_row + 1, last_row + 1):
+                        if str(pivot_sheet.Cells(row_index, 1).Value).strip().lower() == "grand total":
+                            grand_total_row = row_index
+                            break
+
+                    grand_total_relative_row = (
+                        grand_total_row - header_row + 1
+                        if grand_total_row is not None
+                        else min(last_row - header_row + 1, 3)
+                    )
+                    percentage_format_roles[header_row] = {
+                        "header": 1,
+                        "first_detail": 2,
+                        "middle_detail": 3 if grand_total_relative_row > 3 else 2,
+                        "last_detail": max(2, grand_total_relative_row - 1),
+                        "grand_total": grand_total_relative_row,
+                    }
                     percentage_column_widths[header_row] = pivot_sheet.Columns(column_index).ColumnWidth
                     source_range = pivot_sheet.Range(
                         pivot_sheet.Cells(header_row, column_index),
@@ -2307,35 +2326,33 @@ def update_template_workbook_via_com(
                 return
 
             def _apply_percentage_presentation(format_source) -> None:
-                try:
-                    if format_source is not None:
-                        format_source.Copy()
+                def _copy_format(source_row: int, target_start_row: int, target_end_row: int | None = None) -> None:
+                    if format_source is None or target_start_row > (target_end_row or target_start_row):
+                        return
+
+                    target_end_row = target_end_row or target_start_row
+                    try:
+                        format_source.Cells(source_row, 1).Copy()
                         pivot_sheet.Range(
-                            pivot_sheet.Cells(header_row, formula_col),
-                            pivot_sheet.Cells(data_row_end, formula_col),
+                            pivot_sheet.Cells(target_start_row, formula_col),
+                            pivot_sheet.Cells(target_end_row, formula_col),
                         ).PasteSpecial(Paste=-4122)  # xlPasteFormats
                         xl.CutCopyMode = False
-
-                        if format_source.Rows.Count >= 2 and data_row_end >= data_row_start:
-                            format_source.Cells(2, 1).Copy()
-                            pivot_sheet.Range(
-                                pivot_sheet.Cells(data_row_start, formula_col),
-                                pivot_sheet.Cells(data_row_end, formula_col),
-                            ).PasteSpecial(Paste=-4122)  # xlPasteFormats
-                            xl.CutCopyMode = False
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
                 try:
-                    percentage_range = pivot_sheet.Range(
-                        pivot_sheet.Cells(header_row, formula_col),
-                        pivot_sheet.Cells(data_row_end, formula_col),
-                    )
-                    for border_index in (7, 8, 9, 10):  # left, top, bottom, right
-                        border = percentage_range.Borders(border_index)
-                        border.LineStyle = 1
-                        border.Weight = 2
-                        border.Color = 255
+                    if format_source is not None:
+                        roles = percentage_format_roles.get(header_row, {})
+                        _copy_format(roles.get("header", 1), header_row)
+                        _copy_format(roles.get("first_detail", 2), data_row_start)
+                        _copy_format(
+                            roles.get("middle_detail", 2),
+                            data_row_start + 1,
+                            max(data_row_start + 1, data_row_end - 2),
+                        )
+                        _copy_format(roles.get("last_detail", 2), data_row_end - 1)
+                        _copy_format(roles.get("grand_total", format_source.Rows.Count), data_row_end)
                 except Exception:
                     pass
 
