@@ -68,8 +68,8 @@ EXCEL_DATE_SOURCE_HEADERS = (
     TARGET_SOURCE_HEADER,
     *TARGET_SO_COMPLETE_DATE_HEADERS,
 )
-EXCEL_DATE_DISPLAY_FORMAT = "dd/mm/yyyy"
-EXCEL_DATETIME_DISPLAY_FORMAT = "dd/mm/yyyy hh:mm"
+EXCEL_DATE_DISPLAY_FORMAT = "mm/dd/yyyy"
+EXCEL_DATETIME_DISPLAY_FORMAT = "mm/dd/yyyy hh:mm"
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 EXCEL_HEADER_FONT_COLOR = "FFFFFF"
 EXCEL_RED_FONT_COLOR = "FF0000"
@@ -2077,6 +2077,46 @@ def update_template_workbook_via_com(
                     except Exception:
                         pass
 
+        def _capture_template_column_widths(sheet) -> dict[str, float]:
+            widths: dict[str, float] = {}
+            column_count = sheet.UsedRange.Columns.Count
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                header_key = normalize_header_key(header_value)
+                if not header_key:
+                    continue
+
+                try:
+                    widths[header_key] = float(sheet.Columns(column_index).ColumnWidth)
+                except Exception:
+                    pass
+            return widths
+
+        def _apply_template_column_widths(
+            sheet,
+            column_count: int,
+            column_widths: dict[str, float],
+        ) -> None:
+            if not column_widths:
+                return
+
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                header_key = normalize_header_key(header_value)
+                width = column_widths.get(header_key)
+                if width is None:
+                    continue
+
+                try:
+                    sheet.Columns(column_index).ColumnWidth = width
+                except Exception:
+                    pass
+
+        def _normalized_excel_date_number_format(number_format: str) -> str:
+            normalized = number_format.lower()
+            has_time = "h" in normalized or "s" in normalized
+            return EXCEL_DATETIME_DISPLAY_FORMAT if has_time else EXCEL_DATE_DISPLAY_FORMAT
+
         def _capture_template_date_number_formats(sheet) -> dict[str, str]:
             formats: dict[str, str] = {}
             used_range = sheet.UsedRange
@@ -2095,7 +2135,9 @@ def update_template_workbook_via_com(
 
                     number_format = str(cell.NumberFormat)
                     if number_format and number_format.lower() != "general":
-                        formats[normalize_header_key(header_text)] = number_format
+                        formats[normalize_header_key(header_text)] = _normalized_excel_date_number_format(
+                            number_format
+                        )
                     break
             return formats
 
@@ -2119,6 +2161,27 @@ def update_template_workbook_via_com(
                     sheet.Range(sheet.Cells(2, column_index), sheet.Cells(row_count, column_index)).NumberFormat = (
                         number_format
                     )
+                except Exception:
+                    pass
+
+        def _ensure_date_column_widths(sheet, column_count: int) -> None:
+            minimum_date_width = len("mm/dd/yyyy") + 2
+            minimum_datetime_width = len("mm/dd/yyyy hh:mm") + 2
+            for column_index in range(1, column_count + 1):
+                header_value = sheet.Cells(1, column_index).Value
+                header_text = str(header_value).strip() if header_value is not None else ""
+                if not header_text:
+                    continue
+
+                number_format = str(sheet.Cells(2, column_index).NumberFormat).lower()
+                is_date_format = "mm/dd/yyyy" in number_format
+                if not is_date_format and not is_excel_date_source_header(header_text):
+                    continue
+
+                minimum_width = minimum_datetime_width if "h" in number_format else minimum_date_width
+                try:
+                    if float(sheet.Columns(column_index).ColumnWidth) < minimum_width:
+                        sheet.Columns(column_index).ColumnWidth = minimum_width
                 except Exception:
                     pass
 
@@ -2444,12 +2507,15 @@ def update_template_workbook_via_com(
 
         _capture_percentage_formats()
         hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
+        template_column_widths = _capture_template_column_widths(data_sheet)
         template_date_number_formats = _capture_template_date_number_formats(data_sheet)
 
         row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet, preserve_first_table=True)
         _ensure_table(data_sheet, row_count, column_count)
+        _apply_template_column_widths(data_sheet, column_count, template_column_widths)
         _hide_columns_by_header(data_sheet, row_count, column_count)
         _apply_template_date_number_formats(data_sheet, row_count, column_count, template_date_number_formats)
+        _ensure_date_column_widths(data_sheet, column_count)
 
         _delete_on_progress_sheets()
         progress_sheet = None
@@ -2696,11 +2762,14 @@ def apply_target_so_complete_date_filter_format(worksheet, df: pd.DataFrame) -> 
     }
     for header in df.columns:
         header_text = str(header).strip()
-        if header_text not in header_positions or not is_excel_date_source_header(header_text):
+        if header_text not in header_positions:
             continue
 
         source_values = df[header].dropna()
         if source_values.empty:
+            continue
+
+        if not is_excel_date_source_header(header_text) and not is_date_like_series(source_values):
             continue
 
         parsed_source_dates = pd.to_datetime(source_values, errors="coerce", format="mixed")
@@ -2729,6 +2798,28 @@ def is_excel_date_source_header(header: str) -> bool:
     normalized = normalize_header_key(header)
     explicit_headers = {normalize_header_key(value) for value in EXCEL_DATE_SOURCE_HEADERS}
     return normalized in explicit_headers or "date" in normalized
+
+
+def is_date_like_series(source_values: pd.Series) -> bool:
+    if source_values.empty:
+        return False
+
+    as_text = source_values.astype("string").str.strip()
+    as_text = as_text[as_text.ne("")]
+    if as_text.empty:
+        return False
+
+    date_shaped = as_text.str.contains(
+        r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}",
+        regex=True,
+        na=False,
+    )
+    datetime_values = source_values.map(lambda value: isinstance(value, (datetime, date)), na_action="ignore")
+    if not (date_shaped | datetime_values.reindex(date_shaped.index, fill_value=False)).mean() >= 0.8:
+        return False
+
+    parsed_dates = pd.to_datetime(source_values, errors="coerce", format="mixed")
+    return parsed_dates.notna().mean() >= 0.8
 
 
 def apply_worksheet_presentation(worksheet) -> None:
