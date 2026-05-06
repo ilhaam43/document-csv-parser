@@ -15,6 +15,16 @@ By default, the script reads CSV files from `.\input-today` and writes results t
 - Optionally removes duplicate rows.
 - Optionally infers numeric and date columns.
 
+## Latest Repo Notes
+
+- `csv_to_excel.py` still supports the original standalone CLI flow from `input-today` to `output-today`.
+- `run_daily_pipeline.py` adds an optional one-command flow that runs the daily tracking, ongoing tracking, and iPhone tracking generators sequentially.
+- The one-command pipeline is an additional option only. It does not replace the standalone scripts.
+- `csv_to_excel.py` can now receive a specific yesterday/reference workbook internally, so the pipeline can pass `Daily Tracking Yesterday.xlsx` directly without changing the old CLI behavior.
+- The daily tracking and iPhone generators now preserve header captions, header styling, and column widths from the reference/template workbook more closely.
+- Date-like columns are scanned and formatted as Excel dates using `mm/dd/yyyy`; date-time columns keep time using `mm/dd/yyyy hh:mm`.
+- The iPhone generator preserves the column model for both `ALL ORDER` and `ALL ORDER IPHONE`, including dynamic headers such as `TARGET ...` and `Phase ...`.
+
 ## Run Locally
 
 ```powershell
@@ -34,6 +44,80 @@ Combine every CSV in a folder into one workbook:
 
 ```powershell
 python csv_to_excel.py .\input-today -o .\output-today\combined.xlsx --combine
+```
+
+## Run Standalone Scripts
+
+Daily Tracking only:
+
+```powershell
+python .\csv_to_excel.py .\input-today -o .\output-today
+```
+
+Ongoing Tracking only:
+
+```powershell
+python .\csv_to_excel_on_going.py .\input-ongoing -o .\output-outgoing
+```
+
+iPhone Tracking only:
+
+```powershell
+python .\generate_iphone_tracking.py .\input-iphone -r .\vlookup-iphone -o .\output-iphone
+```
+
+The standalone scripts keep their original folders and commands. Use these when you only need one report.
+
+## Run Full Daily Pipeline
+
+Use this when you want one command to generate all three reports:
+
+1. Daily Tracking
+2. Daily Tracking On Progress
+3. Daily Tracking iPhone
+
+Required folder structure:
+
+```text
+input-pipeline/
+  data-order/
+    DataOrderSD-YYYYMMDD-*.csv
+  log-update/
+    LogUpdateStatusOrderSD-YYYYMMDD-*.csv
+
+reference-pipeline/
+  daily-yesterday/
+    Daily Tracking <yesterday>.xlsx
+  ongoing-yesterday/
+    Daily Tracking On Progress <yesterday>.xlsx
+  iphone-yesterday/
+    Daily Tracking Iphone <yesterday>.xlsx
+
+output-pipeline/
+```
+
+Run the pipeline:
+
+```powershell
+python .\run_daily_pipeline.py `
+  --data-order .\input-pipeline\data-order `
+  --daily-reference .\reference-pipeline\daily-yesterday `
+  --log-update .\input-pipeline\log-update `
+  --ongoing-reference .\reference-pipeline\ongoing-yesterday `
+  --iphone-reference .\reference-pipeline\iphone-yesterday `
+  -o .\output-pipeline
+```
+
+The pipeline runs the Excel COM-based steps one by one for reliability. This is intentional because running multiple Excel COM processes in parallel can cause workbook locks, failed saves, or unstable pivot refreshes.
+
+Optional pipeline flags:
+
+```text
+--skip-ongoing           Generate only Daily Tracking and iPhone output.
+--skip-iphone            Generate only Daily Tracking and ongoing output.
+--skip-template-refresh  Skip Excel COM refresh for the Daily Tracking step.
+--ongoing-with-pivot     Also refresh the ongoing ALL ORDER ON PROGRESS pivots.
+--keep-temp              Keep temporary pipeline folders for debugging.
 ```
 
 ## Run With Docker
