@@ -115,6 +115,7 @@ class ConvertOptions:
     infer_types: bool
     combine: bool
     refresh_template: bool = True
+    lookup_workbook: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -472,6 +473,10 @@ def resolve_vlookup_workbook() -> Path:
         raise FileNotFoundError(f"No lookup workbook found in: {lookup_dir}")
 
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def lookup_workbook_for_options(options: ConvertOptions) -> Path:
+    return options.lookup_workbook or resolve_vlookup_workbook()
 
 
 def phase_lookup_header(lookup_workbook: Path) -> str:
@@ -2112,6 +2117,142 @@ def update_template_workbook_via_com(
                 except Exception:
                     pass
 
+        def _capture_sheet_header_model(sheet, column_count: int) -> dict[str, object]:
+            model_sheet = target_wb.Worksheets.Add()
+            model_sheet.Visible = 0
+            try:
+                sheet.Range(sheet.Cells(1, 1), sheet.Cells(1, column_count)).Copy()
+                model_sheet.Range(model_sheet.Cells(1, 1), model_sheet.Cells(1, column_count)).PasteSpecial(
+                    Paste=-4122
+                )  # xlPasteFormats
+                xl.CutCopyMode = False
+                return {
+                    "sheet": model_sheet,
+                    "captions": {
+                        column_index: sheet.Cells(1, column_index).Value
+                        for column_index in range(1, column_count + 1)
+                    },
+                    "widths": {
+                        column_index: sheet.Columns(column_index).ColumnWidth
+                        for column_index in range(1, column_count + 1)
+                    },
+                    "hidden": {
+                        column_index: sheet.Columns(column_index).Hidden
+                        for column_index in range(1, column_count + 1)
+                    },
+                    "row_height": sheet.Rows(1).RowHeight,
+                }
+            except Exception:
+                try:
+                    model_sheet.Delete()
+                except Exception:
+                    pass
+                raise
+
+        def _generated_header_caption(header_value: object, template_caption: object | None) -> object:
+            current = str(header_value or "").strip()
+            normalized_current = normalize_header_key(current)
+            if normalized_current == normalize_header_key(GROUP_SALES_HEADER):
+                return "Group Sales"
+            if normalized_current == normalize_header_key(DIVISION_SALES_HEADER):
+                return "Column1"
+            if normalized_current == normalize_header_key(SEGMENT_SALES_HEADER):
+                return "Segment Sales"
+            if template_caption is not None:
+                template = str(template_caption).strip()
+                if normalize_header_key(template) == normalized_current:
+                    return template_caption
+
+            if normalized_current == normalize_header_key(QUO_HEADER):
+                return "quo"
+            if normalized_current == normalize_header_key(SERVICE_DELIVERY_DIV_HEADER):
+                return LOOKUP_SERVICE_DELIVERY_DIV_HEADER + " "
+            target_match = re.match(
+                r"^(TARGET\s+Detemined as 1\s+[A-Za-z]+)\s+(\d{4})$",
+                current,
+                flags=re.IGNORECASE,
+            )
+            if target_match:
+                return f"{target_match.group(1)} {target_match.group(2)[-2:]}"
+            return header_value
+
+        def _apply_sales_header_model(sheet, column_count: int) -> None:
+            sales_header_keys = {
+                normalize_header_key("Group Sales"),
+                normalize_header_key("Column1"),
+                normalize_header_key("Segment Sales"),
+                normalize_header_key(SALES_HEADER),
+            }
+            for column_index in range(1, column_count + 1):
+                header_key = normalize_header_key(sheet.Cells(1, column_index).Value)
+                if header_key not in sales_header_keys:
+                    continue
+                try:
+                    sheet.Cells(1, column_index).Interior.Color = 16777215
+                    sheet.Cells(1, column_index).Font.Color = 0
+                    sheet.Cells(1, column_index).Font.Bold = True
+                except Exception:
+                    pass
+
+        def _apply_sheet_header_model(sheet, model: dict[str, object], column_count: int) -> None:
+            model_sheet = model.get("sheet")
+            if model_sheet is not None:
+                try:
+                    model_sheet.Range(
+                        model_sheet.Cells(1, 1),
+                        model_sheet.Cells(1, column_count),
+                    ).Copy()
+                    sheet.Range(sheet.Cells(1, 1), sheet.Cells(1, column_count)).PasteSpecial(Paste=-4122)
+                    xl.CutCopyMode = False
+                except Exception:
+                    pass
+
+            captions = model.get("captions", {})
+            if isinstance(captions, dict):
+                for column_index in range(1, column_count + 1):
+                    sheet.Cells(1, column_index).Value = _generated_header_caption(
+                        sheet.Cells(1, column_index).Value,
+                        captions.get(column_index),
+                    )
+
+            widths = model.get("widths", {})
+            if isinstance(widths, dict):
+                for column_index in range(1, column_count + 1):
+                    width = widths.get(column_index)
+                    if width is None:
+                        continue
+                    try:
+                        sheet.Columns(column_index).ColumnWidth = width
+                    except Exception:
+                        pass
+
+            hidden = model.get("hidden", {})
+            if isinstance(hidden, dict):
+                for column_index in range(1, column_count + 1):
+                    if column_index not in hidden:
+                        continue
+                    try:
+                        sheet.Columns(column_index).Hidden = hidden[column_index]
+                    except Exception:
+                        pass
+
+            row_height = model.get("row_height")
+            if row_height is not None:
+                try:
+                    sheet.Rows(1).RowHeight = row_height
+                except Exception:
+                    pass
+            _apply_sales_header_model(sheet, column_count)
+
+        def _delete_sheet_header_model(model: dict[str, object]) -> None:
+            model_sheet = model.get("sheet")
+            if model_sheet is None:
+                return
+            try:
+                model_sheet.Delete()
+            except Exception:
+                pass
+
         def _normalized_excel_date_number_format(number_format: str) -> str:
             normalized = number_format.lower()
             has_time = "h" in normalized or "s" in normalized
@@ -2507,6 +2648,7 @@ def update_template_workbook_via_com(
 
         _capture_percentage_formats()
         hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
+        template_header_model = _capture_sheet_header_model(data_sheet, generated_data_sheet.UsedRange.Columns.Count)
         template_column_widths = _capture_template_column_widths(data_sheet)
         template_date_number_formats = _capture_template_date_number_formats(data_sheet)
 
@@ -2730,6 +2872,9 @@ def update_template_workbook_via_com(
                 target_after_percentage_format_sheet.Delete()
             except Exception:
                 pass
+
+        _apply_sheet_header_model(data_sheet, template_header_model, column_count)
+        _delete_sheet_header_model(template_header_model)
 
         target_wb.Save()
         print(f"[info] Refreshed {refreshed_count} template PivotTables in {output_path.name}")
@@ -2979,6 +3124,7 @@ def build_options(args: argparse.Namespace, output_path: Path) -> ConvertOptions
         infer_types=args.infer_types,
         combine=args.combine,
         refresh_template=not args.skip_template_refresh,
+        lookup_workbook=None,
     )
 
 
@@ -2993,7 +3139,7 @@ def convert_csv_files(input_path: Path, csv_files: list[Path], output_path: Path
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
-    lookup_workbook = resolve_vlookup_workbook()
+    lookup_workbook = lookup_workbook_for_options(options)
     mappings = load_lookup_mappings(lookup_workbook)
     progress_sheet_name = on_progress_sheet_name(csv_path)
 
@@ -3025,7 +3171,7 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
 
 
 def convert_many(csv_files: list[Path], options: ConvertOptions) -> None:
-    mappings = load_lookup_mappings(resolve_vlookup_workbook())
+    mappings = load_lookup_mappings(lookup_workbook_for_options(options))
     if options.combine:
         options.output.parent.mkdir(parents=True, exist_ok=True)
         used_sheet_names: set[str] = set()

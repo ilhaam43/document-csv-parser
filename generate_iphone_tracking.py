@@ -138,8 +138,171 @@ def ensure_table(sheet, table_name: str, row_count: int, column_count: int) -> N
     table.TableStyle = EXCEL_TABLE_STYLE_NAME
 
 
+def iphone_header_caption(header_value: object) -> object:
+    text = str(header_value or "").strip()
+    if normalize_header_key(text) == normalize_header_key(QUO_HEADER):
+        return QUO_HEADER
+    if normalize_header_key(text) == normalize_header_key("Service Delivery Div"):
+        return "Service Delivery Div. "
+
+    target_match = re.match(
+        r"^(TARGET\s+Detemined as 1\s+[A-Za-z]+)\s+(\d{4})$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if target_match:
+        return f"{target_match.group(1)} {target_match.group(2)[-2:]}"
+
+    return header_value
+
+
+def is_dated_phase_header(header_value: object) -> bool:
+    return bool(re.match(r"^phase\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}$", str(header_value).strip(), flags=re.IGNORECASE))
+
+
+def capture_sheet_column_model(sheet, column_count: int) -> dict[str, object]:
+    template_sheet = sheet.Parent.Worksheets.Add()
+    template_sheet.Visible = 0
+    try:
+        source_range = sheet.Range(sheet.Cells(1, 1), sheet.Cells(1, column_count))
+        target_range = template_sheet.Range(template_sheet.Cells(1, 1), template_sheet.Cells(1, column_count))
+        source_range.Copy()
+        target_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
+        widths = {
+            column_index: sheet.Columns(column_index).ColumnWidth
+            for column_index in range(1, column_count + 1)
+        }
+        captions = {
+            column_index: sheet.Cells(1, column_index).Value
+            for column_index in range(1, column_count + 1)
+        }
+        return {
+            "sheet": template_sheet,
+            "widths": widths,
+            "captions": captions,
+            "row_height": sheet.Rows(1).RowHeight,
+        }
+    except Exception:
+        try:
+            template_sheet.Delete()
+        except Exception:
+            pass
+        raise
+
+
+def apply_sheet_column_model(sheet, model: dict[str, object], column_count: int, xl) -> None:
+    template_sheet = model.get("sheet")
+    if template_sheet is not None:
+        try:
+            template_sheet.Range(
+                template_sheet.Cells(1, 1),
+                template_sheet.Cells(1, column_count),
+            ).Copy()
+            sheet.Range(sheet.Cells(1, 1), sheet.Cells(1, column_count)).PasteSpecial(Paste=-4122)
+            xl.CutCopyMode = False
+        except Exception:
+            pass
+
+    widths = model.get("widths", {})
+    if isinstance(widths, dict):
+        for column_index in range(1, column_count + 1):
+            width = widths.get(column_index)
+            if width is None:
+                continue
+            try:
+                sheet.Columns(column_index).ColumnWidth = width
+            except Exception:
+                pass
+
+    captions = model.get("captions", {})
+    if isinstance(captions, dict):
+        for column_index in range(1, column_count + 1):
+            current_caption = sheet.Cells(1, column_index).Value
+            template_caption = captions.get(column_index)
+            if template_caption is not None and normalize_header_key(template_caption) == normalize_header_key(
+                current_caption
+            ):
+                sheet.Cells(1, column_index).Value = template_caption
+            else:
+                sheet.Cells(1, column_index).Value = iphone_header_caption(current_caption)
+
+    if isinstance(widths, dict) and isinstance(captions, dict):
+        for column_index in range(1, column_count + 1):
+            template_caption = captions.get(column_index)
+            current_caption = sheet.Cells(1, column_index).Value
+            template_width = widths.get(column_index)
+            if template_width is None or not is_dated_phase_header(template_caption) or not is_dated_phase_header(
+                current_caption
+            ):
+                continue
+
+            try:
+                width_delta = (len(str(current_caption).strip()) - len(str(template_caption).strip())) * 0.423
+                sheet.Columns(column_index).ColumnWidth = max(8.09, float(template_width) + width_delta)
+            except Exception:
+                pass
+
+    row_height = model.get("row_height")
+    if row_height is not None:
+        try:
+            sheet.Rows(1).RowHeight = row_height
+        except Exception:
+            pass
+
+
+def delete_sheet_model(model: dict[str, object]) -> None:
+    template_sheet = model.get("sheet")
+    if template_sheet is None:
+        return
+    try:
+        template_sheet.Delete()
+    except Exception:
+        pass
+
+
+def capture_column_widths(sheet, column_count: int) -> dict[int, float]:
+    widths: dict[int, float] = {}
+    for column_index in range(1, column_count + 1):
+        try:
+            widths[column_index] = float(sheet.Columns(column_index).ColumnWidth)
+        except Exception:
+            pass
+    return widths
+
+
+def capture_header_captions(sheet, column_count: int) -> dict[int, object]:
+    return {column_index: sheet.Cells(1, column_index).Value for column_index in range(1, column_count + 1)}
+
+
+def apply_column_widths(sheet, widths: dict[int, float]) -> None:
+    for column_index, width in widths.items():
+        try:
+            sheet.Columns(column_index).ColumnWidth = width
+        except Exception:
+            pass
+
+
+def apply_dated_phase_width_adjustments(
+    sheet,
+    template_widths: dict[int, float],
+    template_captions: dict[int, object],
+) -> None:
+    for column_index, template_caption in template_captions.items():
+        current_caption = sheet.Cells(1, column_index).Value
+        template_width = template_widths.get(column_index)
+        if template_width is None or not is_dated_phase_header(template_caption) or not is_dated_phase_header(
+            current_caption
+        ):
+            continue
+
+        try:
+            width_delta = (len(str(current_caption).strip()) - len(str(template_caption).strip())) * 0.423
+            sheet.Columns(column_index).ColumnWidth = max(8.09, float(template_width) + width_delta)
+        except Exception:
+            pass
+
+
 def build_iphone_sheet(all_order_sheet, iphone_sheet, xl) -> tuple[int, int]:
-    reset_sheet(iphone_sheet)
     source_range = all_order_sheet.UsedRange
     source_values = source_range.Value
     if not isinstance(source_values, tuple) or not source_values:
@@ -168,33 +331,19 @@ def build_iphone_sheet(all_order_sheet, iphone_sheet, xl) -> tuple[int, int]:
 
     row_count = len(iphone_rows)
     column_count = len(headers)
+    column_model = capture_sheet_column_model(iphone_sheet, column_count)
+    reset_sheet(iphone_sheet)
     target_range = iphone_sheet.Range(
         iphone_sheet.Cells(1, 1),
         iphone_sheet.Cells(row_count, column_count),
     )
     target_range.Value = tuple(iphone_rows)
 
-    for column_index in range(1, column_count + 1):
-        try:
-            iphone_sheet.Columns(column_index).ColumnWidth = all_order_sheet.Columns(column_index).ColumnWidth
-        except Exception:
-            pass
-
-    all_order_sheet.Range(
-        all_order_sheet.Cells(1, 1),
-        all_order_sheet.Cells(1, column_count),
-    ).Copy()
-    iphone_sheet.Range(
-        iphone_sheet.Cells(1, 1),
-        iphone_sheet.Cells(1, column_count),
-    ).PasteSpecial(Paste=-4122)  # xlPasteFormats
-    xl.CutCopyMode = False
-    try:
-        iphone_sheet.Rows(1).RowHeight = all_order_sheet.Rows(1).RowHeight
-    except Exception:
-        pass
+    apply_sheet_column_model(iphone_sheet, column_model, column_count, xl)
 
     ensure_table(iphone_sheet, IPHONE_TABLE_NAME, row_count, column_count)
+    apply_sheet_column_model(iphone_sheet, column_model, column_count, xl)
+    delete_sheet_model(column_model)
     return row_count, column_count
 
 
@@ -512,7 +661,15 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         pct_format_sheet, pct_format_sources, pct_column_widths, pct_formula_offsets = (
             capture_percentage_completion_formats(target_wb, xl)
         )
+        source_column_count = source_all_order.UsedRange.Columns.Count
+        target_all_order_widths = capture_column_widths(target_all_order, source_column_count)
+        target_iphone_widths = capture_column_widths(target_iphone, source_column_count)
+        target_all_order_captions = capture_header_captions(target_all_order, source_column_count)
+        target_iphone_captions = capture_header_captions(target_iphone, source_column_count)
+        all_order_column_model = capture_sheet_column_model(target_all_order, source_column_count)
         row_count, column_count = copy_used_range(source_all_order, target_all_order, xl)
+        apply_sheet_column_model(target_all_order, all_order_column_model, column_count, xl)
+        delete_sheet_model(all_order_column_model)
         ensure_table(target_all_order, ALL_ORDER_TABLE_NAME, row_count, column_count)
         mappings = previous_iphone_mappings(reference_workbook)
         updated_count = apply_previous_iphone_mappings(target_all_order, mappings)
@@ -526,6 +683,10 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             pct_column_widths,
             pct_formula_offsets,
         )
+        apply_column_widths(target_all_order, target_all_order_widths)
+        apply_column_widths(target_iphone, target_iphone_widths)
+        apply_dated_phase_width_adjustments(target_all_order, target_all_order_widths, target_all_order_captions)
+        apply_dated_phase_width_adjustments(target_iphone, target_iphone_widths, target_iphone_captions)
 
         if pct_format_sheet is not None:
             try:
