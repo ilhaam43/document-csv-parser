@@ -1861,7 +1861,7 @@ def add_pivot_sheet_via_com(
                 else:
                     formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
-                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0,00%"
+                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
         _write_side_percentage(pt4, 3, "C", "sum_cancel_so")
         _write_side_percentage(pt9, 3, "C", "source_non_new")
@@ -2300,6 +2300,10 @@ def update_template_workbook_via_com(
                     xl.CutCopyMode = False
                     if target_after_percentage_column_width is not None:
                         pivot_sheet.Columns(formula_col).ColumnWidth = target_after_percentage_column_width
+                    pivot_sheet.Range(
+                        pivot_sheet.Cells(data_row_start, formula_col),
+                        pivot_sheet.Cells(data_row_end, formula_col),
+                    ).NumberFormat = "0.00%"
                 except Exception:
                     pass
 
