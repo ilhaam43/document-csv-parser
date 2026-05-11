@@ -1169,6 +1169,10 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
                 border.Weight = xl_medium
 
             header_cell = pivot_sheet.Cells(header_row, header_col)
+            header_cell.Font.Bold = True
+            header_cell.HorizontalAlignment = -4108
+            header_cell.VerticalAlignment = -4108
+            header_cell.WrapText = True
             for border_id in (xl_edge_left, xl_edge_top, xl_edge_bottom, xl_edge_right):
                 border = header_cell.Borders(border_id)
                 border.LineStyle = xl_continuous
@@ -1176,6 +1180,9 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
                 border.Weight = xl_medium
 
             bottom_cell = pivot_sheet.Cells(last_row, header_col)
+            bottom_cell.Font.Bold = True
+            bottom_cell.HorizontalAlignment = -4108
+            bottom_cell.VerticalAlignment = -4108
             for border_id in (xl_edge_left, xl_edge_top, xl_edge_bottom, xl_edge_right):
                 border = bottom_cell.Borders(border_id)
                 border.LineStyle = xl_continuous
@@ -1186,6 +1193,9 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
                 pivot_sheet.Cells(header_row + 1, header_col),
                 pivot_sheet.Cells(last_row, header_col),
             )
+            data_range.Font.Bold = True
+            data_range.HorizontalAlignment = -4108
+            data_range.VerticalAlignment = -4108
             data_range.FormatConditions.Delete()
             icon_condition = data_range.FormatConditions.AddIconSetCondition()
             icon_condition.IconSet = pivot_sheet.Parent.IconSets(4)
@@ -1197,6 +1207,127 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
             icon_condition.IconCriteria(3).Type = 0
             icon_condition.IconCriteria(3).Operator = 7
             icon_condition.IconCriteria(3).Value = 0.99
+        except Exception:
+            pass
+
+
+def ensure_ongoing_percentage_columns(pivot_sheet) -> None:
+    percentage_header = "Percentage of Order On going from Pre-Installation to UAT"
+    percentage_header_key = normalize_header_key(percentage_header)
+    div_dept_key = normalize_header_key("Div./Dept.")
+    count_quo_key = normalize_header_key("Count of quo")
+    phase_headers_for_numerator = {
+        normalize_header_key("04-Pre Installation"),
+        normalize_header_key("05-Customer Preparation"),
+        normalize_header_key("06-Installation"),
+        normalize_header_key("07-UAT On Hold"),
+    }
+    try:
+        used_range = pivot_sheet.UsedRange
+        first_row = used_range.Row
+        first_col = used_range.Column
+        used_rows = used_range.Rows.Count
+        used_cols = used_range.Columns.Count
+        raw_values = used_range.Value
+    except Exception:
+        return
+
+    if used_rows <= 0 or used_cols <= 0:
+        return
+
+    if not isinstance(raw_values, tuple):
+        values = [[raw_values]]
+    elif raw_values and not isinstance(raw_values[0], tuple):
+        values = [list(raw_values)]
+    else:
+        values = [list(row) for row in raw_values]
+
+    def _cell_value(row_index: int, column_index: int):
+        row_offset = row_index - first_row
+        column_offset = column_index - first_col
+        if row_offset < 0 or column_offset < 0:
+            return None
+        try:
+            return values[row_offset][column_offset]
+        except Exception:
+            return None
+
+    def _column_letter(column_number: int) -> str:
+        result = ""
+        while column_number:
+            column_number, remainder = divmod(column_number - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    for header_row in range(first_row, first_row + used_rows):
+        right_label_col = None
+        phase_columns: list[int] = []
+
+        for column_index in range(first_col, first_col + used_cols + 1):
+            value = _cell_value(header_row, column_index)
+            normalized_value = normalize_header_key(value)
+            if normalized_value == div_dept_key:
+                right_label_col = column_index
+                phase_columns = []
+                continue
+
+            if right_label_col is None or column_index <= right_label_col:
+                continue
+
+            if normalized_value == percentage_header_key:
+                break
+
+            if normalized_value in phase_headers_for_numerator:
+                phase_columns.append(column_index)
+
+        if not phase_columns:
+            continue
+
+        denominator_col = None
+        for column_index in range((right_label_col or 1) - 1, 0, -1):
+            if normalize_header_key(_cell_value(header_row, column_index)) == count_quo_key:
+                denominator_col = column_index
+                break
+
+        if denominator_col is None:
+            continue
+
+        percentage_col = max(phase_columns) + 1
+        try:
+            existing_header = _cell_value(header_row, percentage_col)
+            if existing_header not in (None, "") and normalize_header_key(existing_header) != percentage_header_key:
+                continue
+
+            pivot_sheet.Cells(header_row, percentage_col).Value = percentage_header
+            pivot_sheet.Cells(header_row, percentage_col).WrapText = True
+            pivot_sheet.Cells(header_row, percentage_col).HorizontalAlignment = -4108
+            pivot_sheet.Cells(header_row, percentage_col).VerticalAlignment = -4108
+            pivot_sheet.Cells(header_row, percentage_col).Font.Bold = True
+
+            last_row = find_contiguous_percentage_block_last_row(pivot_sheet, header_row, percentage_col)
+            numerator_range = ":".join(
+                (
+                    f"{_column_letter(min(phase_columns))}{{row}}",
+                    f"{_column_letter(max(phase_columns))}{{row}}",
+                )
+            )
+            denominator_letter = _column_letter(denominator_col)
+            for row_index in range(header_row + 1, last_row + 1):
+                denominator = _cell_value(row_index, denominator_col)
+                if denominator in (None, ""):
+                    pivot_sheet.Cells(row_index, percentage_col).ClearContents()
+                    continue
+
+                pivot_sheet.Cells(row_index, percentage_col).Formula = (
+                    f"=(SUM({numerator_range.format(row=row_index)}))/"
+                    f"{denominator_letter}{row_index}"
+                )
+                pivot_sheet.Cells(row_index, percentage_col).NumberFormat = "0.00%"
+
+            pivot_sheet.Columns(percentage_col).ColumnWidth = max(
+                pivot_sheet.Columns(percentage_col).ColumnWidth,
+                24,
+            )
         except Exception:
             pass
 
@@ -1283,6 +1414,7 @@ def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date 
     except Exception:
         pass
 
+    ensure_ongoing_percentage_columns(pivot_sheet)
     normalize_percentage_block_formatting(pivot_sheet)
 
 
