@@ -1631,7 +1631,7 @@ def add_pivot_sheet_via_com(
                     target_name,
                     xlSum,
                 )
-                percent_field.NumberFormat = "0.00%"
+                percent_field.NumberFormatLocal = "0,00%"
             except Exception:
                 pass
 
@@ -1910,7 +1910,7 @@ def add_pivot_sheet_via_com(
                 else:
                     formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
-                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0,00%"
+                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormatLocal = "0,00%"
 
         def _format_percentage_completion_columns() -> None:
             normalized_header = "percentage of completion (so complete, cancel & change target)"
@@ -1934,7 +1934,7 @@ def add_pivot_sheet_via_com(
                         pivot_sheet.Range(
                             pivot_sheet.Cells(header_row + 1, column_index),
                             pivot_sheet.Cells(last_row, column_index),
-                        ).NumberFormat = "0.00%"
+                        ).NumberFormatLocal = "0,00%"
                     break
 
         _write_side_percentage(pt4, 3, "C", "sum_cancel_so")
@@ -2564,7 +2564,7 @@ def update_template_workbook_via_com(
                     pivot_sheet.Range(
                         pivot_sheet.Cells(data_row_start, formula_col),
                         pivot_sheet.Cells(data_row_end, formula_col),
-                    ).NumberFormat = "0.00%"
+                    ).NumberFormatLocal = "0,00%"
                 except Exception:
                     pass
 
@@ -2603,7 +2603,7 @@ def update_template_workbook_via_com(
                 else:
                     formula = f"={so_letter}{row_index}/{left_count_column}{row_index}"
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
-                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
+                pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormatLocal = "0,00%"
 
             format_source = percentage_format_sources.get(header_row)
             _apply_percentage_presentation(format_source)
@@ -2635,7 +2635,7 @@ def update_template_workbook_via_com(
                         pivot_sheet.Range(
                             pivot_sheet.Cells(header_row + 1, column_index),
                             pivot_sheet.Cells(last_row, column_index),
-                        ).NumberFormat = "0.00%"
+                        ).NumberFormatLocal = "0,00%"
                     break
 
         data_sheet = _sheet_by_name(target_wb, VLOOKUP_SHEET_NAME)
