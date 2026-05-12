@@ -252,7 +252,7 @@ def reference_date_from_tracking_workbook_path(tracking_workbook_path: Path) -> 
 
 def output_filename_for_tracking(tracking_workbook_path: Path) -> str:
     reference_date = reference_date_from_tracking_workbook_path(tracking_workbook_path)
-    return f"Daily Tracking On Progress {reference_date.day} {reference_date.strftime('%B %Y')} Fixed.xlsx"
+    return f"Daily Tracking {reference_date.day} {reference_date.strftime('%B %Y')} On Going.xlsx"
 
 
 def expected_on_progress_sheet_name(reference_date: date) -> str:
@@ -1211,6 +1211,82 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
             pass
 
 
+def clear_ongoing_percentage_columns(pivot_sheet) -> None:
+    percentage_header_key = normalize_header_key("Percentage of Order On going from Pre-Installation to UAT")
+    try:
+        used_range = pivot_sheet.UsedRange
+        first_row = used_range.Row
+        first_col = used_range.Column
+        row_count = used_range.Rows.Count
+        col_count = used_range.Columns.Count
+        raw_values = used_range.Value
+    except Exception:
+        return
+
+    if not isinstance(raw_values, tuple):
+        values = [[raw_values]]
+    elif raw_values and not isinstance(raw_values[0], tuple):
+        values = [list(raw_values)]
+    else:
+        values = [list(row) for row in raw_values]
+
+    for row_offset, row_values in enumerate(values):
+        row_index = first_row + row_offset
+        for col_offset, value in enumerate(row_values):
+            if normalize_header_key(value) != percentage_header_key:
+                continue
+
+            column_index = first_col + col_offset
+            cleanup_last_row = find_contiguous_percentage_block_last_row(pivot_sheet, row_index, column_index)
+            try:
+                pivot_sheet.Range(
+                    pivot_sheet.Cells(row_index, column_index),
+                    pivot_sheet.Cells(cleanup_last_row, column_index),
+                ).Clear()
+            except Exception:
+                pass
+
+
+def repair_spilled_pivot_tables(pivot_sheet) -> None:
+    try:
+        pivot_tables = pivot_sheet.PivotTables()
+    except Exception:
+        return
+
+    for pivot_index in range(1, pivot_tables.Count + 1):
+        try:
+            pivot_table = pivot_tables(pivot_index)
+            table_range = pivot_table.TableRange2
+            top_row = table_range.Row
+            left_col = table_range.Column
+            top_left_cell = pivot_sheet.Cells(top_row, left_col)
+            is_spill_error = str(top_left_cell.Text).strip().upper() == "#SPILL!" or top_left_cell.Value == -2146826243
+            if not is_spill_error:
+                continue
+
+            last_row = top_row + 1
+            for row_index in range(top_row + 1, top_row + 180):
+                try:
+                    left_label = str(pivot_sheet.Cells(row_index, 1).Text).strip().lower()
+                    if left_label == "grand total":
+                        last_row = row_index
+                        break
+                    if row_index > top_row + 1 and not left_label:
+                        last_row = row_index - 1
+                        break
+                except Exception:
+                    continue
+
+            blocker_col = left_col + 5
+            pivot_sheet.Range(
+                pivot_sheet.Cells(top_row + 1, blocker_col),
+                pivot_sheet.Cells(last_row, blocker_col),
+            ).Clear()
+            pivot_table.RefreshTable()
+        except Exception:
+            continue
+
+
 def ensure_ongoing_percentage_columns(pivot_sheet) -> None:
     percentage_header = "Percentage of Order On going from Pre-Installation to UAT"
     percentage_header_key = normalize_header_key(percentage_header)
@@ -1262,11 +1338,14 @@ def ensure_ongoing_percentage_columns(pivot_sheet) -> None:
     for header_row in range(first_row, first_row + used_rows):
         right_label_col = None
         phase_columns: list[int] = []
+        segments: list[tuple[int, list[int]]] = []
 
         for column_index in range(first_col, first_col + used_cols + 1):
             value = _cell_value(header_row, column_index)
             normalized_value = normalize_header_key(value)
             if normalized_value == div_dept_key:
+                if right_label_col is not None and phase_columns:
+                    segments.append((right_label_col, phase_columns))
                 right_label_col = column_index
                 phase_columns = []
                 continue
@@ -1275,61 +1354,67 @@ def ensure_ongoing_percentage_columns(pivot_sheet) -> None:
                 continue
 
             if normalized_value == percentage_header_key:
+                if phase_columns:
+                    segments.append((right_label_col, phase_columns))
                 break
 
             if normalized_value in phase_headers_for_numerator:
                 phase_columns.append(column_index)
 
-        if not phase_columns:
+        if right_label_col is not None and phase_columns:
+            segments.append((right_label_col, phase_columns))
+
+        if not segments:
             continue
 
-        denominator_col = None
-        for column_index in range((right_label_col or 1) - 1, 0, -1):
-            if normalize_header_key(_cell_value(header_row, column_index)) == count_quo_key:
-                denominator_col = column_index
-                break
+        for segment_label_col, segment_phase_columns in segments:
+            denominator_col = None
+            for column_index in range(segment_label_col - 1, 0, -1):
+                if normalize_header_key(_cell_value(header_row, column_index)) == count_quo_key:
+                    denominator_col = column_index
+                    break
 
-        if denominator_col is None:
-            continue
-
-        percentage_col = max(phase_columns) + 1
-        try:
-            existing_header = _cell_value(header_row, percentage_col)
-            if existing_header not in (None, "") and normalize_header_key(existing_header) != percentage_header_key:
+            if denominator_col is None:
                 continue
 
-            pivot_sheet.Cells(header_row, percentage_col).Value = percentage_header
-            pivot_sheet.Cells(header_row, percentage_col).WrapText = True
-            pivot_sheet.Cells(header_row, percentage_col).HorizontalAlignment = -4108
-            pivot_sheet.Cells(header_row, percentage_col).VerticalAlignment = -4108
-            pivot_sheet.Cells(header_row, percentage_col).Font.Bold = True
-
-            last_row = find_contiguous_percentage_block_last_row(pivot_sheet, header_row, percentage_col)
-            numerator_range = ":".join(
-                (
-                    f"{_column_letter(min(phase_columns))}{{row}}",
-                    f"{_column_letter(max(phase_columns))}{{row}}",
-                )
-            )
-            denominator_letter = _column_letter(denominator_col)
-            for row_index in range(header_row + 1, last_row + 1):
-                denominator = _cell_value(row_index, denominator_col)
-                if denominator in (None, ""):
-                    pivot_sheet.Cells(row_index, percentage_col).ClearContents()
+            percentage_col = max(segment_phase_columns) + 1
+            try:
+                existing_header = _cell_value(header_row, percentage_col)
+                if existing_header not in (None, "") and normalize_header_key(existing_header) != percentage_header_key:
                     continue
 
-                pivot_sheet.Cells(row_index, percentage_col).Formula = (
-                    f"=(SUM({numerator_range.format(row=row_index)}))/"
-                    f"{denominator_letter}{row_index}"
-                )
-                pivot_sheet.Cells(row_index, percentage_col).NumberFormat = "0.00%"
+                pivot_sheet.Cells(header_row, percentage_col).Value = percentage_header
+                pivot_sheet.Cells(header_row, percentage_col).WrapText = True
+                pivot_sheet.Cells(header_row, percentage_col).HorizontalAlignment = -4108
+                pivot_sheet.Cells(header_row, percentage_col).VerticalAlignment = -4108
+                pivot_sheet.Cells(header_row, percentage_col).Font.Bold = True
 
-            pivot_sheet.Columns(percentage_col).ColumnWidth = max(
-                pivot_sheet.Columns(percentage_col).ColumnWidth,
-                24,
-            )
-        except Exception:
-            pass
+                last_row = find_contiguous_percentage_block_last_row(pivot_sheet, header_row, percentage_col)
+                numerator_range = ":".join(
+                    (
+                        f"{_column_letter(min(segment_phase_columns))}{{row}}",
+                        f"{_column_letter(max(segment_phase_columns))}{{row}}",
+                    )
+                )
+                denominator_letter = _column_letter(denominator_col)
+                for row_index in range(header_row + 1, last_row + 1):
+                    denominator = _cell_value(row_index, denominator_col)
+                    if denominator in (None, ""):
+                        pivot_sheet.Cells(row_index, percentage_col).ClearContents()
+                        continue
+
+                    pivot_sheet.Cells(row_index, percentage_col).Formula = (
+                        f"=(SUM({numerator_range.format(row=row_index)}))/"
+                        f"{denominator_letter}{row_index}"
+                    )
+                    pivot_sheet.Cells(row_index, percentage_col).NumberFormat = "0.00%"
+
+                pivot_sheet.Columns(percentage_col).ColumnWidth = max(
+                    pivot_sheet.Columns(percentage_col).ColumnWidth,
+                    24,
+                )
+            except Exception:
+                pass
 
 
 def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date | None = None) -> None:
@@ -1405,15 +1490,12 @@ def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date 
 
     try:
         used_range = pivot_sheet.UsedRange
-        row_count = used_range.Rows.Count
-        column_count = used_range.Columns.Count
-        for row_index in range(1, row_count + 1):
-            for column_index in range(1, column_count + 1):
-                if pivot_sheet.Cells(row_index, column_index).Value == -2146826281:
-                    pivot_sheet.Cells(row_index, column_index).ClearContents()
+        used_range.Replace(What=-2146826281, Replacement="", LookAt=1)
     except Exception:
         pass
 
+    ensure_ongoing_percentage_columns(pivot_sheet)
+    repair_spilled_pivot_tables(pivot_sheet)
     ensure_ongoing_percentage_columns(pivot_sheet)
     normalize_percentage_block_formatting(pivot_sheet)
 
@@ -1435,9 +1517,33 @@ def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) ->
         return False
 
     try:
-        workbook.RefreshAll()
+        phase_start = time.perf_counter()
+        refreshed_cache_indexes: set[int] = set()
+        for sheet in (progress_sheet, pivot_sheet):
+            pivot_tables = sheet.PivotTables()
+            for pivot_index in range(1, pivot_tables.Count + 1):
+                pivot_table = pivot_tables(pivot_index)
+                cache_index = int(pivot_table.CacheIndex)
+                if cache_index in refreshed_cache_indexes:
+                    continue
+                pivot_table.PivotCache().Refresh()
+                refreshed_cache_indexes.add(cache_index)
+        profile_log("refresh pivot caches only", phase_start)
+        phase_start = time.perf_counter()
+        clear_ongoing_percentage_columns(pivot_sheet)
+        for sheet in (progress_sheet, pivot_sheet):
+            pivot_tables = sheet.PivotTables()
+            for pivot_index in range(1, pivot_tables.Count + 1):
+                pivot_tables(pivot_index).RefreshTable()
+        repair_spilled_pivot_tables(pivot_sheet)
+        profile_log("refresh pivot tables", phase_start)
     except Exception:
-        return False
+        try:
+            phase_start = time.perf_counter()
+            workbook.RefreshAll()
+            profile_log("fallback workbook RefreshAll", phase_start)
+        except Exception:
+            return False
 
     target_progress_name = expected_on_progress_sheet_name(reference_date)
     try:
@@ -1448,6 +1554,7 @@ def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) ->
         pass
 
     try:
+        phase_start = time.perf_counter()
         target_row_field_name = resolve_top_pivot_row_field_for_reference_date(data_sheet, reference_date)
         pivot_tables = progress_sheet.PivotTables()
         top_candidates = []
@@ -1477,13 +1584,18 @@ def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) ->
         second_top = progress_sheet.PivotTables(top_candidates[1][2])
         if not pivot_has_non_empty_grand_total(first_top) or not pivot_has_non_empty_grand_total(second_top):
             return False
+        profile_log("repair top progress pivots", phase_start)
     except Exception:
         return False
 
     try:
+        phase_start = time.perf_counter()
         restore_on_progress_filter_caption_layout(progress_sheet)
         enforce_on_progress_row_label_filters(progress_sheet, reference_date)
+        profile_log("restore progress sheet layout", phase_start)
+        phase_start = time.perf_counter()
         restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date)
+        profile_log("restore ongoing pivot sheet", phase_start)
     except Exception:
         return False
 
