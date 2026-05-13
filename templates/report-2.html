@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Report 1 CSV Parser</title>
+  <title>Report 2 Ongoing Parser</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <main>
     <header class="app-header">
       <div>
-        <p class="eyebrow">Daily tracking workbook generator</p>
-        <h1>Report 1 CSV Parser</h1>
-        <code>Powered by csv_to_excel.py</code>
+        <p class="eyebrow">Ongoing tracking workbook generator</p>
+        <h1>Report 2 Ongoing Parser</h1>
+        <code>Powered by csv_to_excel_on_going.py</code>
       </div>
       <div class="health" id="health">API status: checking</div>
     </header>
@@ -20,26 +20,26 @@
     <div class="workspace">
       <section class="upload-panel">
         <div class="panel-heading">
-          <h2>Upload Files</h2>
-          <p>Process the raw CSV with yesterday's workbook template and refreshed pivots.</p>
+          <h2>Upload Ongoing Files</h2>
+          <p>Generate the outgoing workbook from the tracking workbook and status log CSV.</p>
         </div>
         <form id="upload-form">
           <div class="field">
-            <label for="raw_data">Raw CSV</label>
-            <input id="raw_data" name="raw_data" type="file" accept=".csv,text/csv" required>
+            <label for="tracking_workbook">Daily Tracking Excel</label>
+            <input id="tracking_workbook" name="tracking_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
           </div>
 
           <div class="field">
-            <label for="yesterday_cleaned_data">Yesterday Cleaned Excel</label>
-            <input id="yesterday_cleaned_data" name="yesterday_cleaned_data" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+            <label for="log_update_status">Log Update Status CSV</label>
+            <input id="log_update_status" name="log_update_status" type="file" accept=".csv,text/csv" required>
           </div>
 
           <label class="option">
-            <input id="refresh_template" name="refresh_template" type="checkbox" checked>
-            <span>Refresh template pivots</span>
+            <input id="with_pivot" name="with_pivot" type="checkbox" checked>
+            <span>Refresh ongoing pivots</span>
           </label>
 
-          <button id="submit-button" type="submit">Generate Workbook</button>
+          <button id="submit-button" type="submit">Generate Ongoing Workbook</button>
         </form>
       </section>
 
@@ -54,6 +54,6 @@
     </div>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/report-2.js"></script>
 </body>
 </html>

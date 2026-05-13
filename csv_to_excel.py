@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 import pandas as pd
@@ -1077,22 +1078,30 @@ def write_all_order_sheet_for_template(
     csv_path: Path,
     mappings: LookupMappings,
 ) -> tuple[pd.DataFrame, set[str]]:
-    output_df = apply_lookup_values(df, mappings)
-    apply_current_month_process_adjustment_overrides(output_df, reference_date_from_csv_path(csv_path))
-    output_df = coerce_numeric_columns_for_pivots(output_df)
-    target_header = next((column for column in output_df.columns if str(column).startswith("TARGET")), "")
-    output_df, hidden_columns = add_pivot_template_compatibility_columns(
-        output_df,
-        csv_path,
-        target_header,
-        mappings.phase_header,
-    )
+    output_df, hidden_columns = prepare_all_order_dataframe_for_template(df, csv_path, mappings)
     output_df.to_excel(writer, sheet_name=VLOOKUP_SHEET_NAME, index=False)
     worksheet = writer.sheets[VLOOKUP_SHEET_NAME]
     apply_target_so_complete_date_filter_format(worksheet, output_df)
     apply_worksheet_presentation(worksheet)
     hide_worksheet_columns(worksheet, hidden_columns)
     return output_df, hidden_columns
+
+
+def prepare_all_order_dataframe_for_template(
+    df: pd.DataFrame,
+    csv_path: Path,
+    mappings: LookupMappings,
+) -> tuple[pd.DataFrame, set[str]]:
+    output_df = apply_lookup_values(df, mappings)
+    apply_current_month_process_adjustment_overrides(output_df, reference_date_from_csv_path(csv_path))
+    output_df = coerce_numeric_columns_for_pivots(output_df)
+    target_header = next((column for column in output_df.columns if str(column).startswith("TARGET")), "")
+    return add_pivot_template_compatibility_columns(
+        output_df,
+        csv_path,
+        target_header,
+        mappings.phase_header,
+    )
 
 
 def write_on_progress_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, csv_path: Path, sheet_name: str) -> None:
@@ -1981,12 +1990,28 @@ def update_template_workbook_via_com(
     target_wb = None
     generated_wb = None
     try:
+        profile_enabled = env_flag_enabled("CSV_TO_EXCEL_PROFILE")
+        profile_start = perf_counter()
+        profile_last = profile_start
+
+        def _profile(stage: str) -> None:
+            nonlocal profile_last
+            if not profile_enabled:
+                return
+            now = perf_counter()
+            print(
+                f"[profile] {stage}: +{now - profile_last:.2f}s total={now - profile_start:.2f}s",
+                file=sys.stderr,
+            )
+            profile_last = now
+
         xl = win32com.client.DispatchEx("Excel.Application")
         xl.Visible = False
         xl.DisplayAlerts = False
 
         target_wb = xl.Workbooks.Open(str(output_path.resolve()))
         generated_wb = xl.Workbooks.Open(str(generated_workbook_path.resolve()))
+        _profile("open Excel workbooks")
 
         def _sheet_by_name(workbook, sheet_name: str):
             for sheet in workbook.Sheets:
@@ -2405,26 +2430,62 @@ def update_template_workbook_via_com(
 
             return [*adapted, *(label for label in default_order if label not in adapted)]
 
-        def _hide_pivot_items(pivot_table, field_name: str, hidden_values: set[str]) -> None:
+        def _hide_pivot_items(pivot_table, field_name: str, hidden_values: set[str]) -> bool:
             hidden_normalized = {_normalized_pivot_item_name(value) for value in hidden_values}
+            changed = False
             try:
                 field = pivot_table.PivotFields(field_name)
                 for item in field.PivotItems():
                     if _normalized_pivot_item_name(item.Name) in hidden_normalized:
                         try:
-                            item.Visible = False
+                            if bool(item.Visible):
+                                item.Visible = False
+                                changed = True
                         except Exception:
                             pass
             except Exception:
                 pass
+            return changed
 
-        def _restore_template_specific_pivot_filters(pivot_table) -> None:
+        def _show_pivot_items_except_excluded_years(pivot_table) -> bool:
+            changed = False
+            try:
+                field = pivot_table.PivotFields(YEAR_FAB_UPLOAD_HEADER)
+                field.EnableMultiplePageItems = True
+                for item in field.PivotItems():
+                    if is_excluded_year_fab_upload_value(getattr(item, "Value", item.Name)):
+                        continue
+                    try:
+                        if not bool(item.Visible):
+                            item.Visible = True
+                            changed = True
+                    except Exception:
+                        pass
+                for item in field.PivotItems():
+                    if not is_excluded_year_fab_upload_value(getattr(item, "Value", item.Name)):
+                        continue
+                    try:
+                        if bool(item.Visible):
+                            item.Visible = False
+                            changed = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return changed
+
+        def _restore_template_specific_pivot_filters(pivot_table) -> bool:
+            changed = _show_pivot_items_except_excluded_years(pivot_table)
             if str(pivot_table.Name) == "PivotTable13":
-                _hide_pivot_items(
-                    pivot_table,
-                    PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER,
-                    {"ICT Delivery Ops."},
+                changed = (
+                    _hide_pivot_items(
+                        pivot_table,
+                        PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER,
+                        {"ICT Delivery Ops."},
+                    )
+                    or changed
                 )
+            return changed
 
         def _column_letter(column_number: int) -> str:
             result = ""
@@ -2647,17 +2708,23 @@ def update_template_workbook_via_com(
             raise RuntimeError("Could not find required sheets for template update.")
 
         _capture_percentage_formats()
+        _profile("capture PIVOT percentage formats")
         hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
+        _profile("capture progress state")
         template_header_model = _capture_sheet_header_model(data_sheet, generated_data_sheet.UsedRange.Columns.Count)
+        _profile("capture ALL ORDER header model")
         template_column_widths = _capture_template_column_widths(data_sheet)
         template_date_number_formats = _capture_template_date_number_formats(data_sheet)
+        _profile("capture ALL ORDER formats")
 
         row_count, column_count = _copy_used_range(generated_data_sheet, data_sheet, preserve_first_table=True)
+        _profile("copy generated ALL ORDER into template")
         _ensure_table(data_sheet, row_count, column_count)
         _apply_template_column_widths(data_sheet, column_count, template_column_widths)
         _hide_columns_by_header(data_sheet, row_count, column_count)
         _apply_template_date_number_formats(data_sheet, row_count, column_count, template_date_number_formats)
         _ensure_date_column_widths(data_sheet, column_count)
+        _profile("apply ALL ORDER table/formats")
 
         _delete_on_progress_sheets()
         progress_sheet = None
@@ -2665,6 +2732,7 @@ def update_template_workbook_via_com(
             progress_sheet = target_wb.Worksheets.Add(None, data_sheet)
             progress_sheet.Name = progress_sheet_name
             _copy_used_range(generated_progress_sheet, progress_sheet)
+        _profile("replace ALL ORDER ON PROGRESS sheet")
 
         def _add_on_progress_pivots(shared_pivot_cache) -> None:
             if progress_sheet is None or not target_header:
@@ -2824,21 +2892,28 @@ def update_template_workbook_via_com(
                 exclude_phase_values={"cancel", "so complete"},
             )
 
-            progress_sheet.Range("A1").Value = YEAR_FAB_UPLOAD_HEADER
-            progress_sheet.Range("B1").Value = "(Multiple Items)"
-            progress_sheet.Range("A2").Value = PROCESS_ADJUSTMENT_HEADER
-            progress_sheet.Range("B2").Value = "(All)"
-            progress_sheet.Range("A3").Value = PHASE_HEADER_PREFIX
-            progress_sheet.Range("B3").Value = "(All)"
-            progress_sheet.Range("D1").Value = YEAR_FAB_UPLOAD_HEADER
-            progress_sheet.Range("E1").Value = "(Multiple Items)"
-            progress_sheet.Range("D2").Value = PROCESS_ADJUSTMENT_HEADER
-            progress_sheet.Range("E2").Value = "(All)"
-            progress_sheet.Range("D3").Value = PHASE_HEADER_PREFIX
-            progress_sheet.Range("E3").Value = "(Multiple Items)"
+            for cell_address, value in (
+                ("A1", YEAR_FAB_UPLOAD_HEADER),
+                ("B1", "(Multiple Items)"),
+                ("A2", PROCESS_ADJUSTMENT_HEADER),
+                ("B2", "(All)"),
+                ("A3", PHASE_HEADER_PREFIX),
+                ("B3", "(All)"),
+                ("D1", YEAR_FAB_UPLOAD_HEADER),
+                ("E1", "(Multiple Items)"),
+                ("D2", PROCESS_ADJUSTMENT_HEADER),
+                ("E2", "(All)"),
+                ("D3", PHASE_HEADER_PREFIX),
+                ("E3", "(Multiple Items)"),
+            ):
+                try:
+                    progress_sheet.Range(cell_address).Value = value
+                except Exception:
+                    pass
 
         generated_wb.Close(SaveChanges=False)
         generated_wb = None
+        _profile("close generated workbook")
 
         data_range = data_sheet.Range(data_sheet.Cells(1, 1), data_sheet.Cells(row_count, column_count))
         source_data = f"'{VLOOKUP_SHEET_NAME}'!{data_range.Address}"
@@ -2846,11 +2921,12 @@ def update_template_workbook_via_com(
         pivot_tables = pivot_sheet.PivotTables()
         for pivot_index in range(1, pivot_tables.Count + 1):
             pivot_table = pivot_tables(pivot_index)
+            pivot_profile_start = perf_counter()
             try:
                 pivot_table.SaveData = True
                 pivot_table.RefreshTable()
-                _restore_template_specific_pivot_filters(pivot_table)
-                pivot_table.RefreshTable()
+                if _restore_template_specific_pivot_filters(pivot_table):
+                    pivot_table.RefreshTable()
                 if str(pivot_table.Name) == "PivotTable17":
                     pivot_table_range = pivot_table.TableRange2
                     pivot_error_text = str(pivot_sheet.Range("D113").Text).strip().upper()
@@ -2985,6 +3061,11 @@ def update_template_workbook_via_com(
                 _repair_completion_formula(pivot_table, 109, 3, "C", "source_non_new")
                 _repair_completion_formula(pivot_table, 373, 2, "C", "target_after")
                 refreshed_count += 1
+                if profile_enabled:
+                    print(
+                        f"[profile] refresh {pivot_table.Name}: {perf_counter() - pivot_profile_start:.2f}s",
+                        file=sys.stderr,
+                    )
             except Exception as exc:
                 print(
                     f"[warn] Could not refresh PivotTable '{pivot_table.Name}' on '{pivot_sheet.Name}': {exc}",
@@ -2992,10 +3073,12 @@ def update_template_workbook_via_com(
                 )
 
         _format_percentage_completion_columns()
+        _profile("refresh PIVOT sheet pivots")
 
         if progress_sheet is not None:
             on_progress_cache = pivot_sheet.PivotTables()(1).PivotCache()
             _add_on_progress_pivots(on_progress_cache)
+        _profile("build ALL ORDER ON PROGRESS pivots")
 
         if target_after_percentage_format_sheet is not None:
             try:
@@ -3005,8 +3088,10 @@ def update_template_workbook_via_com(
 
         _apply_sheet_header_model(data_sheet, template_header_model, column_count)
         _delete_sheet_header_model(template_header_model)
+        _profile("restore ALL ORDER header model")
 
         target_wb.Save()
+        _profile("save workbook")
         print(f"[info] Refreshed {refreshed_count} template PivotTables in {output_path.name}")
     except Exception as exc:
         print(f"[warn] Could not update template workbook via COM: {exc}", file=sys.stderr)
@@ -3267,10 +3352,29 @@ def convert_csv_files(input_path: Path, csv_files: list[Path], output_path: Path
 
 
 def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> None:
+    profile_enabled = env_flag_enabled("CSV_TO_EXCEL_PROFILE")
+    profile_start = perf_counter()
+    profile_last = profile_start
+
+    def _profile(stage: str) -> None:
+        nonlocal profile_last
+        if not profile_enabled:
+            return
+        now = perf_counter()
+        print(
+            f"[profile] {stage}: +{now - profile_last:.2f}s total={now - profile_start:.2f}s",
+            file=sys.stderr,
+        )
+        profile_last = now
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df = clean_dataframe(read_csv(csv_path, options), options, csv_path)
+    raw_df = read_csv(csv_path, options)
+    _profile("read CSV")
+    df = clean_dataframe(raw_df, options, csv_path)
+    _profile("clean CSV dataframe")
     lookup_workbook = lookup_workbook_for_options(options)
     mappings = load_lookup_mappings(lookup_workbook)
+    _profile("load lookup workbook mappings")
     progress_sheet_name = on_progress_sheet_name(csv_path)
 
     with tempfile.TemporaryDirectory(prefix="csv_to_excel_", dir=output_path.parent) as temp_dir:
@@ -3283,10 +3387,12 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
                 mappings,
             )
             write_on_progress_sheet(writer, output_df, csv_path, progress_sheet_name)
+        _profile("write temporary workbook")
 
         target_header = first_target_header(output_df)
         if options.refresh_template:
             shutil.copy2(lookup_workbook, output_path)
+            _profile("copy template workbook")
             update_template_workbook_via_com(
                 output_path,
                 generated_workbook_path,
@@ -3294,8 +3400,10 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
                 target_header,
                 hidden_columns,
             )
+            _profile("update template workbook via Excel COM")
         else:
             shutil.copy2(generated_workbook_path, output_path)
+            _profile("copy generated workbook")
 
     print(f"Wrote {output_path}")
 

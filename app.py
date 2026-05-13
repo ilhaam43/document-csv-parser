@@ -23,10 +23,15 @@ from csv_to_excel import (
     resolve_csv_files,
     resolve_output_path,
 )
+from csv_to_excel_on_going import (
+    apply_logic_to_workbook as apply_ongoing_logic_to_workbook,
+    output_filename_for_tracking as ongoing_output_filename_for_tracking,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent
 CONVERSION_OUTPUT_DIR = Path("output-today")
+ONGOING_CONVERSION_OUTPUT_DIR = Path("output-outgoing")
 API_WORK_DIR = Path("output-today/api")
 
 app = FastAPI(
@@ -117,9 +122,43 @@ def _run_conversion(
     }
 
 
-@app.get("/")
+def _run_ongoing_conversion(
+    tracking_workbook_path: Path,
+    log_csv_path: Path,
+    output_path: Path,
+    with_pivot: bool,
+) -> dict[str, object]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    started = time.perf_counter()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        apply_ongoing_logic_to_workbook(
+            tracking_workbook_path,
+            log_csv_path,
+            output_path,
+            with_pivot=with_pivot,
+            engine="com",
+            clone_pivot_template=False,
+        )
+    elapsed_seconds = time.perf_counter() - started
+
+    return {
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "output_path": str(output_path),
+        "stdout": stdout.getvalue().strip(),
+        "stderr": stderr.getvalue().strip(),
+        "with_pivot": with_pivot,
+    }
+
+
+@app.get("/report-1")
 def upload_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "index.html", media_type="text/html")
+
+
+@app.get("/report-2")
+def report_2_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "report-2.html", media_type="text/html")
 
 
 @app.get("/health")
@@ -218,4 +257,53 @@ async def convert_upload(
         "output_file": str(output_path),
         "download_url": _download_url(request, job_dir.name, output_path.name),
         "refresh_template": refresh_template,
+    }
+
+
+@app.post("/convert/report-2/upload")
+async def convert_report_2_upload(
+    request: Request,
+    tracking_workbook: UploadFile = File(...),
+    log_update_status: UploadFile = File(...),
+    with_pivot: bool = Form(default=True),
+) -> dict[str, object]:
+    if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="tracking_workbook must be a .xlsx file.")
+    if not log_update_status.filename or not log_update_status.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="log_update_status must be a .csv file.")
+
+    job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    tracking_path = job_dir / Path(tracking_workbook.filename).name
+    log_path = job_dir / Path(log_update_status.filename).name
+    output_filename = ongoing_output_filename_for_tracking(tracking_path)
+    conversion_output_path = (APP_ROOT / ONGOING_CONVERSION_OUTPUT_DIR / output_filename).resolve()
+    output_path = job_dir / output_filename
+
+    try:
+        await _save_upload_file(tracking_workbook, tracking_path)
+        await _save_upload_file(log_update_status, log_path)
+        conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = await run_in_threadpool(
+            _run_ongoing_conversion,
+            tracking_path,
+            log_path,
+            conversion_output_path,
+            with_pivot,
+        )
+        shutil.copy2(conversion_output_path, output_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "message": "Report 2 workbook generated successfully.",
+        "elapsed_seconds": result["elapsed_seconds"],
+        "filename": output_path.name,
+        "tracking_workbook_filename": tracking_path.name,
+        "log_update_status_filename": log_path.name,
+        "output_file": str(output_path),
+        "download_url": _download_url(request, job_dir.name, output_path.name),
+        "with_pivot": with_pivot,
     }
