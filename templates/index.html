@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report CSV Parser</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Report CSV Parser</h1>
+        <code>csv_to_excel.py</code>
+      </div>
+      <div class="health" id="health">API status: checking</div>
+    </header>
+
+    <div class="workspace">
+      <section>
+        <form id="upload-form">
+          <div class="field">
+            <label for="raw_data">Raw CSV</label>
+            <input id="raw_data" name="raw_data" type="file" accept=".csv,text/csv" required>
+          </div>
+
+          <div class="field">
+            <label for="yesterday_cleaned_data">Yesterday Cleaned Excel</label>
+            <input id="yesterday_cleaned_data" name="yesterday_cleaned_data" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+
+          <label class="option">
+            <input id="refresh_template" name="refresh_template" type="checkbox" checked>
+            <span>Refresh template pivots</span>
+          </label>
+
+          <button id="submit-button" type="submit">Process Upload</button>
+        </form>
+      </section>
+
+      <aside class="status">
+        <h2>Status</h2>
+        <div id="status-box" class="status-box">Ready.</div>
+        <a id="download-link" class="download" href="#">Download Workbook</a>
+      </aside>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

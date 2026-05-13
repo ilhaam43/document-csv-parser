@@ -2851,6 +2851,136 @@ def update_template_workbook_via_com(
                 pivot_table.RefreshTable()
                 _restore_template_specific_pivot_filters(pivot_table)
                 pivot_table.RefreshTable()
+                if str(pivot_table.Name) == "PivotTable17":
+                    pivot_table_range = pivot_table.TableRange2
+                    pivot_error_text = str(pivot_sheet.Range("D113").Text).strip().upper()
+                    if (
+                        pivot_table_range.Columns.Count <= 1
+                        or pivot_table_range.Rows.Count <= 1
+                        or pivot_error_text in {"#SPILL!", "#VALUE!"}
+                    ):
+                        try:
+                            pivot_table.TableRange2.Clear()
+                        except Exception:
+                            pass
+                        try:
+                            pivot_sheet.Range("D109:L130").Clear()
+                        except Exception:
+                            pass
+
+                        target_match = re.search(r"1\s+([A-Za-z]+)\s+(\d{4}|\d{2})", target_header)
+                        target_month = target_match.group(1) if target_match else ""
+                        target_year = target_match.group(2)[-2:] if target_match else ""
+                        target_month_label = f"Target {target_month}" if target_month else ""
+                        short_target_header = (
+                            f"TARGET  Detemined as 1 {target_month[:3]} {target_year}"
+                            if target_month and target_year
+                            else target_header
+                        )
+
+                        pivot_cache = target_wb.PivotCaches().Create(SourceType=1, SourceData=source_data)
+                        try:
+                            pivot_table = pivot_cache.CreatePivotTable(
+                                TableDestination=pivot_sheet.Range("D113"),
+                                TableName="PivotTable17",
+                            )
+                        except Exception:
+                            pivot_table = pivot_cache.CreatePivotTable(
+                                TableDestination=pivot_sheet.Range("D113"),
+                                TableName="PivotTable17_Rebuilt",
+                            )
+
+                        pivot_table.ManualUpdate = True
+                        try:
+                            pivot_table.CompactLayoutRowHeader = "Div./Dept."
+                            pivot_table.CompactLayoutColumnHeader = "Column Labels"
+                            pivot_table.RowGrand = False
+                            pivot_table.ColumnGrand = True
+                        except Exception:
+                            pass
+
+                        for position, field_name in enumerate(
+                            (PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER, DEPT_SD_HEADER),
+                            start=1,
+                        ):
+                            try:
+                                row_field = pivot_table.PivotFields(field_name)
+                                row_field.Orientation = 1
+                                row_field.Position = position
+                            except Exception:
+                                pass
+
+                        try:
+                            column_field = pivot_table.PivotFields(PHASE_HEADER_PREFIX)
+                            column_field.Orientation = 2
+                            column_field.Position = 1
+                            column_field.Caption = PHASE_HEADER_PREFIX
+                            column_field.EnableMultiplePageItems = True
+                            visible_phase_values = {
+                                "02-survey",
+                                "05-customer preparation",
+                                "06-installation",
+                                "07-uat on hold",
+                                "cancel",
+                                "so complete",
+                            }
+                            for item in column_field.PivotItems():
+                                try:
+                                    item.Visible = (
+                                        _normalized_pivot_item_name(getattr(item, "Value", item.Name))
+                                        in visible_phase_values
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        for field_name, position, visible_values in (
+                            (YEAR_FAB_UPLOAD_HEADER, 1, None),
+                            (PROCESS_ADJUSTMENT_HEADER, 2, {"non new reg"}),
+                            (short_target_header, 3, {target_month_label.lower()} if target_month_label else None),
+                        ):
+                            try:
+                                page_field = pivot_table.PivotFields(field_name)
+                                page_field.Orientation = 3
+                                page_field.Position = position
+                                page_field.EnableMultiplePageItems = True
+                                if visible_values is not None:
+                                    for item in page_field.PivotItems():
+                                        try:
+                                            item.Visible = (
+                                                _normalized_pivot_item_name(getattr(item, "Value", item.Name))
+                                                in visible_values
+                                            )
+                                        except Exception:
+                                            pass
+                                elif field_name == YEAR_FAB_UPLOAD_HEADER:
+                                    for item in page_field.PivotItems():
+                                        try:
+                                            item.Visible = not is_excluded_year_fab_upload_value(
+                                                getattr(item, "Value", item.Name)
+                                            )
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                        try:
+                            count_field = pivot_table.AddDataField(
+                                pivot_table.PivotFields(QUO_HEADER),
+                                "Count of quo",
+                                -4112,
+                            )
+                            count_field.NumberFormat = "0"
+                        except Exception:
+                            pass
+                        try:
+                            pivot_table.TableStyle2 = "PivotStyleLight14"
+                        except Exception:
+                            pass
+                        pivot_table.ManualUpdate = False
+                        pivot_table.RefreshTable()
+
                 _repair_completion_formula(pivot_table, 4, 3, "C", "sum_cancel_so")
                 _repair_completion_formula(pivot_table, 109, 3, "C", "source_non_new")
                 _repair_completion_formula(pivot_table, 373, 2, "C", "target_after")

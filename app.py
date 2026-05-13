@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -11,9 +12,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from csv_to_excel_api import (
+from csv_to_excel import (
     ConvertOptions,
     convert_many,
     convert_one,
@@ -24,12 +26,14 @@ from csv_to_excel_api import (
 
 
 APP_ROOT = Path(__file__).resolve().parent
+CONVERSION_OUTPUT_DIR = Path("output-today")
 API_WORK_DIR = Path("output-today/api")
 
 app = FastAPI(
     title="Report CSV Parser API",
     version="1.0.0",
 )
+app.mount("/static", StaticFiles(directory=APP_ROOT / "static"), name="static")
 
 
 class ConvertPathRequest(BaseModel):
@@ -113,6 +117,11 @@ def _run_conversion(
     }
 
 
+@app.get("/")
+def upload_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "index.html", media_type="text/html")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -174,7 +183,9 @@ async def convert_upload(
     job_dir.mkdir(parents=True, exist_ok=True)
     input_path = job_dir / Path(raw_data.filename).name
     lookup_workbook_path = job_dir / Path(yesterday_cleaned_data.filename).name
-    output_path = job_dir / output_filename_from_csv_path(input_path)
+    output_filename = output_filename_from_csv_path(input_path)
+    conversion_output_path = (APP_ROOT / CONVERSION_OUTPUT_DIR / output_filename).resolve()
+    output_path = job_dir / output_filename
 
     try:
         await _save_upload_file(raw_data, input_path)
@@ -182,7 +193,7 @@ async def convert_upload(
 
         conversion_request = ConvertPathRequest(
             input_path=str(input_path),
-            output_path=str(output_path),
+            output_path=str(conversion_output_path),
             delimiter=delimiter or None,
             encoding=encoding or None,
             normalize_headers=normalize_headers,
@@ -192,7 +203,8 @@ async def convert_upload(
             infer_types=infer_types,
             refresh_template=refresh_template,
         )
-        result = await run_in_threadpool(_run_conversion, input_path, output_path, conversion_request, lookup_workbook_path)
+        result = await run_in_threadpool(_run_conversion, input_path, conversion_output_path, conversion_request)
+        shutil.copy2(conversion_output_path, output_path)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
