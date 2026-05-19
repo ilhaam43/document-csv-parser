@@ -4,6 +4,35 @@ const statusBox = document.getElementById("status-box");
 const downloadLink = document.getElementById("download-link");
 const health = document.getElementById("health");
 
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (minutes === 0) {
+    return `${remainingSeconds} detik`;
+  }
+
+  return `${minutes} menit ${remainingSeconds} detik`;
+}
+
+function processingStage(seconds) {
+  if (seconds < 5) {
+    return "Uploading files";
+  }
+  if (seconds < 20) {
+    return "Preparing ongoing workbook";
+  }
+  if (seconds < 60) {
+    return "Applying status update logic";
+  }
+  if (seconds < 180) {
+    return "Refreshing ongoing pivots";
+  }
+
+  return "Saving output workbook";
+}
+
 fetch("/health")
   .then((response) => (response.ok ? response.json() : Promise.reject()))
   .then(() => {
@@ -23,12 +52,11 @@ form.addEventListener("submit", async (event) => {
   const started = Date.now();
   const timer = window.setInterval(() => {
     const seconds = Math.round((Date.now() - started) / 1000);
-    statusBox.textContent = `Processing ongoing workbook... ${seconds}s`;
+    statusBox.textContent = `${processingStage(seconds)}... ${formatDuration(seconds)}`;
   }, 1000);
 
   try {
     const body = new FormData(form);
-    body.set("with_pivot", document.getElementById("with_pivot").checked ? "true" : "false");
 
     const response = await fetch("/convert/report-2/upload", {
       method: "POST",
@@ -40,7 +68,7 @@ form.addEventListener("submit", async (event) => {
     }
 
     statusBox.className = "status-box ok";
-    statusBox.textContent = `Generated ${payload.filename} in ${payload.elapsed_seconds}s.`;
+    statusBox.textContent = `Generated ${payload.filename} in ${formatDuration(payload.elapsed_seconds)}.`;
     downloadLink.href = payload.download_url;
     downloadLink.classList.add("visible");
   } catch (error) {

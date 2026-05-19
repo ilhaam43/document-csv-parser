@@ -34,10 +34,10 @@
             <input id="log_update_status" name="log_update_status" type="file" accept=".csv,text/csv" required>
           </div>
 
-          <label class="option">
-            <input id="with_pivot" name="with_pivot" type="checkbox" checked>
-            <span>Refresh ongoing pivots</span>
-          </label>
+          <div class="field">
+            <label for="previous_ongoing_workbook">Yesterday Ongoing Excel</label>
+            <input id="previous_ongoing_workbook" name="previous_ongoing_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
 
           <button id="submit-button" type="submit">Generate Ongoing Workbook</button>
         </form>
@@ -54,6 +54,6 @@
     </div>
   </main>
 
-  <script src="/static/report-2.js"></script>
+  <script src="/static/report-2.js?v=20260519"></script>
 </body>
 </html>
