@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report 3 iPhone Parser</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">iPhone tracking workbook generator</p>
+        <h1>Report 3 iPhone Parser</h1>
+        <code>Powered by generate_iphone_tracking.py</code>
+      </div>
+      <div class="health" id="health">API status: checking</div>
+    </header>
+
+    <div class="workspace">
+      <section class="upload-panel">
+        <div class="panel-heading">
+          <h2>Upload iPhone Files</h2>
+          <p>Generate the iPhone workbook from today's Daily Tracking workbook and previous iPhone workbook.</p>
+        </div>
+        <form id="upload-form">
+          <div class="field">
+            <label for="tracking_workbook">Daily Tracking Excel</label>
+            <input id="tracking_workbook" name="tracking_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+
+          <div class="field">
+            <label for="previous_iphone_workbook">Previous iPhone Excel</label>
+            <input id="previous_iphone_workbook" name="previous_iphone_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+
+          <button id="submit-button" type="submit">Generate iPhone Workbook</button>
+        </form>
+      </section>
+
+      <aside class="status">
+        <div class="panel-heading">
+          <h2>Status</h2>
+          <p>Conversion progress and download link.</p>
+        </div>
+        <div id="status-box" class="status-box">Ready.</div>
+        <a id="download-link" class="download" href="#">Download Workbook</a>
+      </aside>
+    </div>
+  </main>
+
+  <script src="/static/report-3.js?v=20260519"></script>
+</body>
+</html>

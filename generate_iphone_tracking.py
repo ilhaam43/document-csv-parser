@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -34,6 +36,11 @@ PREVIOUS_IPHONE_MAPPING_HEADERS = (
 )
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+
+
+def profile_log(label: str, start: float) -> None:
+    if os.getenv("IPHONE_PROFILE", "").strip().lower() in {"1", "true", "yes"}:
+        print(f"[profile] {label}: {time.perf_counter() - start:.2f}s", file=sys.stderr)
 
 
 def reference_date_from_workbook_path(workbook_path: Path) -> date:
@@ -401,17 +408,54 @@ def apply_previous_iphone_mappings(all_order_sheet, mappings: dict[str, dict[str
     row_count = all_order_sheet.UsedRange.Rows.Count
     updated_count = 0
 
-    for row_index in range(2, row_count + 1):
-        quo_value = str(all_order_sheet.Cells(row_index, quo_column).Value or "").strip()
+    if row_count < 2:
+        return 0
+
+    quo_range = all_order_sheet.Range(all_order_sheet.Cells(2, quo_column), all_order_sheet.Cells(row_count, quo_column))
+    quo_values = quo_range.Value
+    if not isinstance(quo_values, tuple):
+        quo_rows = [(quo_values,)]
+    elif quo_values and not isinstance(quo_values[0], tuple):
+        quo_rows = [(value,) for value in quo_values]
+    else:
+        quo_rows = list(quo_values)
+
+    target_column_values: dict[str, list[list[object]]] = {}
+    for header, column_index in target_columns.items():
+        value_range = all_order_sheet.Range(
+            all_order_sheet.Cells(2, column_index),
+            all_order_sheet.Cells(row_count, column_index),
+        )
+        values = value_range.Value
+        if not isinstance(values, tuple):
+            rows = [[values]]
+        elif values and not isinstance(values[0], tuple):
+            rows = [[value] for value in values]
+        else:
+            rows = [list(row) for row in values]
+        target_column_values[header] = rows
+
+    touched_headers: set[str] = set()
+    for row_offset, row_value in enumerate(quo_rows):
+        quo_value = str(row_value[0] or "").strip()
         row_mapping = mappings.get(quo_value)
         if not row_mapping:
             continue
 
         for header, mapped_value in row_mapping.items():
-            cell = all_order_sheet.Cells(row_index, target_columns[header])
-            if str(cell.Value or "").strip() != mapped_value:
-                cell.Value = mapped_value
+            current_value = target_column_values[header][row_offset][0]
+            if str(current_value or "").strip() != mapped_value:
+                target_column_values[header][row_offset][0] = mapped_value
+                touched_headers.add(header)
                 updated_count += 1
+
+    for header in touched_headers:
+        column_index = target_columns[header]
+        value_range = all_order_sheet.Range(
+            all_order_sheet.Cells(2, column_index),
+            all_order_sheet.Cells(row_count, column_index),
+        )
+        value_range.Value = tuple(tuple(row) for row in target_column_values[header])
 
     return updated_count
 
@@ -438,8 +482,25 @@ def refresh_pivots(workbook) -> int:
         for pivot_index in range(1, pivot_tables.Count + 1):
             pivot_tables_to_refresh.append(pivot_tables(pivot_index))
 
+    refreshed_cache_indexes: set[int] = set()
     for pivot_table in pivot_tables_to_refresh:
-        pivot_table.RefreshTable()
+        try:
+            cache_index = int(pivot_table.CacheIndex)
+            if cache_index in refreshed_cache_indexes:
+                continue
+            pivot_table.PivotCache().Refresh()
+            refreshed_cache_indexes.add(cache_index)
+        except Exception:
+            try:
+                pivot_table.RefreshTable()
+            except Exception:
+                pass
+
+    for pivot_table in pivot_tables_to_refresh:
+        try:
+            pivot_table.RefreshTable()
+        except Exception:
+            pass
 
     for pivot_table in pivot_tables_to_refresh:
         apply_year_fab_upload_filter(pivot_table)
@@ -645,12 +706,25 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
     source_wb = None
     target_wb = None
     try:
+        total_start = time.perf_counter()
         xl = win32com.client.DispatchEx("Excel.Application")
         xl.Visible = False
         xl.DisplayAlerts = False
+        try:
+            xl.ScreenUpdating = False
+        except Exception:
+            pass
+        try:
+            xl.EnableEvents = False
+        except Exception:
+            pass
 
+        phase_start = time.perf_counter()
         source_wb = xl.Workbooks.Open(str(input_workbook.resolve()))
+        profile_log("open source workbook", phase_start)
+        phase_start = time.perf_counter()
         target_wb = xl.Workbooks.Open(str(output_workbook.resolve()))
+        profile_log("open target workbook", phase_start)
 
         source_all_order = sheet_by_name(source_wb, ALL_ORDER_SHEET_NAME)
         target_all_order = sheet_by_name(target_wb, ALL_ORDER_SHEET_NAME)
@@ -658,24 +732,41 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         if source_all_order is None or target_all_order is None or target_iphone is None:
             raise ValueError("Input/reference workbook must contain ALL ORDER and ALL ORDER IPHONE sheets.")
 
+        phase_start = time.perf_counter()
         pct_format_sheet, pct_format_sources, pct_column_widths, pct_formula_offsets = (
             capture_percentage_completion_formats(target_wb, xl)
         )
+        profile_log("capture percentage formats", phase_start)
+        phase_start = time.perf_counter()
         source_column_count = source_all_order.UsedRange.Columns.Count
         target_all_order_widths = capture_column_widths(target_all_order, source_column_count)
         target_iphone_widths = capture_column_widths(target_iphone, source_column_count)
         target_all_order_captions = capture_header_captions(target_all_order, source_column_count)
         target_iphone_captions = capture_header_captions(target_iphone, source_column_count)
         all_order_column_model = capture_sheet_column_model(target_all_order, source_column_count)
+        profile_log("capture sheet models", phase_start)
+        phase_start = time.perf_counter()
         row_count, column_count = copy_used_range(source_all_order, target_all_order, xl)
+        profile_log("copy all order", phase_start)
+        phase_start = time.perf_counter()
         apply_sheet_column_model(target_all_order, all_order_column_model, column_count, xl)
         delete_sheet_model(all_order_column_model)
         ensure_table(target_all_order, ALL_ORDER_TABLE_NAME, row_count, column_count)
+        profile_log("restore all order model", phase_start)
+        phase_start = time.perf_counter()
         mappings = previous_iphone_mappings(reference_workbook)
+        profile_log("load previous mappings", phase_start)
+        phase_start = time.perf_counter()
         updated_count = apply_previous_iphone_mappings(target_all_order, mappings)
+        profile_log("apply previous mappings", phase_start)
+        phase_start = time.perf_counter()
         iphone_rows, _ = build_iphone_sheet(target_all_order, target_iphone, xl)
+        profile_log("build iphone sheet", phase_start)
+        phase_start = time.perf_counter()
         progress_name = rename_progress_sheet(target_wb, report_date)
         refreshed_count = refresh_pivots(target_wb)
+        profile_log("refresh pivots", phase_start)
+        phase_start = time.perf_counter()
         repair_percentage_completion_columns(
             target_wb,
             xl,
@@ -683,10 +774,13 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             pct_column_widths,
             pct_formula_offsets,
         )
+        profile_log("repair percentage columns", phase_start)
+        phase_start = time.perf_counter()
         apply_column_widths(target_all_order, target_all_order_widths)
         apply_column_widths(target_iphone, target_iphone_widths)
         apply_dated_phase_width_adjustments(target_all_order, target_all_order_widths, target_all_order_captions)
         apply_dated_phase_width_adjustments(target_iphone, target_iphone_widths, target_iphone_captions)
+        profile_log("restore column widths", phase_start)
 
         if pct_format_sheet is not None:
             try:
@@ -694,7 +788,10 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             except Exception:
                 pass
 
+        phase_start = time.perf_counter()
         target_wb.Save()
+        profile_log("save workbook", phase_start)
+        profile_log("total iphone generation", total_start)
         print(f"[info] Applied {updated_count} previous iPhone mappings")
         print(f"[info] Wrote {iphone_rows - 1} iPhone rows to '{IPHONE_SHEET_NAME}'")
         print(f"[info] Refreshed {refreshed_count} PivotTables, progress sheet '{progress_name}'")
