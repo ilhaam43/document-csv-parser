@@ -2353,6 +2353,7 @@ def apply_logic_to_workbook_com(
     output_path: Path,
     with_pivot: bool = False,
     clone_pivot_template: bool = False,
+    template_workbook_path: Path | None = None,
     aging_date: date | None = None,
 ) -> None:
     try:
@@ -2361,8 +2362,8 @@ def apply_logic_to_workbook_com(
         raise RuntimeError("pywin32 is required for --engine com.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    base_workbook_path = tracking_workbook_path
-    if clone_pivot_template:
+    base_workbook_path = template_workbook_path or tracking_workbook_path
+    if clone_pivot_template and template_workbook_path is None:
         try:
             base_workbook_path = resolve_validate_source_workbook(output_path.parent.parent)
         except FileNotFoundError:
@@ -2398,7 +2399,7 @@ def apply_logic_to_workbook_com(
         phase_start = time.perf_counter()
         wb = xl.Workbooks.Open(str(output_path.resolve()))
         profile_log("open target workbook", phase_start)
-        if clone_pivot_template and base_workbook_path.resolve() != tracking_workbook_path.resolve():
+        if (clone_pivot_template or template_workbook_path is not None) and base_workbook_path.resolve() != tracking_workbook_path.resolve():
             phase_start = time.perf_counter()
             source_wb = xl.Workbooks.Open(str(tracking_workbook_path.resolve()))
             profile_log("open source workbook", phase_start)
@@ -2745,6 +2746,7 @@ def apply_logic_to_workbook(
     with_pivot: bool = False,
     engine: str = "com",
     clone_pivot_template: bool = False,
+    template_workbook_path: Path | None = None,
     aging_date: date | None = None,
 ) -> None:
     if engine == "openpyxl":
@@ -2764,6 +2766,7 @@ def apply_logic_to_workbook(
             output_path,
             with_pivot=with_pivot,
             clone_pivot_template=clone_pivot_template,
+            template_workbook_path=template_workbook_path,
             aging_date=aging_date,
         )
     except RuntimeError:

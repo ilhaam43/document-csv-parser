@@ -125,6 +125,7 @@ def _run_conversion(
 def _run_ongoing_conversion(
     tracking_workbook_path: Path,
     log_csv_path: Path,
+    template_workbook_path: Path,
     output_path: Path,
     with_pivot: bool,
 ) -> dict[str, object]:
@@ -138,7 +139,8 @@ def _run_ongoing_conversion(
             output_path,
             with_pivot=with_pivot,
             engine="com",
-            clone_pivot_template=False,
+            clone_pivot_template=True,
+            template_workbook_path=template_workbook_path,
         )
     elapsed_seconds = time.perf_counter() - started
 
@@ -265,17 +267,21 @@ async def convert_report_2_upload(
     request: Request,
     tracking_workbook: UploadFile = File(...),
     log_update_status: UploadFile = File(...),
+    template_workbook: UploadFile = File(...),
     with_pivot: bool = Form(default=True),
 ) -> dict[str, object]:
     if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="tracking_workbook must be a .xlsx file.")
     if not log_update_status.filename or not log_update_status.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="log_update_status must be a .csv file.")
+    if not template_workbook.filename or not template_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="template_workbook must be a .xlsx file.")
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = job_dir / Path(tracking_workbook.filename).name
     log_path = job_dir / Path(log_update_status.filename).name
+    template_path = job_dir / Path(template_workbook.filename).name
     output_filename = ongoing_output_filename_for_tracking(tracking_path)
     conversion_output_path = (APP_ROOT / ONGOING_CONVERSION_OUTPUT_DIR / output_filename).resolve()
     output_path = job_dir / output_filename
@@ -283,12 +289,14 @@ async def convert_report_2_upload(
     try:
         await _save_upload_file(tracking_workbook, tracking_path)
         await _save_upload_file(log_update_status, log_path)
+        await _save_upload_file(template_workbook, template_path)
         conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         result = await run_in_threadpool(
             _run_ongoing_conversion,
             tracking_path,
             log_path,
+            template_path,
             conversion_output_path,
             with_pivot,
         )
@@ -303,6 +311,7 @@ async def convert_report_2_upload(
         "filename": output_path.name,
         "tracking_workbook_filename": tracking_path.name,
         "log_update_status_filename": log_path.name,
+        "template_workbook_filename": template_path.name,
         "output_file": str(output_path),
         "download_url": _download_url(request, job_dir.name, output_path.name),
         "with_pivot": with_pivot,
