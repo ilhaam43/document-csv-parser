@@ -27,11 +27,16 @@ from csv_to_excel_on_going import (
     apply_logic_to_workbook as apply_ongoing_logic_to_workbook,
     output_filename_for_tracking as ongoing_output_filename_for_tracking,
 )
+from generate_iphone_tracking import (
+    default_output_path as iphone_default_output_path,
+    generate_iphone_tracking,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent
 CONVERSION_OUTPUT_DIR = Path("output-today")
 ONGOING_CONVERSION_OUTPUT_DIR = Path("output-outgoing")
+IPHONE_CONVERSION_OUTPUT_DIR = Path("output-iphone")
 API_WORK_DIR = Path("output-today/api")
 
 app = FastAPI(
@@ -39,6 +44,22 @@ app = FastAPI(
     version="1.0.0",
 )
 app.mount("/static", StaticFiles(directory=APP_ROOT / "static"), name="static")
+
+
+@contextlib.contextmanager
+def _initialized_com_thread():
+    """Initialize Windows COM for worker threads that automate Excel."""
+    try:
+        import pythoncom  # type: ignore
+    except ImportError:
+        yield
+        return
+
+    pythoncom.CoInitialize()
+    try:
+        yield
+    finally:
+        pythoncom.CoUninitialize()
 
 
 class ConvertPathRequest(BaseModel):
@@ -100,15 +121,16 @@ def _run_conversion(
     stderr = io.StringIO()
     started = time.perf_counter()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        if len(csv_files) == 1 and input_path.is_file():
-            convert_one(csv_files[0], resolved_output, options)
-            output_files = [resolved_output]
-        else:
-            convert_many(csv_files, options)
-            if request.combine:
+        with _initialized_com_thread():
+            if len(csv_files) == 1 and input_path.is_file():
+                convert_one(csv_files[0], resolved_output, options)
                 output_files = [resolved_output]
             else:
-                output_files = [resolved_output / output_filename_from_csv_path(csv_path) for csv_path in csv_files]
+                convert_many(csv_files, options)
+                if request.combine:
+                    output_files = [resolved_output]
+                else:
+                    output_files = [resolved_output / output_filename_from_csv_path(csv_path) for csv_path in csv_files]
     elapsed_seconds = time.perf_counter() - started
 
     return {
@@ -125,7 +147,7 @@ def _run_conversion(
 def _run_ongoing_conversion(
     tracking_workbook_path: Path,
     log_csv_path: Path,
-    template_workbook_path: Path,
+    previous_ongoing_workbook_path: Path,
     output_path: Path,
     with_pivot: bool,
 ) -> dict[str, object]:
@@ -133,15 +155,16 @@ def _run_ongoing_conversion(
     stderr = io.StringIO()
     started = time.perf_counter()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        apply_ongoing_logic_to_workbook(
-            tracking_workbook_path,
-            log_csv_path,
-            output_path,
-            with_pivot=with_pivot,
-            engine="com",
-            clone_pivot_template=True,
-            template_workbook_path=template_workbook_path,
-        )
+        with _initialized_com_thread():
+            apply_ongoing_logic_to_workbook(
+                tracking_workbook_path,
+                log_csv_path,
+                output_path,
+                with_pivot=with_pivot,
+                engine="com",
+                clone_pivot_template=True,
+                base_workbook_path=previous_ongoing_workbook_path,
+            )
     elapsed_seconds = time.perf_counter() - started
 
     return {
@@ -153,6 +176,27 @@ def _run_ongoing_conversion(
     }
 
 
+def _run_iphone_conversion(
+    tracking_workbook_path: Path,
+    reference_workbook_path: Path,
+    output_path: Path,
+) -> dict[str, object]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    started = time.perf_counter()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with _initialized_com_thread():
+            generate_iphone_tracking(tracking_workbook_path, reference_workbook_path, output_path)
+    elapsed_seconds = time.perf_counter() - started
+
+    return {
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "output_path": str(output_path),
+        "stdout": stdout.getvalue().strip(),
+        "stderr": stderr.getvalue().strip(),
+    }
+
+
 @app.get("/report-1")
 def upload_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "index.html", media_type="text/html")
@@ -161,6 +205,11 @@ def upload_page() -> FileResponse:
 @app.get("/report-2")
 def report_2_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "report-2.html", media_type="text/html")
+
+
+@app.get("/report-3")
+def report_3_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "report-3.html", media_type="text/html")
 
 
 @app.get("/health")
@@ -244,7 +293,13 @@ async def convert_upload(
             infer_types=infer_types,
             refresh_template=refresh_template,
         )
-        result = await run_in_threadpool(_run_conversion, input_path, conversion_output_path, conversion_request)
+        result = await run_in_threadpool(
+            _run_conversion,
+            input_path,
+            conversion_output_path,
+            conversion_request,
+            lookup_workbook_path,
+        )
         shutil.copy2(conversion_output_path, output_path)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -267,21 +322,21 @@ async def convert_report_2_upload(
     request: Request,
     tracking_workbook: UploadFile = File(...),
     log_update_status: UploadFile = File(...),
-    template_workbook: UploadFile = File(...),
-    with_pivot: bool = Form(default=True),
+    previous_ongoing_workbook: UploadFile = File(...),
+    with_pivot: bool = Form(default=False),
 ) -> dict[str, object]:
     if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="tracking_workbook must be a .xlsx file.")
     if not log_update_status.filename or not log_update_status.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="log_update_status must be a .csv file.")
-    if not template_workbook.filename or not template_workbook.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="template_workbook must be a .xlsx file.")
+    if not previous_ongoing_workbook.filename or not previous_ongoing_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="previous_ongoing_workbook must be a .xlsx file.")
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = job_dir / Path(tracking_workbook.filename).name
     log_path = job_dir / Path(log_update_status.filename).name
-    template_path = job_dir / Path(template_workbook.filename).name
+    previous_ongoing_path = job_dir / Path(previous_ongoing_workbook.filename).name
     output_filename = ongoing_output_filename_for_tracking(tracking_path)
     conversion_output_path = (APP_ROOT / ONGOING_CONVERSION_OUTPUT_DIR / output_filename).resolve()
     output_path = job_dir / output_filename
@@ -289,14 +344,14 @@ async def convert_report_2_upload(
     try:
         await _save_upload_file(tracking_workbook, tracking_path)
         await _save_upload_file(log_update_status, log_path)
-        await _save_upload_file(template_workbook, template_path)
+        await _save_upload_file(previous_ongoing_workbook, previous_ongoing_path)
         conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         result = await run_in_threadpool(
             _run_ongoing_conversion,
             tracking_path,
             log_path,
-            template_path,
+            previous_ongoing_path,
             conversion_output_path,
             with_pivot,
         )
@@ -311,8 +366,54 @@ async def convert_report_2_upload(
         "filename": output_path.name,
         "tracking_workbook_filename": tracking_path.name,
         "log_update_status_filename": log_path.name,
-        "template_workbook_filename": template_path.name,
+        "previous_ongoing_workbook_filename": previous_ongoing_path.name,
         "output_file": str(output_path),
         "download_url": _download_url(request, job_dir.name, output_path.name),
         "with_pivot": with_pivot,
+    }
+
+
+@app.post("/convert/report-3/upload")
+async def convert_report_3_upload(
+    request: Request,
+    tracking_workbook: UploadFile = File(...),
+    previous_iphone_workbook: UploadFile = File(...),
+) -> dict[str, object]:
+    if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="tracking_workbook must be a .xlsx file.")
+    if not previous_iphone_workbook.filename or not previous_iphone_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="previous_iphone_workbook must be a .xlsx file.")
+
+    job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    tracking_path = job_dir / Path(tracking_workbook.filename).name
+    reference_path = job_dir / Path(previous_iphone_workbook.filename).name
+    output_filename = iphone_default_output_path(tracking_path).name
+    conversion_output_path = (APP_ROOT / IPHONE_CONVERSION_OUTPUT_DIR / output_filename).resolve()
+    output_path = job_dir / output_filename
+
+    try:
+        await _save_upload_file(tracking_workbook, tracking_path)
+        await _save_upload_file(previous_iphone_workbook, reference_path)
+        conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        result = await run_in_threadpool(
+            _run_iphone_conversion,
+            tracking_path,
+            reference_path,
+            conversion_output_path,
+        )
+        shutil.copy2(conversion_output_path, output_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "message": "Report 3 iPhone workbook generated successfully.",
+        "elapsed_seconds": result["elapsed_seconds"],
+        "filename": output_path.name,
+        "tracking_workbook_filename": tracking_path.name,
+        "previous_iphone_workbook_filename": reference_path.name,
+        "output_file": str(output_path),
+        "download_url": _download_url(request, job_dir.name, output_path.name),
     }

@@ -4,6 +4,35 @@ const statusBox = document.getElementById("status-box");
 const downloadLink = document.getElementById("download-link");
 const health = document.getElementById("health");
 
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (minutes === 0) {
+    return `${remainingSeconds} detik`;
+  }
+
+  return `${minutes} menit ${remainingSeconds} detik`;
+}
+
+function processingStage(seconds) {
+  if (seconds < 5) {
+    return "Uploading files";
+  }
+  if (seconds < 20) {
+    return "Preparing workbook";
+  }
+  if (seconds < 60) {
+    return "Cleaning and mapping data";
+  }
+  if (seconds < 180) {
+    return "Refreshing Excel pivots";
+  }
+
+  return "Saving output workbook";
+}
+
 fetch("/health")
   .then((response) => (response.ok ? response.json() : Promise.reject()))
   .then(() => {
@@ -23,7 +52,7 @@ form.addEventListener("submit", async (event) => {
   const started = Date.now();
   const timer = window.setInterval(() => {
     const seconds = Math.round((Date.now() - started) / 1000);
-    statusBox.textContent = `Processing... ${seconds}s`;
+    statusBox.textContent = `${processingStage(seconds)}... ${formatDuration(seconds)}`;
   }, 1000);
 
   try {
@@ -40,7 +69,7 @@ form.addEventListener("submit", async (event) => {
     }
 
     statusBox.className = "status-box ok";
-    statusBox.textContent = `Generated ${payload.filename} in ${payload.elapsed_seconds}s.`;
+    statusBox.textContent = `Generated ${payload.filename} in ${formatDuration(payload.elapsed_seconds)}.`;
     downloadLink.href = payload.download_url;
     downloadLink.classList.add("visible");
   } catch (error) {

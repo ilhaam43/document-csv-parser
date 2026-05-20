@@ -21,13 +21,13 @@ function processingStage(seconds) {
     return "Uploading files";
   }
   if (seconds < 20) {
-    return "Preparing ongoing workbook";
+    return "Preparing iPhone workbook";
   }
   if (seconds < 60) {
-    return "Applying status update logic";
+    return "Mapping iPhone order data";
   }
   if (seconds < 180) {
-    return "Refreshing ongoing pivots";
+    return "Refreshing iPhone pivots";
   }
 
   return "Saving output workbook";
@@ -58,7 +58,7 @@ form.addEventListener("submit", async (event) => {
   try {
     const body = new FormData(form);
 
-    const response = await fetch("/convert/report-2/upload", {
+    const response = await fetch("/convert/report-3/upload", {
       method: "POST",
       body,
     });
