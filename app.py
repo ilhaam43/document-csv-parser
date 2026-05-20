@@ -5,14 +5,13 @@ import io
 import shutil
 import time
 import uuid
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -38,7 +37,6 @@ APP_ROOT = Path(__file__).resolve().parent
 CONVERSION_OUTPUT_DIR = Path("output-today")
 ONGOING_CONVERSION_OUTPUT_DIR = Path("output-outgoing")
 IPHONE_CONVERSION_OUTPUT_DIR = Path("output-iphone")
-PIPELINE_CONVERSION_OUTPUT_DIR = Path("output-pipeline")
 API_WORK_DIR = Path("output-today/api")
 
 app = FastAPI(
@@ -199,67 +197,6 @@ def _run_iphone_conversion(
     }
 
 
-def _run_pipeline_conversion(
-    data_order_csv_path: Path,
-    daily_reference_workbook_path: Path,
-    log_csv_path: Path,
-    previous_ongoing_workbook_path: Path,
-    previous_iphone_workbook_path: Path,
-    output_dir: Path,
-    refresh_template: bool,
-    ongoing_with_pivot: bool,
-) -> dict[str, object]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    started = time.perf_counter()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    daily_output_path = (output_dir / output_filename_from_csv_path(data_order_csv_path)).resolve()
-    ongoing_output_path = (output_dir / ongoing_output_filename_for_tracking(daily_output_path)).resolve()
-    iphone_output_path = (output_dir / iphone_default_output_path(daily_output_path).name).resolve()
-
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        with _initialized_com_thread():
-            daily_request = ConvertPathRequest(
-                input_path=str(data_order_csv_path),
-                output_path=str(daily_output_path),
-                refresh_template=refresh_template,
-            )
-            _run_conversion(
-                data_order_csv_path,
-                daily_output_path,
-                daily_request,
-                daily_reference_workbook_path,
-            )
-            _run_ongoing_conversion(
-                daily_output_path,
-                log_csv_path,
-                previous_ongoing_workbook_path,
-                ongoing_output_path,
-                ongoing_with_pivot,
-            )
-            _run_iphone_conversion(
-                daily_output_path,
-                previous_iphone_workbook_path,
-                iphone_output_path,
-            )
-    elapsed_seconds = time.perf_counter() - started
-
-    return {
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "output_files": [str(daily_output_path), str(ongoing_output_path), str(iphone_output_path)],
-        "stdout": stdout.getvalue().strip(),
-        "stderr": stderr.getvalue().strip(),
-        "refresh_template": refresh_template,
-        "ongoing_with_pivot": ongoing_with_pivot,
-    }
-
-
-@app.get("/")
-def home() -> RedirectResponse:
-    return RedirectResponse(url="/report-1", status_code=302)
-
-
 @app.get("/report-1")
 def upload_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "index.html", media_type="text/html")
@@ -273,11 +210,6 @@ def report_2_page() -> FileResponse:
 @app.get("/report-3")
 def report_3_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "report-3.html", media_type="text/html")
-
-
-@app.get("/pipeline")
-def pipeline_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "pipeline.html", media_type="text/html")
 
 
 @app.get("/health")
@@ -301,12 +233,11 @@ def download_output(job_id: str, filename: str) -> FileResponse:
     if output_path.parent != job_dir or not output_path.is_file():
         raise HTTPException(status_code=404, detail="Output file not found.")
 
-    media_type = (
-        "application/zip"
-        if output_path.suffix.lower() == ".zip"
-        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=output_path.name,
     )
-    return FileResponse(output_path, media_type=media_type, filename=output_path.name)
 
 
 @app.post("/convert/path")
@@ -485,77 +416,4 @@ async def convert_report_3_upload(
         "previous_iphone_workbook_filename": reference_path.name,
         "output_file": str(output_path),
         "download_url": _download_url(request, job_dir.name, output_path.name),
-    }
-
-
-@app.post("/convert/pipeline/upload")
-async def convert_pipeline_upload(
-    request: Request,
-    raw_data: UploadFile = File(...),
-    yesterday_cleaned_data: UploadFile = File(...),
-    log_update_status: UploadFile = File(...),
-    previous_ongoing_workbook: UploadFile = File(...),
-    previous_iphone_workbook: UploadFile = File(...),
-    refresh_template: bool = Form(default=True),
-    ongoing_with_pivot: bool = Form(default=False),
-) -> dict[str, object]:
-    if not raw_data.filename or not raw_data.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="raw_data must be a .csv file.")
-    if not yesterday_cleaned_data.filename or not yesterday_cleaned_data.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="yesterday_cleaned_data must be a .xlsx file.")
-    if not log_update_status.filename or not log_update_status.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="log_update_status must be a .csv file.")
-    if not previous_ongoing_workbook.filename or not previous_ongoing_workbook.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="previous_ongoing_workbook must be a .xlsx file.")
-    if not previous_iphone_workbook.filename or not previous_iphone_workbook.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="previous_iphone_workbook must be a .xlsx file.")
-
-    job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
-    job_dir.mkdir(parents=True, exist_ok=True)
-    input_dir = job_dir / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-
-    raw_path = input_dir / Path(raw_data.filename).name
-    daily_reference_path = input_dir / Path(yesterday_cleaned_data.filename).name
-    log_path = input_dir / Path(log_update_status.filename).name
-    previous_ongoing_path = input_dir / Path(previous_ongoing_workbook.filename).name
-    previous_iphone_path = input_dir / Path(previous_iphone_workbook.filename).name
-    conversion_output_dir = (APP_ROOT / PIPELINE_CONVERSION_OUTPUT_DIR).resolve()
-    pipeline_zip_path = job_dir / "daily-pipeline-output.zip"
-
-    try:
-        await _save_upload_file(raw_data, raw_path)
-        await _save_upload_file(yesterday_cleaned_data, daily_reference_path)
-        await _save_upload_file(log_update_status, log_path)
-        await _save_upload_file(previous_ongoing_workbook, previous_ongoing_path)
-        await _save_upload_file(previous_iphone_workbook, previous_iphone_path)
-
-        result = await run_in_threadpool(
-            _run_pipeline_conversion,
-            raw_path,
-            daily_reference_path,
-            log_path,
-            previous_ongoing_path,
-            previous_iphone_path,
-            conversion_output_dir,
-            refresh_template,
-            ongoing_with_pivot,
-        )
-
-        output_files = [Path(path) for path in result["output_files"]]
-        with zipfile.ZipFile(pipeline_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for output_file in output_files:
-                archive.write(output_file, arcname=output_file.name)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "success": True,
-        "message": "Daily pipeline generated successfully.",
-        "elapsed_seconds": result["elapsed_seconds"],
-        "filename": pipeline_zip_path.name,
-        "output_files": [Path(path).name for path in result["output_files"]],
-        "download_url": _download_url(request, job_dir.name, pipeline_zip_path.name),
-        "refresh_template": refresh_template,
-        "ongoing_with_pivot": ongoing_with_pivot,
     }
