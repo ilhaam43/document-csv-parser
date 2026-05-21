@@ -36,6 +36,18 @@ PREVIOUS_IPHONE_MAPPING_HEADERS = (
 )
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+PHASE_PIVOT_ORDER = (
+    "00-New",
+    "01-Presales",
+    "02-Survey",
+    "03-Allocation",
+    "04-Pre Installation",
+    "05-Customer Preparation",
+    "06-Installation",
+    "07-UAT On Hold",
+    "Cancel",
+    "SO Complete",
+)
 
 
 def profile_log(label: str, start: float) -> None:
@@ -515,7 +527,14 @@ def refresh_pivots(workbook) -> int:
 
 
 def is_excluded_year_fab_upload_value(value: object) -> bool:
-    return str(value).strip().lower() in YEAR_FAB_UPLOAD_EXCLUDED_VALUES
+    normalized = str(value).strip()
+    if normalized.lower() in YEAR_FAB_UPLOAD_EXCLUDED_VALUES:
+        return True
+
+    if re.fullmatch(r"\d{4}(?:\.0+)?", normalized):
+        return int(float(normalized)) < 2023
+
+    return False
 
 
 def apply_year_fab_upload_filter(pivot_table) -> None:
@@ -558,6 +577,233 @@ def header_column(sheet, header_row: int, header_text: str, start_col: int = 5, 
         if normalize_header_key(sheet.Cells(header_row, column_index).Value) == normalized:
             return column_index
     return None
+
+
+def contiguous_left_pivot_last_row(pivot_sheet, header_row: int) -> int:
+    for row_index in range(header_row + 1, header_row + 120):
+        has_label = pivot_sheet.Cells(row_index, 1).Value not in (None, "")
+        has_count = pivot_sheet.Cells(row_index, 3).Value not in (None, "")
+        if not has_label and not has_count:
+            return row_index - 1
+    return header_row
+
+
+def pivot_phase_block_needs_repair(pivot_sheet, header_row: int) -> bool:
+    if header_column(pivot_sheet, header_row, "SO Complete") is not None:
+        return False
+
+    for row_index in range(max(1, header_row - 2), header_row + 2):
+        for column_index in range(5, 13):
+            text = str(pivot_sheet.Cells(row_index, column_index).Text or "").strip().upper()
+            if text == "#SPILL!":
+                return True
+
+    return pivot_sheet.Cells(header_row, 1).Value not in (None, "") and pivot_sheet.Cells(header_row, 5).Value in (None, "")
+
+
+def sheet_header_map(sheet) -> dict[str, int]:
+    return {
+        normalize_header_key(sheet.Cells(1, column_index).Value): column_index
+        for column_index in range(1, sheet.UsedRange.Columns.Count + 1)
+        if sheet.Cells(1, column_index).Value not in (None, "")
+    }
+
+
+def column_values(sheet, column_index: int, row_count: int) -> list[object]:
+    values = sheet.Range(sheet.Cells(2, column_index), sheet.Cells(row_count, column_index)).Value
+    if row_count <= 1:
+        return []
+    if not isinstance(values, tuple):
+        return [values]
+    return [row[0] if isinstance(row, tuple) else row for row in values]
+
+
+def capture_phase_pivot_formats(workbook, xl):
+    pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
+    if pivot_sheet is None:
+        return None, {}
+
+    format_sheet = None
+    format_sources = {}
+    for header_row in (9, 56, 167):
+        if format_sheet is None:
+            format_sheet = workbook.Worksheets.Add()
+            format_sheet.Name = "__iphone_phase_fmt"
+            format_sheet.Visible = 0
+
+        destination_row = (len(format_sources) * 81) + 1
+        source_range = pivot_sheet.Range(
+            pivot_sheet.Cells(max(1, header_row - 1), 5),
+            pivot_sheet.Cells(header_row + 79, 20),
+        )
+        target_range = format_sheet.Range(
+            format_sheet.Cells(destination_row, 1),
+            format_sheet.Cells(destination_row + 80, 16),
+        )
+        source_range.Copy()
+        target_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
+        xl.CutCopyMode = False
+        format_sources[header_row] = target_range
+
+    return format_sheet, format_sources
+
+
+def repair_spilled_phase_pivot_blocks(workbook, xl=None, format_sources=None) -> None:
+    """Rebuild only collapsed/#SPILL phase pivot blocks; leave normal pivots untouched."""
+    pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
+    iphone_sheet = sheet_by_name(workbook, IPHONE_SHEET_NAME)
+    if pivot_sheet is None or iphone_sheet is None:
+        return
+
+    format_sources = format_sources or {}
+    header_map = sheet_header_map(iphone_sheet)
+    required_headers = {
+        "process": normalize_header_key("Process"),
+        "service": normalize_header_key("Service Delivery Div. "),
+        "dept": normalize_header_key("Dept SD"),
+        "phase": normalize_header_key("Phase"),
+        "year": normalize_header_key(YEAR_FAB_UPLOAD_HEADER),
+    }
+    if any(header_key not in header_map for header_key in required_headers.values()):
+        return
+
+    row_count = iphone_sheet.UsedRange.Rows.Count
+    source_columns = {
+        name: column_values(iphone_sheet, header_map[header_key], row_count)
+        for name, header_key in required_headers.items()
+    }
+    source_rows = []
+    for index in range(max(0, row_count - 1)):
+        year_value = source_columns["year"][index] if index < len(source_columns["year"]) else None
+        if is_excluded_year_fab_upload_value(year_value):
+            continue
+
+        source_rows.append(
+            {
+                "process": str(source_columns["process"][index] or "").strip(),
+                "service": str(source_columns["service"][index] or "").strip(),
+                "dept": str(source_columns["dept"][index] or "").strip(),
+                "phase": str(source_columns["phase"][index] or "").strip(),
+            }
+        )
+
+    process_names = {row["process"] for row in source_rows if row["process"]}
+    service_names = {row["service"] for row in source_rows if row["service"]}
+    dept_names = {row["dept"] for row in source_rows if row["dept"]}
+    active_phases = {
+        row["phase"]
+        for row in source_rows
+        if row["phase"] and any(row["phase"] == phase for phase in PHASE_PIVOT_ORDER)
+    }
+
+    phase_columns = [phase for phase in PHASE_PIVOT_ORDER if phase in active_phases]
+    if "SO Complete" not in phase_columns:
+        phase_columns.append("SO Complete")
+    if not phase_columns:
+        return
+
+    def counts_for(current_process: str | None, current_service: str | None, current_dept: str | None) -> dict[str, int]:
+        counts = {phase: 0 for phase in phase_columns}
+        for row in source_rows:
+            if current_process is not None and row["process"] != current_process:
+                continue
+            if current_service is not None and row["service"] != current_service:
+                continue
+            if current_dept is not None and row["dept"] != current_dept:
+                continue
+            if row["phase"] in counts:
+                counts[row["phase"]] += 1
+        return counts
+
+    for header_row in (9, 56, 167):
+        if not pivot_phase_block_needs_repair(pivot_sheet, header_row):
+            continue
+
+        last_row = contiguous_left_pivot_last_row(pivot_sheet, header_row)
+        if last_row <= header_row:
+            continue
+
+        pivot_sheet.Range(
+            pivot_sheet.Cells(max(1, header_row - 1), 5),
+            pivot_sheet.Cells(last_row, 20),
+        ).ClearContents()
+
+        format_source = format_sources.get(header_row)
+        if format_source is not None:
+            try:
+                format_source.Copy()
+                pivot_sheet.Range(
+                    pivot_sheet.Cells(max(1, header_row - 1), 5),
+                    pivot_sheet.Cells(header_row + 79, 20),
+                ).PasteSpecial(Paste=-4122)  # xlPasteFormats
+                if xl is not None:
+                    xl.CutCopyMode = False
+            except Exception:
+                pass
+
+        pivot_sheet.Cells(header_row - 1, 5).Value = "Count of quo"
+        pivot_sheet.Cells(header_row - 1, 6).Value = "Column Labels"
+        pivot_sheet.Cells(header_row, 5).Value = "Div./Dept."
+        for offset, phase in enumerate(phase_columns, start=6):
+            pivot_sheet.Cells(header_row, offset).Value = phase
+        last_phase_col = 5 + len(phase_columns)
+
+        current_process = None
+        current_service = None
+        for row_index in range(header_row + 1, last_row + 1):
+            label = str(pivot_sheet.Cells(row_index, 1).Value or "").strip()
+            if not label:
+                continue
+
+            pivot_sheet.Cells(row_index, 5).Value = label
+            if normalize_header_key(label) == normalize_header_key("Grand Total"):
+                row_counts = counts_for(None, None, None)
+            elif label in process_names:
+                current_process = label
+                current_service = None
+                row_counts = counts_for(current_process, None, None)
+            elif label in service_names:
+                current_service = label
+                row_counts = counts_for(current_process, current_service, None)
+            elif label in dept_names:
+                row_counts = counts_for(current_process, current_service, label)
+            else:
+                row_counts = {phase: 0 for phase in phase_columns}
+
+            for offset, phase in enumerate(phase_columns, start=6):
+                count = row_counts.get(phase, 0)
+                pivot_sheet.Cells(row_index, offset).Value = count if count else None
+
+        try:
+            phase_format_source = None
+            if format_source is not None:
+                phase_format_source = format_source.Columns(2)
+            else:
+                phase_format_source = pivot_sheet.Range(
+                    pivot_sheet.Cells(max(1, header_row - 1), 6),
+                    pivot_sheet.Cells(header_row + 79, 6),
+                )
+
+            for column_index in range(6, last_phase_col + 1):
+                phase_format_source.Copy()
+                pivot_sheet.Range(
+                    pivot_sheet.Cells(max(1, header_row - 1), column_index),
+                    pivot_sheet.Cells(header_row + 79, column_index),
+                ).PasteSpecial(Paste=-4122)  # xlPasteFormats
+            if xl is not None:
+                xl.CutCopyMode = False
+            else:
+                pivot_sheet.Parent.Application.CutCopyMode = False
+        except Exception:
+            pass
+
+        try:
+            pivot_sheet.Range(
+                pivot_sheet.Cells(header_row + 1, 6),
+                pivot_sheet.Cells(last_row, last_phase_col),
+            ).NumberFormat = "0"
+        except Exception:
+            pass
 
 
 def formula_column_offsets(formula_r1c1: str) -> list[int]:
@@ -612,6 +858,26 @@ def capture_percentage_completion_formats(workbook, xl):
         ]
 
     return format_sheet, format_sources, column_widths, formula_offsets
+
+
+def clear_stale_percentage_completion_columns(workbook) -> None:
+    """Free old side-calculation columns so refreshed PivotTables can expand normally."""
+    pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
+    if pivot_sheet is None:
+        return
+
+    for header_row in (9, 56, 167):
+        percentage_col = header_column(pivot_sheet, header_row, PERCENTAGE_COMPLETION_HEADER, end_col=25)
+        if percentage_col is None:
+            continue
+
+        try:
+            pivot_sheet.Range(
+                pivot_sheet.Cells(header_row, percentage_col),
+                pivot_sheet.Cells(header_row + 79, percentage_col),
+            ).Clear()
+        except Exception:
+            pass
 
 
 def repair_percentage_completion_columns(
@@ -738,6 +1004,9 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         )
         profile_log("capture percentage formats", phase_start)
         phase_start = time.perf_counter()
+        phase_format_sheet, phase_format_sources = capture_phase_pivot_formats(target_wb, xl)
+        profile_log("capture phase pivot formats", phase_start)
+        phase_start = time.perf_counter()
         source_column_count = source_all_order.UsedRange.Columns.Count
         target_all_order_widths = capture_column_widths(target_all_order, source_column_count)
         target_iphone_widths = capture_column_widths(target_iphone, source_column_count)
@@ -764,8 +1033,12 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         profile_log("build iphone sheet", phase_start)
         phase_start = time.perf_counter()
         progress_name = rename_progress_sheet(target_wb, report_date)
+        clear_stale_percentage_completion_columns(target_wb)
         refreshed_count = refresh_pivots(target_wb)
         profile_log("refresh pivots", phase_start)
+        phase_start = time.perf_counter()
+        repair_spilled_phase_pivot_blocks(target_wb, xl, phase_format_sources)
+        profile_log("repair spilled phase pivots", phase_start)
         phase_start = time.perf_counter()
         repair_percentage_completion_columns(
             target_wb,
@@ -785,6 +1058,11 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         if pct_format_sheet is not None:
             try:
                 pct_format_sheet.Delete()
+            except Exception:
+                pass
+        if phase_format_sheet is not None:
+            try:
+                phase_format_sheet.Delete()
             except Exception:
                 pass
 
