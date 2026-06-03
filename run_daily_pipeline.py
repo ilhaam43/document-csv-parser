@@ -7,6 +7,7 @@ import argparse
 import shutil
 import sys
 import tempfile
+from datetime import date, datetime
 from pathlib import Path
 
 import csv_to_excel
@@ -80,6 +81,7 @@ def convert_ongoing_tracking(
     output_path: Path,
     with_pivot: bool,
     keep_temp: bool,
+    aging_date: date,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,6 +105,8 @@ def convert_ongoing_tracking(
             with_pivot=with_pivot,
             engine="com",
             clone_pivot_template=True,
+            aging_date=aging_date,
+            base_workbook_path=ongoing_reference_workbook,
         )
         shutil.copy2(temp_output, output_path)
     finally:
@@ -182,6 +186,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Run the slower ongoing ALL ORDER ON PROGRESS pivot refresh too.",
     )
     parser.add_argument(
+        "--ongoing-aging-date",
+        type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
+        default=None,
+        help="Date used to calculate ongoing Pre-Installation Aging. Defaults to today's date.",
+    )
+    parser.add_argument(
         "--keep-temp",
         action="store_true",
         help="Keep temporary working folders for debugging.",
@@ -233,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                     ongoing_output,
                     args.ongoing_with_pivot,
                     args.keep_temp,
+                    args.ongoing_aging_date or date.today(),
                 )
             )
         else:
