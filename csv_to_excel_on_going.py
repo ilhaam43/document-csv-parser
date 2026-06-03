@@ -645,24 +645,24 @@ def date_from_dated_phase_header(header_value: object) -> date | None:
 
 
 def find_source_dynamic_headers(source_headers: list[object], reference_date: date) -> tuple[str, str]:
-    target_header = None
     phase_header = None
     expected_phase_date = reference_date - timedelta(days=1)
     for header_value in source_headers:
         if header_value is None:
             continue
-        if target_header is None and is_target_determined_header(header_value):
-            target_header = str(header_value)
         if (
             phase_header is None
             and is_dated_phase_header(header_value)
             and date_from_dated_phase_header(header_value) == expected_phase_date
         ):
             phase_header = str(header_value)
-        if target_header is not None and phase_header is not None:
+        if phase_header is not None:
             break
     return (
-        target_header or fallback_target_determined_header(reference_date),
+        # Keep the template-compatible month abbreviation in the output header.
+        # Source workbooks generated from CSV can use the full month name ("April"),
+        # while the ongoing pivot templates use the abbreviated field ("Apr").
+        fallback_target_determined_header(reference_date),
         phase_header or fallback_dated_phase_header(reference_date),
     )
 
@@ -1122,23 +1122,29 @@ def enforce_on_progress_row_label_filters(progress_sheet, reference_date: date) 
     status_pivot = find_on_progress_pivot(progress_sheet, "PivotTable_StatusOrder_PreInstall_UAT")
     try:
         top_candidates = []
+        status_candidates = []
         pivot_tables = progress_sheet.PivotTables()
         for pivot_index in range(1, pivot_tables.Count + 1):
             pt = pivot_tables(pivot_index)
             try:
                 if str(pt.Name) == "PivotTable_StatusOrder_PreInstall_UAT":
+                    status_pivot = pt
                     continue
                 row = pt.TableRange2.Row
                 if row > 10:
+                    status_candidates.append((row, pt.TableRange2.Column, str(pt.Name)))
                     continue
                 top_candidates.append((pt.TableRange2.Column, row, str(pt.Name)))
             except Exception:
                 continue
         top_candidates.sort()
+        status_candidates.sort()
         if top_candidates:
             first_pivot = progress_sheet.PivotTables(top_candidates[0][2])
         if len(top_candidates) > 1:
             second_pivot = progress_sheet.PivotTables(top_candidates[1][2])
+        if status_pivot is None and status_candidates:
+            status_pivot = progress_sheet.PivotTables(status_candidates[0][2])
     except Exception:
         first_pivot = find_on_progress_pivot(progress_sheet, "PivotTable2", 0)
         second_pivot = find_on_progress_pivot(progress_sheet, "PivotTable9", 1)
@@ -1241,16 +1247,52 @@ def find_contiguous_percentage_block_last_row(pivot_sheet, header_row: int, head
 
 def normalize_percentage_block_formatting(pivot_sheet) -> None:
     percentage_header_key = normalize_header_key("Percentage of Order On going from Pre-Installation to UAT")
-    used_rows = pivot_sheet.UsedRange.Rows.Count
-    used_cols = pivot_sheet.UsedRange.Columns.Count
+    try:
+        used_range = pivot_sheet.UsedRange
+        first_row = used_range.Row
+        first_col = used_range.Column
+        used_rows = used_range.Rows.Count
+        used_cols = used_range.Columns.Count
+        raw_values = used_range.Value
+    except Exception:
+        return
+
+    if not isinstance(raw_values, tuple):
+        values = [[raw_values]]
+    elif raw_values and not isinstance(raw_values[0], tuple):
+        values = [list(raw_values)]
+    else:
+        values = [list(row) for row in raw_values]
+
+    def _cell_value(row_index: int, column_index: int):
+        row_offset = row_index - first_row
+        column_offset = column_index - first_col
+        if row_offset < 0 or column_offset < 0:
+            return None
+        try:
+            return values[row_offset][column_offset]
+        except Exception:
+            return None
+
+    def _has_block_value(row_index: int, header_col: int) -> bool:
+        for column_index in range(first_col, header_col + 1):
+            value = _cell_value(row_index, column_index)
+            if value not in (None, ""):
+                return True
+        return False
+
+    def _find_block_last_row(header_row: int, header_col: int) -> int:
+        last_used_row = first_row + used_rows - 1
+        for row_index in range(header_row + 1, last_used_row + 1):
+            if not _has_block_value(row_index, header_col):
+                return row_index - 1
+        return last_used_row
+
     header_cells: list[tuple[int, int]] = []
 
-    for row_index in range(1, used_rows + 1):
-        for column_index in range(1, used_cols + 1):
-            try:
-                value = pivot_sheet.Cells(row_index, column_index).Value
-            except Exception:
-                continue
+    for row_index in range(first_row, first_row + used_rows):
+        for column_index in range(first_col, first_col + used_cols):
+            value = _cell_value(row_index, column_index)
             if normalize_header_key(value) == percentage_header_key:
                 header_cells.append((row_index, column_index))
 
@@ -1265,8 +1307,12 @@ def normalize_percentage_block_formatting(pivot_sheet) -> None:
     xl_red = 255
 
     for index, (header_row, header_col) in enumerate(header_cells):
-        last_row = find_contiguous_percentage_block_last_row(pivot_sheet, header_row, header_col)
-        next_header_row = header_cells[index + 1][0] if index + 1 < len(header_cells) else used_rows + 1
+        last_row = _find_block_last_row(header_row, header_col)
+        next_header_row = (
+            header_cells[index + 1][0]
+            if index + 1 < len(header_cells)
+            else first_row + used_rows
+        )
         cleanup_last_row = min(next_header_row - 1, max(last_row + 8, header_row))
 
         try:
@@ -1550,13 +1596,6 @@ def ensure_ongoing_percentage_columns(pivot_sheet) -> None:
 
 def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date | None = None) -> None:
     """Keep the ongoing PIVOT report width model stable after Excel refreshes pivots."""
-    try:
-        pivot_tables = pivot_sheet.PivotTables()
-        for pivot_index in range(1, pivot_tables.Count + 1):
-            apply_range_aging_column_order(pivot_tables(pivot_index))
-    except Exception:
-        pass
-
     april_widths = {
         5: 69.55,
         6: 25.82,
@@ -1620,15 +1659,25 @@ def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date 
             pass
 
     try:
+        phase_start = time.perf_counter()
         used_range = pivot_sheet.UsedRange
         used_range.Replace(What=-2146826281, Replacement="", LookAt=1)
+        profile_log("replace pivot #DIV/0", phase_start)
     except Exception:
         pass
 
+    phase_start = time.perf_counter()
     ensure_ongoing_percentage_columns(pivot_sheet)
+    profile_log("ensure percentage columns first pass", phase_start)
+    phase_start = time.perf_counter()
     repair_spilled_pivot_tables(pivot_sheet)
+    profile_log("repair spilled pivots", phase_start)
+    phase_start = time.perf_counter()
     ensure_ongoing_percentage_columns(pivot_sheet)
+    profile_log("ensure percentage columns second pass", phase_start)
+    phase_start = time.perf_counter()
     normalize_percentage_block_formatting(pivot_sheet)
+    profile_log("normalize percentage formatting", phase_start)
 
 
 def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) -> bool:
@@ -2512,6 +2561,11 @@ def apply_logic_to_workbook_com(
     aging_date = aging_date or reference_date
     lookup = load_pre_installation_lookup(log_csv_path)
     payload_lookup = build_start_date_payload_lookup(lookup, aging_date)
+    pivot_payload_lookup = (
+        build_start_date_payload_lookup(lookup, reference_date)
+        if aging_date != reference_date
+        else payload_lookup
+    )
 
     xl = None
     wb = None
@@ -2804,23 +2858,15 @@ def apply_logic_to_workbook_com(
 
         xl_up = -4162
         last_row = ws.Cells(ws.Rows.Count, quo_column).End(xl_up).Row
-        if last_row >= 2:
-            phase_start = time.perf_counter()
-            quo_values = ws.Range(ws.Cells(2, quo_column), ws.Cells(last_row, quo_column)).Value
-            if isinstance(quo_values, tuple):
-                if quo_values and isinstance(quo_values[0], tuple):
-                    quo_rows = list(quo_values)
-                else:
-                    quo_rows = [(value,) for value in quo_values]
-            else:
-                quo_rows = [(quo_values,)]
+        quo_rows = []
 
+        def write_pre_installation_payload(payload: dict[str, tuple[object, object, object]]) -> None:
             start_values = []
             aging_values = []
             range_values = []
             for row_value in quo_rows:
                 quo_value = normalize_quo_value(row_value[0])
-                start_value, aging_value, range_value = payload_lookup.get(quo_value, ("#N/A", "#N/A", "#N/A"))
+                start_value, aging_value, range_value = payload.get(quo_value, ("#N/A", "#N/A", "#N/A"))
                 if isinstance(start_value, datetime):
                     start_value = excel_serial_from_datetime(start_value)
                 start_values.append((start_value,))
@@ -2833,11 +2879,37 @@ def apply_logic_to_workbook_com(
             ws.Range(ws.Cells(2, start_date_column), ws.Cells(last_row, start_date_column)).NumberFormat = (
                 "m/d/yy h:mm AM/PM"
             )
+
+        def write_pre_installation_range_payload(payload: dict[str, tuple[object, object, object]]) -> None:
+            range_values = []
+            for row_value in quo_rows:
+                quo_value = normalize_quo_value(row_value[0])
+                _, _, range_value = payload.get(quo_value, ("#N/A", "#N/A", "#N/A"))
+                range_values.append((range_value,))
+
+            ws.Range(ws.Cells(2, range_column), ws.Cells(last_row, range_column)).Value = tuple(range_values)
+
+        if last_row >= 2:
+            phase_start = time.perf_counter()
+            quo_values = ws.Range(ws.Cells(2, quo_column), ws.Cells(last_row, quo_column)).Value
+            if isinstance(quo_values, tuple):
+                if quo_values and isinstance(quo_values[0], tuple):
+                    quo_rows = list(quo_values)
+                else:
+                    quo_rows = [(value,) for value in quo_values]
+            else:
+                quo_rows = [(quo_values,)]
+
+            write_pre_installation_payload(payload_lookup)
             profile_log("write pre-installation fields", phase_start)
 
         normalize_all_order_date_column_formats(ws)
         apply_sales_hierarchy_header_style_on_com_sheet(ws)
         if clone_pivot_template and not with_pivot:
+            if last_row >= 2 and pivot_payload_lookup is not payload_lookup:
+                phase_start = time.perf_counter()
+                write_pre_installation_range_payload(pivot_payload_lookup)
+                profile_log("write pivot-date aging range", phase_start)
             phase_start = time.perf_counter()
             fast_refresh_ok = refresh_reporting_sheets_fast_in_workbook(wb, reference_date)
             profile_log("fast refresh reporting sheets", phase_start)
@@ -2859,6 +2931,10 @@ def apply_logic_to_workbook_com(
                     save_workbook=False,
                 )
                 profile_log("refresh on progress sheet", phase_start)
+            if last_row >= 2 and pivot_payload_lookup is not payload_lookup:
+                phase_start = time.perf_counter()
+                write_pre_installation_range_payload(payload_lookup)
+                profile_log("restore display aging range", phase_start)
         phase_start = time.perf_counter()
         wb.Save()
         profile_log("save workbook", phase_start)
