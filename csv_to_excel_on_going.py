@@ -48,6 +48,17 @@ EXCEL_ON_PROGRESS_TAB_COLOR = 15128749  # RGB(173,216,230) light blue for Excel 
 NULL_LIKE_VALUES = {"", "na", "n/a", "null", "none", "nan", "-", "(blank)"}
 COMMON_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin1")
 MIN_REPORTING_YEAR_FAB_UPLOAD = 2023
+EXCEL_ASSIGNMENT_CHUNK_ROWS = 2000
+EXCEL_ERROR_VALUE_TEXT = {
+    -2146826288: "#NULL!",
+    -2146826281: "#DIV/0!",
+    -2146826273: "#VALUE!",
+    -2146826265: "#REF!",
+    -2146826259: "#NAME?",
+    -2146826252: "#NUM!",
+    -2146826246: "#N/A",
+    -2146826243: "#SPILL!",
+}
 
 
 def profile_log(label: str, start: float) -> None:
@@ -106,6 +117,126 @@ def excel_date_number_format_for_header(normalized_header: str, source_number_fo
         return "dd/mm/yyyy hh:mm"
 
     return "dd/mm/yyyy"
+
+
+def normalize_excel_cell_value(value: object) -> object:
+    if isinstance(value, int) and value in EXCEL_ERROR_VALUE_TEXT:
+        return EXCEL_ERROR_VALUE_TEXT[value]
+    return value
+
+
+def normalize_excel_column_values(values: object, row_count: int) -> tuple[tuple[object, ...], ...]:
+    if row_count <= 0:
+        return tuple()
+
+    rows = values if isinstance(values, tuple) else ((values,),)
+    normalized: list[tuple[object, ...]] = []
+    for row in rows:
+        if isinstance(row, tuple):
+            normalized.append((normalize_excel_cell_value(row[0]) if row else None,))
+        else:
+            normalized.append((normalize_excel_cell_value(row),))
+
+    if len(normalized) < row_count:
+        normalized.extend((None,) for _ in range(row_count - len(normalized)))
+    return tuple(normalized[:row_count])
+
+
+def is_retryable_excel_com_error(exc: Exception) -> bool:
+    hresult = exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
+    if hresult in {-2147418111, -2147023170}:
+        return True
+    message = str(exc).lower()
+    return "call was rejected by callee" in message or "remote procedure call failed" in message
+
+
+def retry_excel_com(action, timeout_seconds: float = 180.0, delay_seconds: float = 0.5):
+    deadline = time.monotonic() + timeout_seconds
+    sleep_seconds = delay_seconds
+    while True:
+        try:
+            return action()
+        except Exception as exc:
+            if not is_retryable_excel_com_error(exc) or time.monotonic() >= deadline:
+                raise
+            remaining_seconds = max(0.0, deadline - time.monotonic())
+            time.sleep(min(sleep_seconds, remaining_seconds))
+            sleep_seconds = min(2.0, sleep_seconds + delay_seconds)
+
+
+def set_excel_range_values(range_obj, values: tuple[tuple[object, ...], ...], use_value: bool) -> None:
+    if use_value:
+        range_obj.Value = values
+    else:
+        range_obj.Value2 = values
+
+
+def excel_column_subrange(target_range, start_row: int, row_count: int):
+    end_row = start_row + row_count - 1
+    return target_range.Parent.Range(target_range.Cells(start_row, 1), target_range.Cells(end_row, 1))
+
+
+def assign_excel_cell_as_text(target_range, row_index: int, cell_value: object) -> None:
+    cell = target_range.Cells(row_index, 1)
+    cell.NumberFormat = "@"
+    cell.Value = "" if cell_value is None else str(cell_value)
+
+
+def assign_excel_cell_value(target_range, row_index: int, cell_value: object, use_value: bool) -> None:
+    def assign_cell() -> None:
+        if use_value:
+            target_range.Cells(row_index, 1).Value = cell_value
+        else:
+            target_range.Cells(row_index, 1).Value2 = cell_value
+
+    try:
+        retry_excel_com(assign_cell)
+    except Exception:
+        retry_excel_com(lambda: assign_excel_cell_as_text(target_range, row_index, cell_value))
+
+
+def assign_excel_column_value_slice(
+    target_range,
+    start_row: int,
+    values: tuple[tuple[object, ...], ...],
+    use_value: bool,
+) -> None:
+    slice_range = retry_excel_com(
+        lambda: excel_column_subrange(
+            target_range,
+            start_row,
+            len(values),
+        )
+    )
+    try:
+        retry_excel_com(lambda: set_excel_range_values(slice_range, values, use_value))
+        return
+    except Exception:
+        pass
+
+    if len(values) == 1:
+        assign_excel_cell_value(target_range, start_row, values[0][0] if values[0] else None, use_value)
+        return
+
+    midpoint = len(values) // 2
+    assign_excel_column_value_slice(target_range, start_row, values[:midpoint], use_value)
+    assign_excel_column_value_slice(target_range, start_row + midpoint, values[midpoint:], use_value)
+
+
+def assign_excel_column_values(target_range, values: object, row_count: int, use_value: bool = False) -> None:
+    normalized_values = normalize_excel_column_values(values, row_count)
+    if not normalized_values:
+        return
+
+    try:
+        retry_excel_com(lambda: set_excel_range_values(target_range, normalized_values, use_value))
+        return
+    except Exception:
+        pass
+
+    for chunk_start in range(0, len(normalized_values), EXCEL_ASSIGNMENT_CHUNK_ROWS):
+        chunk_values = normalized_values[chunk_start : chunk_start + EXCEL_ASSIGNMENT_CHUNK_ROWS]
+        assign_excel_column_value_slice(target_range, chunk_start + 1, chunk_values, use_value)
 
 
 def normalize_all_order_date_column_formats(worksheet) -> None:
@@ -2488,14 +2619,16 @@ def apply_logic_to_workbook_com(
                     if source_col is None:
                         continue
                     original_source_col = source_col
-                    source_column_range = source_ws.Range(
-                        source_ws.Cells(2, source_col), source_ws.Cells(source_last_row, source_col)
+                    source_column_range = retry_excel_com(
+                        lambda source_col=source_col: source_ws.Range(
+                            source_ws.Cells(2, source_col), source_ws.Cells(source_last_row, source_col)
+                        )
                     )
 
                     # Month rollover fallback:
                     # when TARGET Determined column is empty in source, use Target In Week values.
                     if is_target_determined_header(target_header_value):
-                        source_column_values_for_check = source_column_range.Value2
+                        source_column_values_for_check = retry_excel_com(lambda: source_column_range.Value2)
                         fallback_col = source_header_to_col.get("targetinweek")
                         if fallback_col is not None:
                             is_empty = True
@@ -2509,43 +2642,53 @@ def apply_logic_to_workbook_com(
                                 is_empty = source_column_values_for_check in (None, "")
                             if is_empty:
                                 source_col = fallback_col
-                                source_column_range = source_ws.Range(
-                                    source_ws.Cells(2, source_col), source_ws.Cells(source_last_row, source_col)
+                                source_column_range = retry_excel_com(
+                                    lambda source_col=source_col: source_ws.Range(
+                                        source_ws.Cells(2, source_col), source_ws.Cells(source_last_row, source_col)
+                                    )
                                 )
 
-                    target_column_range = target_ws.Range(
-                        target_ws.Cells(2, target_col), target_ws.Cells(source_last_row, target_col)
+                    target_column_range = retry_excel_com(
+                        lambda target_col=target_col: target_ws.Range(
+                            target_ws.Cells(2, target_col), target_ws.Cells(source_last_row, target_col)
+                        )
                     )
+                    row_count = source_last_row - 1
                     if target_key == normalize_header_key(YEAR_FAB_UPLOAD_HEADER):
-                        source_column_values = source_column_range.Value2
+                        source_column_values = retry_excel_com(lambda: source_column_range.Value2)
                         normalized_year_values = []
-                        for raw_value in source_column_values:
+                        for raw_value in normalize_excel_column_values(source_column_values, row_count):
                             value = raw_value[0] if isinstance(raw_value, tuple) else raw_value
                             normalized_year_values.append((str(value).strip() if value not in (None, "") else "",))
                         target_column_range.NumberFormat = "@"
-                        try:
-                            target_column_range.Value = tuple(normalized_year_values)
-                        except Exception:
-                            source_column_range.Copy()
-                            target_column_range.PasteSpecial(-4163)  # xlPasteValues
+                        assign_excel_column_values(
+                            target_column_range,
+                            tuple(normalized_year_values),
+                            row_count,
+                            use_value=True,
+                        )
                     else:
-                        try:
-                            if should_preserve_excel_date_values(target_key):
-                                try:
-                                    target_column_range.NumberFormat = excel_date_number_format_for_header(
-                                        target_key,
-                                        source_ws.Cells(2, source_col).NumberFormat,
-                                    )
-                                except Exception:
-                                    pass
-                                target_column_range.Value = source_column_range.Value
-                            elif source_col != target_col or source_col != original_source_col:
-                                target_column_range.Value2 = source_column_range.Value2
-                            else:
-                                target_column_range.Value2 = source_column_range.Value2
-                        except Exception:
-                            source_column_range.Copy()
-                            target_column_range.PasteSpecial(-4163)  # xlPasteValues
+                        if should_preserve_excel_date_values(target_key):
+                            try:
+                                target_column_range.NumberFormat = excel_date_number_format_for_header(
+                                    target_key,
+                                    retry_excel_com(lambda source_col=source_col: source_ws.Cells(2, source_col).NumberFormat),
+                                )
+                            except Exception:
+                                pass
+                            assign_excel_column_values(
+                                target_column_range,
+                                retry_excel_com(lambda: source_column_range.Value),
+                                row_count,
+                                use_value=True,
+                            )
+                        else:
+                            assign_excel_column_values(
+                                target_column_range,
+                                retry_excel_com(lambda: source_column_range.Value2),
+                                row_count,
+                                use_value=False,
+                            )
                         if target_key in {"groupsales", "divisionsales", "segmentsales"}:
                             try:
                                 target_column_range.Replace(
