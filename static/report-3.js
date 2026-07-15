@@ -33,6 +33,92 @@ function processingStage(seconds) {
   return "Saving output workbook";
 }
 
+async function readJsonResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+
+  if (contentType.includes("application/json")) {
+    return text ? JSON.parse(text) : {};
+  }
+
+  if (text.trim().startsWith("<")) {
+    if (isTransientGatewayStatus(response.status)) {
+      throw new TransientGatewayError(`Public gateway returned HTTP ${response.status}. Retrying...`, response.status);
+    }
+
+    throw new Error("The public gateway returned an HTML page instead of API JSON. Please wait a moment, then try again or check the generated output.");
+  }
+
+  throw new Error(text || `Unexpected server response: HTTP ${response.status}`);
+}
+
+class TransientGatewayError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "TransientGatewayError";
+    this.status = status;
+  }
+}
+
+function isTransientGatewayStatus(status) {
+  return [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524].includes(status);
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || `Request failed: HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+async function waitForJob(statusUrl) {
+  const startedAt = Date.now();
+  let transientFailures = 0;
+
+  while (true) {
+    let payload;
+    try {
+      payload = await fetchJson(statusUrl, { cache: "no-store" });
+      transientFailures = 0;
+    } catch (error) {
+      const retryWindowMs = 60 * 60 * 1000;
+      const canRetry =
+        error instanceof TransientGatewayError &&
+        Date.now() - startedAt < retryWindowMs &&
+        transientFailures < 240;
+
+      if (!canRetry) {
+        throw error;
+      }
+
+      transientFailures += 1;
+      await sleep(Math.min(15000, 3000 + transientFailures * 1000));
+      continue;
+    }
+
+    if (payload.status === "succeeded") {
+      return payload;
+    }
+    if (payload.status === "failed") {
+      throw new Error(payload.error || "Conversion failed.");
+    }
+
+    await sleep(3000);
+  }
+}
+
 fetch("/health")
   .then((response) => (response.ok ? response.json() : Promise.reject()))
   .then(() => {
@@ -58,14 +144,12 @@ form.addEventListener("submit", async (event) => {
   try {
     const body = new FormData(form);
 
-    const response = await fetch("/convert/report-3/upload", {
+    const queued = await fetchJson("/convert/report-3/upload/jobs", {
       method: "POST",
       body,
     });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Conversion failed.");
-    }
+    statusBox.textContent = `Job queued. Processing ${queued.filename}...`;
+    const payload = await waitForJob(queued.status_url);
 
     statusBox.className = "status-box ok";
     statusBox.textContent = `Generated ${payload.filename} in ${formatDuration(payload.elapsed_seconds)}.`;

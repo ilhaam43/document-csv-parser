@@ -46,6 +46,10 @@ Combine every CSV in a folder into one workbook:
 python csv_to_excel.py .\input-today -o .\output-today\combined.xlsx --combine
 ```
 
+## Deploy On Windows Server
+
+For native Windows Server deployment as a public FastAPI service on port `8000`, see [docs/windows-server-public-deployment.md](docs/windows-server-public-deployment.md).
+
 ## Run Standalone Scripts
 
 Daily Tracking only:

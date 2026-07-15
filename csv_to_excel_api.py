@@ -229,7 +229,7 @@ def escape_excel_formulas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def current_target_header(reference_date: date) -> str:
-    return f"TARGET  Detemined as 1 {reference_date.strftime('%B %Y')}"
+    return f"TARGET  Detemined as 1 {reference_date.strftime('%b')} {reference_date.strftime('%y')}"
 
 
 def current_target_values(source: pd.Series, reference_date: date) -> pd.Series:

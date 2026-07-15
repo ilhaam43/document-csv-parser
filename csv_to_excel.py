@@ -230,7 +230,7 @@ def escape_excel_formulas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def current_target_header(reference_date: date) -> str:
-    return f"TARGET  Detemined as 1 {reference_date.strftime('%B %Y')}"
+    return f"TARGET  Detemined as 1 {reference_date.strftime('%b')} {reference_date.strftime('%y')}"
 
 
 def current_target_values(source: pd.Series, reference_date: date) -> pd.Series:
@@ -2193,12 +2193,20 @@ def update_template_workbook_via_com(
             if normalized_current == normalize_header_key(SERVICE_DELIVERY_DIV_HEADER):
                 return LOOKUP_SERVICE_DELIVERY_DIV_HEADER + " "
             target_match = re.match(
-                r"^(TARGET\s+Detemined as 1\s+[A-Za-z]+)\s+(\d{4})$",
+                r"^(TARGET\s+Detemined as 1\s+)([A-Za-z]+)\s+(\d{2}|\d{4})$",
                 current,
                 flags=re.IGNORECASE,
             )
             if target_match:
-                return f"{target_match.group(1)} {target_match.group(2)[-2:]}"
+                month_text = target_match.group(2)
+                month_short = month_text[:3].title()
+                for date_format in ("%B", "%b"):
+                    try:
+                        month_short = datetime.strptime(month_text, date_format).strftime("%b")
+                        break
+                    except ValueError:
+                        pass
+                return f"{target_match.group(1)}{month_short} {target_match.group(3)[-2:]}"
             return header_value
 
         def _apply_sales_header_model(sheet, column_count: int) -> None:
