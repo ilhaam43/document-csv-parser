@@ -222,4 +222,8 @@ input/
 output/
 input-today/
 output-today/
+output-outgoing/
+output-iphone/
+vlookup-yesterday/
+logs/
 ~$*.xlsx

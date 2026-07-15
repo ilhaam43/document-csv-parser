@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report 1 CSV Parser</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260520-ui">
+</head>
+<body>
+  <main>
+    <nav class="app-nav" aria-label="Report navigation">
+      <div class="nav-brand">Daily Report Generator</div>
+      <div class="nav-links">
+        <a class="nav-link active" href="/report-1">Report 1</a>
+        <a class="nav-link" href="/report-2">Report 2</a>
+        <a class="nav-link" href="/report-3">Report 3</a>
+        <a class="nav-link" href="/pipeline">Pipeline</a>
+      </div>
+    </nav>
+
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Daily tracking workbook generator</p>
+        <h1>Report 1 CSV Parser</h1>
+        <code>Powered by csv_to_excel.py</code>
+      </div>
+      <div class="health" id="health">API status: checking</div>
+    </header>
+
+    <div class="workspace">
+      <section class="upload-panel">
+        <div class="panel-heading">
+          <h2>Upload Files</h2>
+          <p>Process the raw CSV with yesterday's workbook template and refreshed pivots.</p>
+        </div>
+        <form id="upload-form">
+          <div class="field">
+            <label for="raw_data">Raw CSV</label>
+            <input id="raw_data" name="raw_data" type="file" accept=".csv,text/csv" required>
+          </div>
+
+          <div class="field">
+            <label for="yesterday_cleaned_data">Yesterday Cleaned Excel</label>
+            <input id="yesterday_cleaned_data" name="yesterday_cleaned_data" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+
+          <label class="option">
+            <input id="refresh_template" name="refresh_template" type="checkbox" checked>
+            <span>Refresh template pivots</span>
+          </label>
+
+          <button id="submit-button" type="submit">Generate Workbook</button>
+        </form>
+      </section>
+
+      <aside class="status">
+        <div class="panel-heading">
+          <h2>Status</h2>
+          <p>Conversion progress and download link.</p>
+        </div>
+        <div id="status-box" class="status-box">Ready.</div>
+        <a id="download-link" class="download" href="#">Download Workbook</a>
+      </aside>
+    </div>
+  </main>
+
+  <script src="/static/app.js?v=20260603-jobs"></script>
+</body>
+</html>
