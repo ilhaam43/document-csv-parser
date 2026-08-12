@@ -224,6 +224,15 @@ input-today/
 output-today/
 output-outgoing/
 output-iphone/
+input-ide/*
+!input-ide/.gitkeep
+vlookup-ide/*
+!vlookup-ide/.gitkeep
+collabs-ide/*
+!collabs-ide/.gitkeep
+output-ide/*
+!output-ide/.gitkeep
+IDE/
 vlookup-yesterday/
 logs/
 ~$*.xlsx
