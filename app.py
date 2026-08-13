@@ -10,6 +10,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -37,6 +38,12 @@ from generate_iphone_tracking import (
     default_output_path as iphone_default_output_path,
     generate_iphone_tracking,
 )
+from generate_ide_tracking import (
+    InputFiles as IdeInputFiles,
+    determine_report_date as determine_ide_report_date,
+    generate_ide_tracking,
+    output_filename as ide_output_filename,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +51,7 @@ APP_ROOT = Path(__file__).resolve().parent
 CONVERSION_OUTPUT_DIR = Path("output-today")
 ONGOING_CONVERSION_OUTPUT_DIR = Path("output-outgoing")
 IPHONE_CONVERSION_OUTPUT_DIR = Path("output-iphone")
+IDE_CONVERSION_OUTPUT_DIR = Path("output-ide")
 PIPELINE_CONVERSION_OUTPUT_DIR = Path("output-pipeline")
 API_WORK_DIR = Path("output-today/api")
 RUNTIME_DIRS = (
@@ -51,6 +59,7 @@ RUNTIME_DIRS = (
     CONVERSION_OUTPUT_DIR,
     ONGOING_CONVERSION_OUTPUT_DIR,
     IPHONE_CONVERSION_OUTPUT_DIR,
+    IDE_CONVERSION_OUTPUT_DIR,
     PIPELINE_CONVERSION_OUTPUT_DIR,
     Path("vlookup-yesterday"),
     API_WORK_DIR,
@@ -73,6 +82,9 @@ REPORT_2_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="report
 REPORT_3_JOBS: dict[str, dict[str, object]] = {}
 REPORT_3_JOBS_LOCK = threading.Lock()
 REPORT_3_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="report-3")
+REPORT_4_JOBS: dict[str, dict[str, object]] = {}
+REPORT_4_JOBS_LOCK = threading.Lock()
+REPORT_4_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="report-4")
 PIPELINE_JOBS: dict[str, dict[str, object]] = {}
 PIPELINE_JOBS_LOCK = threading.Lock()
 PIPELINE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
@@ -80,6 +92,7 @@ EXCEL_COM_LOCK = threading.RLock()
 REPORT_1_EXCEL_TIMEOUT_SECONDS = 25 * 60
 REPORT_2_EXCEL_TIMEOUT_SECONDS = 25 * 60
 REPORT_3_EXCEL_TIMEOUT_SECONDS = 25 * 60
+REPORT_4_EXCEL_TIMEOUT_SECONDS = 25 * 60
 PIPELINE_EXCEL_TIMEOUT_SECONDS = 60 * 60
 
 app = FastAPI(
@@ -186,6 +199,21 @@ def _get_report_3_job(job_id: str) -> dict[str, object] | None:
         return dict(job) if job else None
 
 
+def _set_report_4_job(job_id: str, **updates: object) -> None:
+    with REPORT_4_JOBS_LOCK:
+        job = REPORT_4_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _now_seconds()
+
+
+def _get_report_4_job(job_id: str) -> dict[str, object] | None:
+    with REPORT_4_JOBS_LOCK:
+        job = REPORT_4_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
 def _set_pipeline_job(job_id: str, **updates: object) -> None:
     with PIPELINE_JOBS_LOCK:
         job = PIPELINE_JOBS.get(job_id)
@@ -209,6 +237,7 @@ def _mark_job_downloaded(job_id: str) -> None:
     _set_report_1_job(job_id, **updates)
     _set_report_2_job(job_id, **updates)
     _set_report_3_job(job_id, **updates)
+    _set_report_4_job(job_id, **updates)
     _set_pipeline_job(job_id, **updates)
 
 
@@ -524,6 +553,35 @@ def _run_iphone_conversion(
         "stderr": stderr.getvalue().strip(),
     }
 
+
+def _run_ide_conversion(
+    raw_workbook_path: Path,
+    previous_workbook_path: Path,
+    output_path: Path,
+    report_date: date,
+) -> dict[str, object]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    started = time.perf_counter()
+    files = IdeInputFiles(
+        raw=raw_workbook_path,
+        previous=previous_workbook_path,
+    )
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with _initialized_com_thread():
+            result = generate_ide_tracking(files, output_path, report_date)
+    elapsed_seconds = time.perf_counter() - started
+
+    return {
+        **result,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "output_path": str(output_path),
+        "report_date": report_date.isoformat(),
+        "stdout": stdout.getvalue().strip(),
+        "stderr": stderr.getvalue().strip(),
+    }
+
+
 def _run_pipeline_conversion(
     data_order_csv_path: Path,
     daily_reference_workbook_path: Path,
@@ -618,6 +676,50 @@ def _run_report_3_upload_job(
     )
 
 
+def _run_report_4_upload_job(
+    job_id: str,
+    raw_workbook_path: Path,
+    previous_workbook_path: Path,
+    output_path: Path,
+    report_date: date,
+) -> None:
+    _set_report_4_job(job_id, status="running", started_at=_now_seconds())
+
+    def work() -> dict[str, object]:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return _run_ide_conversion(
+            raw_workbook_path,
+            previous_workbook_path,
+            output_path,
+            report_date,
+        )
+
+    result = _run_with_excel_watchdog(
+        "Report 4",
+        job_id,
+        _set_report_4_job,
+        output_path.parent,
+        REPORT_4_EXCEL_TIMEOUT_SECONDS,
+        work,
+    )
+    if result is None:
+        return
+    _set_report_4_job(
+        job_id,
+        status="succeeded",
+        completed_at=_now_seconds(),
+        elapsed_seconds=result["elapsed_seconds"],
+        filename=output_path.name,
+        output_file=str(output_path),
+        report_date=result["report_date"],
+        rows=result["rows"],
+        columns=result["columns"],
+        pivot_tables=result["pivot_tables"],
+        stdout=result.get("stdout", ""),
+        stderr=result.get("stderr", ""),
+    )
+
+
 def _run_pipeline_upload_job(
     job_id: str,
     raw_path: Path,
@@ -692,6 +794,11 @@ def report_2_page() -> FileResponse:
 @app.get("/report-3")
 def report_3_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "report-3.html", media_type="text/html")
+
+
+@app.get("/report-4")
+def report_4_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "report-4.html", media_type="text/html")
 
 
 @app.get("/pipeline")
@@ -796,6 +903,41 @@ def report_3_job_status(request: Request, job_id: str) -> dict[str, object]:
     if job.get("status") == "succeeded" and job.get("filename") and not job.get("downloaded"):
         response["success"] = True
         response["message"] = "Report 3 iPhone workbook generated successfully."
+        response["download_url"] = _download_url(request, job_id, str(job["filename"]))
+    return response
+
+
+@app.get("/jobs/report-4/{job_id}")
+def report_4_job_status(request: Request, job_id: str) -> dict[str, object]:
+    try:
+        uuid.UUID(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Job not found.") from exc
+
+    job = _get_report_4_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "raw_ide_workbook_filename": job.get("raw_ide_workbook_filename"),
+        "previous_ide_workbook_filename": job.get("previous_ide_workbook_filename"),
+        "filename": job.get("filename"),
+        "report_date": job.get("report_date"),
+        "rows": job.get("rows"),
+        "columns": job.get("columns"),
+        "pivot_tables": job.get("pivot_tables"),
+        "elapsed_seconds": job.get("elapsed_seconds"),
+        "error": job.get("error"),
+        "downloaded": job.get("downloaded", False),
+        "downloaded_at": job.get("downloaded_at"),
+    }
+    if job.get("status") == "succeeded" and job.get("filename") and not job.get("downloaded"):
+        response["success"] = True
+        response["message"] = "Report 4 IDE workbook generated successfully."
         response["download_url"] = _download_url(request, job_id, str(job["filename"]))
     return response
 
@@ -1251,6 +1393,65 @@ async def convert_report_3_upload(
         "previous_iphone_workbook_filename": reference_path.name,
         "output_file": str(output_path),
         "download_url": _download_url(request, job_dir.name, output_path.name),
+    }
+
+
+@app.post("/convert/report-4/upload/jobs")
+async def start_report_4_upload_job(
+    request: Request,
+    raw_ide_workbook: UploadFile = File(...),
+    previous_ide_workbook: UploadFile = File(...),
+) -> dict[str, object]:
+    if not raw_ide_workbook.filename or not raw_ide_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="raw_ide_workbook must be a .xlsx file.")
+    if not previous_ide_workbook.filename or not previous_ide_workbook.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="previous_ide_workbook must be a .xlsx file.")
+    job_id = uuid.uuid4().hex
+    job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = job_dir / Path(raw_ide_workbook.filename).name
+    previous_path = job_dir / Path(previous_ide_workbook.filename).name
+
+    try:
+        await _save_upload_file(raw_ide_workbook, raw_path)
+        await _save_upload_file(previous_ide_workbook, previous_path)
+        resolved_report_date = determine_ide_report_date(None, raw_path)
+    except Exception as exc:
+        logger.exception("Report 4 upload save failed for job %s", job_id)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    output_path = (job_dir / ide_output_filename(resolved_report_date)).resolve()
+    with REPORT_4_JOBS_LOCK:
+        REPORT_4_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+            "raw_ide_workbook_filename": raw_path.name,
+            "previous_ide_workbook_filename": previous_path.name,
+            "report_date": resolved_report_date.isoformat(),
+            "filename": output_path.name,
+        }
+
+    REPORT_4_EXECUTOR.submit(
+        _run_report_4_upload_job,
+        job_id,
+        raw_path,
+        previous_path,
+        output_path,
+        resolved_report_date,
+    )
+
+    return {
+        "success": True,
+        "message": "Report 4 conversion queued.",
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/jobs/report-4/{job_id}",
+        "filename": output_path.name,
+        "report_date": resolved_report_date.isoformat(),
+        "raw_ide_workbook_filename": raw_path.name,
+        "previous_ide_workbook_filename": previous_path.name,
     }
 
 

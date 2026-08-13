@@ -19,12 +19,11 @@ from typing import Iterable
 import pandas as pd
 from dateutil import parser as date_parser
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 
 DEFAULT_INPUT_DIR = "input-ide"
 DEFAULT_REFERENCE_DIR = "vlookup-ide"
-DEFAULT_COLLABS_DIR = "collabs-ide"
 DEFAULT_OUTPUT_DIR = "output-ide"
 
 RAW_SHEET_NAME = "ICT ORDER 2026"
@@ -106,19 +105,29 @@ STATUS_NORMALIZATION = {
 class InputFiles:
     raw: Path
     previous: Path
-    collabs: Path
 
 
 @dataclass(frozen=True)
 class BuildResult:
     dataframe: pd.DataFrame
     invalid_dates: dict[str, list[str]]
-    collabs_fallback_count: int
     zero_fallback_count: int
     duplicate_quote_ids: tuple[str, ...]
     duplicate_rows_preserved: int
     date_fallback_count: int
     field_fallback_count: int
+
+
+@dataclass(frozen=True)
+class PivotPercentageBlock:
+    pivot_name: str
+    header_row_offset: int
+    original_header_row: int
+    original_end_row: int
+    scratch_start_row: int
+    formula: str
+    formula_row: int
+    pivot_header_columns: dict[int, str]
 
 
 def is_missing(value: object) -> bool:
@@ -187,23 +196,33 @@ def date_from_filename(path: Path) -> date | None:
         except ValueError:
             pass
 
+    separated_numeric_match = re.search(
+        r"(?<!\d)(\d{1,2})[\s._-]+(\d{1,2})[\s._-]+((?:20)?\d{2})(?!\d)",
+        path.stem,
+    )
+    if separated_numeric_match:
+        day_text, month_text, year_text = separated_numeric_match.groups()
+        if len(year_text) == 2:
+            year_text = f"20{year_text}"
+        try:
+            return date(int(year_text), int(month_text), int(day_text))
+        except ValueError:
+            pass
+
     return None
 
 
-def determine_report_date(explicit_date: date | None, collabs: Path, previous: Path) -> date:
+def determine_report_date(explicit_date: date | None, raw: Path) -> date:
     if explicit_date is not None:
         return explicit_date
 
-    collabs_date = date_from_filename(collabs)
-    if collabs_date is not None:
-        return collabs_date
-
-    previous_date = date_from_filename(previous)
-    if previous_date is not None:
-        return previous_date + timedelta(days=1)
+    raw_date = date_from_filename(raw)
+    if raw_date is not None and raw.stem.casefold().startswith("ide dashboard"):
+        return raw_date
 
     raise ValueError(
-        "Could not determine the report date. Use --report-date YYYY-MM-DD."
+        "Raw workbook filename must include the report date, for example: "
+        "'IDE DASHBOARD 15 August 2026.xlsx'."
     )
 
 
@@ -235,7 +254,6 @@ def resolve_inputs(args: argparse.Namespace) -> InputFiles:
     return InputFiles(
         raw=resolve_single_file(args.input, ".xlsx", "IDE raw workbook"),
         previous=resolve_single_file(args.reference, ".xlsx", "previous IDE workbook"),
-        collabs=resolve_single_file(args.collabs, ".csv", "collabs fallback"),
     )
 
 
@@ -374,30 +392,6 @@ def numeric_value(value: object) -> int | float | None:
     return int(number) if number.is_integer() else number
 
 
-def load_collabs_lookup(collabs_path: Path, required_quote_ids: set[str]) -> dict[str, tuple[object, object]]:
-    if not required_quote_ids:
-        return {}
-
-    lookup: dict[str, tuple[object, object]] = {}
-    usecols = ["quote_num", "otc", "mrc"]
-    for chunk in pd.read_csv(
-        collabs_path,
-        usecols=usecols,
-        dtype="string",
-        chunksize=200_000,
-        low_memory=False,
-    ):
-        chunk["quote_num"] = chunk["quote_num"].map(normalize_quote_id)
-        matches = chunk.loc[chunk["quote_num"].isin(required_quote_ids)]
-        for row in matches.itertuples(index=False):
-            quote_id = normalize_quote_id(row.quote_num)
-            if quote_id and quote_id not in lookup:
-                lookup[quote_id] = (numeric_value(row.otc), numeric_value(row.mrc))
-        if required_quote_ids.issubset(lookup):
-            break
-    return lookup
-
-
 def parse_excel_datetime(value: object) -> datetime | None:
     if is_missing(value) or isinstance(value, time):
         return None
@@ -428,12 +422,12 @@ def parse_excel_datetime(value: object) -> datetime | None:
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%m/%d/%Y",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y %H:%M",
         "%d/%m/%Y",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
     )
     for fmt in formats:
         try:
@@ -557,6 +551,11 @@ def pre_installation_range_value(aging: object) -> object:
     return "> 30 Days"
 
 
+def financial_value_or_zero(value: object) -> int | float:
+    parsed = numeric_value(value)
+    return 0 if parsed is None else parsed
+
+
 def insert_after(df: pd.DataFrame, after_header: str, header: str, values: Iterable[object]) -> None:
     if after_header not in df.columns:
         raise ValueError(f"Could not insert {header}; missing anchor column: {after_header}")
@@ -567,7 +566,6 @@ def insert_after(df: pd.DataFrame, after_header: str, header: str, values: Itera
 def build_all_order(
     raw: pd.DataFrame,
     previous: pd.DataFrame,
-    collabs_path: Path,
     report_date: date,
     previous_path: Path,
 ) -> BuildResult:
@@ -608,20 +606,11 @@ def build_all_order(
     previous_quote_ids = set(previous[QUOTE_ID_HEADER].map(normalize_quote_id))
     pre_installation_start_lookup = first_quote_lookup(previous, PRE_INSTALLATION_START_HEADER)
 
-    missing_financial_ids = {
-        quote_id
-        for quote_id, key in zip(quote_ids, current_keys, strict=False)
-        if numeric_value(otc_lookup.get(key)) is None
-        or numeric_value(mrc_lookup.get(key)) is None
-    }
-    collabs_lookup = load_collabs_lookup(collabs_path, missing_financial_ids)
-
     order_types: list[object] = []
     otc_values: list[object] = []
     mrc_values: list[object] = []
     previous_status_values: list[object] = []
     pre_installation_start_values: list[object] = []
-    collabs_fallback_count = 0
     zero_fallback_count = 0
 
     current_status_values = result[STATUS_DELIVERY_HEADER].map(normalize_status)
@@ -638,25 +627,9 @@ def build_all_order(
 
         previous_otc = numeric_value(otc_lookup.get(key))
         previous_mrc = numeric_value(mrc_lookup.get(key))
-        collabs_otc, collabs_mrc = collabs_lookup.get(quote_id, (None, None))
-        used_collabs = False
-        used_zero = False
-        if previous_otc is None:
-            previous_otc = collabs_otc
-            used_collabs = collabs_otc is not None
-        if previous_mrc is None:
-            previous_mrc = collabs_mrc
-            used_collabs = used_collabs or collabs_mrc is not None
-        if previous_otc is None:
-            previous_otc = 0
-            used_zero = True
-        if previous_mrc is None:
-            previous_mrc = 0
-            used_zero = True
-        otc_values.append(previous_otc)
-        mrc_values.append(previous_mrc)
-        collabs_fallback_count += int(used_collabs)
-        zero_fallback_count += int(used_zero)
+        zero_fallback_count += int(previous_otc is None or previous_mrc is None)
+        otc_values.append(financial_value_or_zero(previous_otc))
+        mrc_values.append(financial_value_or_zero(previous_mrc))
 
         if quote_id not in previous_quote_ids:
             previous_status_values.append(EXCEL_NA_ERROR)
@@ -751,7 +724,6 @@ def build_all_order(
     return BuildResult(
         dataframe=result,
         invalid_dates=invalid_dates,
-        collabs_fallback_count=collabs_fallback_count,
         zero_fallback_count=zero_fallback_count,
         duplicate_quote_ids=duplicate_quote_ids,
         duplicate_rows_preserved=duplicate_rows_preserved,
@@ -895,6 +867,194 @@ def autofit_with_limits(worksheet, column_count: int) -> None:
             column.ColumnWidth = MAX_COLUMN_WIDTH
         elif width < MIN_COLUMN_WIDTH:
             column.ColumnWidth = MIN_COLUMN_WIDTH
+
+
+def pivot_header_columns(worksheet, table_range, header_row: int) -> dict[int, str]:
+    headers: dict[int, str] = {}
+    start_column = int(table_range.Column)
+    end_column = start_column + int(table_range.Columns.Count) - 1
+    for column_number in range(start_column, end_column + 1):
+        value = worksheet.Cells(header_row, column_number).Value
+        if value is None:
+            continue
+        normalized = " ".join(str(value).strip().casefold().split())
+        if normalized:
+            headers[column_number] = normalized
+    return headers
+
+
+def capture_pivot_percentage_blocks(workbook, worksheet):
+    """Move percentage blocks aside so dynamic PivotTable columns can expand."""
+    scratch = workbook.Worksheets.Add(After=workbook.Worksheets(workbook.Worksheets.Count))
+    scratch.Name = "__PERCENTAGE_LAYOUT__"
+
+    used_range = worksheet.UsedRange
+    used_values = used_range.Value2
+    percentage_headers: list[tuple[int, int]] = []
+    if used_values is not None:
+        for row_offset, row in enumerate(used_values):
+            for column_offset, value in enumerate(row):
+                if isinstance(value, str) and "percentage" in value.casefold():
+                    percentage_headers.append(
+                        (used_range.Row + row_offset, used_range.Column + column_offset)
+                    )
+
+    blocks: list[PivotPercentageBlock] = []
+    scratch_row = 1
+    pivot_tables = worksheet.PivotTables()
+    for header_row, percentage_column in percentage_headers:
+        candidates = []
+        for pivot_index in range(1, pivot_tables.Count + 1):
+            pivot_table = pivot_tables(pivot_index)
+            table_range = pivot_table.TableRange2
+            table_bottom = table_range.Row + table_range.Rows.Count - 1
+            table_right = table_range.Column + table_range.Columns.Count - 1
+            if table_range.Row <= header_row <= table_bottom and table_right < percentage_column:
+                candidates.append((table_right, pivot_table))
+        if not candidates:
+            continue
+
+        _, pivot_table = max(candidates, key=lambda item: item[0])
+        table_range = pivot_table.TableRange2
+        formula_row = header_row + 1
+        formula = str(worksheet.Cells(formula_row, percentage_column).Formula or "")
+        if not formula.startswith("="):
+            continue
+
+        end_row = formula_row
+        while end_row + 1 <= used_range.Row + used_range.Rows.Count - 1:
+            next_formula = str(
+                worksheet.Cells(end_row + 1, percentage_column).Formula or ""
+            )
+            if not next_formula.startswith("="):
+                break
+            end_row += 1
+
+        source_range = worksheet.Range(
+            worksheet.Cells(header_row, percentage_column),
+            worksheet.Cells(end_row, percentage_column),
+        )
+        source_range.Copy(Destination=scratch.Cells(scratch_row, 1))
+        blocks.append(
+            PivotPercentageBlock(
+                pivot_name=str(pivot_table.Name),
+                header_row_offset=header_row - int(table_range.Row),
+                original_header_row=header_row,
+                original_end_row=end_row,
+                scratch_start_row=scratch_row,
+                formula=formula,
+                formula_row=formula_row,
+                pivot_header_columns=pivot_header_columns(
+                    worksheet,
+                    table_range,
+                    header_row,
+                ),
+            )
+        )
+        source_range.Clear()
+        scratch_row += end_row - header_row + 2
+
+    scratch.Visible = 2  # xlSheetVeryHidden
+    return scratch, blocks
+
+
+def remap_percentage_formula(
+    formula: str,
+    source_row: int,
+    target_row: int,
+    column_mapping: dict[int, int],
+) -> str:
+    cell_reference = re.compile(r"(?<![A-Z0-9_])(\$?)([A-Z]{1,3})(\$?)(\d+)")
+    row_delta = target_row - source_row
+
+    def replace(match: re.Match[str]) -> str:
+        column_absolute, column_text, row_absolute, row_text = match.groups()
+        source_column = column_index_from_string(column_text)
+        target_column = column_mapping.get(source_column, source_column)
+        row_number = int(row_text)
+        if not row_absolute:
+            row_number += row_delta
+        return (
+            f"{column_absolute}{get_column_letter(target_column)}"
+            f"{row_absolute}{row_number}"
+        )
+
+    return cell_reference.sub(replace, formula)
+
+
+def restore_pivot_percentage_blocks(worksheet, scratch, blocks: list[PivotPercentageBlock]) -> None:
+    for block in blocks:
+        pivot_table = worksheet.PivotTables(block.pivot_name)
+        table_range = pivot_table.TableRange2
+        if int(table_range.Rows.Count) <= 1 or int(table_range.Columns.Count) <= 1:
+            raise RuntimeError(
+                f"PivotTable '{block.pivot_name}' did not render after refresh."
+            )
+
+        header_row = int(table_range.Row) + block.header_row_offset
+        percentage_column = int(table_range.Column) + int(table_range.Columns.Count)
+        end_row = int(table_range.Row) + int(table_range.Rows.Count) - 1
+        source_height = block.original_end_row - block.original_header_row + 1
+        source_range = scratch.Range(
+            scratch.Cells(block.scratch_start_row, 1),
+            scratch.Cells(block.scratch_start_row + source_height - 1, 1),
+        )
+        destination_range = worksheet.Range(
+            worksheet.Cells(header_row, percentage_column),
+            worksheet.Cells(header_row + source_height - 1, percentage_column),
+        )
+        source_range.Copy(Destination=destination_range)
+
+        formula_start_row = header_row + 1
+        if end_row < formula_start_row:
+            continue
+
+        if end_row != header_row + source_height - 1:
+            body_template = scratch.Cells(block.scratch_start_row + 1, 1)
+            grand_total_template = scratch.Cells(
+                block.scratch_start_row + source_height - 1,
+                1,
+            )
+            if end_row > formula_start_row:
+                body_template.Copy(
+                    Destination=worksheet.Range(
+                        worksheet.Cells(formula_start_row, percentage_column),
+                        worksheet.Cells(end_row - 1, percentage_column),
+                    )
+                )
+            grand_total_template.Copy(
+                Destination=worksheet.Cells(end_row, percentage_column)
+            )
+            if end_row < header_row + source_height - 1:
+                worksheet.Range(
+                    worksheet.Cells(end_row + 1, percentage_column),
+                    worksheet.Cells(header_row + source_height - 1, percentage_column),
+                ).Clear()
+
+        current_headers = pivot_header_columns(worksheet, table_range, header_row)
+        current_columns_by_header = {
+            header: column for column, header in current_headers.items()
+        }
+        column_mapping = {
+            old_column: current_columns_by_header[header]
+            for old_column, header in block.pivot_header_columns.items()
+            if header in current_columns_by_header
+        }
+        formulas = tuple(
+            (
+                remap_percentage_formula(
+                    block.formula,
+                    block.formula_row,
+                    row_number,
+                    column_mapping,
+                ),
+            )
+            for row_number in range(formula_start_row, end_row + 1)
+        )
+        worksheet.Range(
+            worksheet.Cells(formula_start_row, percentage_column),
+            worksheet.Cells(end_row, percentage_column),
+        ).Formula = formulas
 
 
 def adjust_pivot_column_widths(worksheet) -> None:
@@ -1070,6 +1230,7 @@ def update_workbook_via_com(
     excel = None
     workbook = None
     previous_calculation = None
+    percentage_scratch = None
     try:
         excel = win32com.client.DispatchEx("Excel.Application")
         excel.Visible = False
@@ -1200,6 +1361,11 @@ def update_workbook_via_com(
         excel.ActiveWindow.SplitRow = 0
         excel.ActiveWindow.FreezePanes = True
 
+        percentage_scratch, percentage_blocks = capture_pivot_percentage_blocks(
+            workbook,
+            pivot_sheet,
+        )
+
         refreshed_count = 0
         pivot_tables = pivot_sheet.PivotTables()
         for pivot_index in range(1, pivot_tables.Count + 1):
@@ -1219,6 +1385,14 @@ def update_workbook_via_com(
                     f"Could not refresh PivotTable '{pivot_table.Name}': {exc}"
                 ) from exc
 
+        restore_pivot_percentage_blocks(
+            pivot_sheet,
+            percentage_scratch,
+            percentage_blocks,
+        )
+        percentage_scratch.Visible = -1  # xlSheetVisible
+        percentage_scratch.Delete()
+        percentage_scratch = None
         repair_pivot_percentage_ranges(pivot_sheet)
         adjust_pivot_column_widths(pivot_sheet)
         validate_target_complete_pivots(pivot_sheet, df)
@@ -1363,7 +1537,7 @@ def generate_ide_tracking(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw = read_raw_dataframe(files.raw)
     previous = read_previous_dataframe(files.previous)
-    build = build_all_order(raw, previous, files.collabs, report_date, files.previous)
+    build = build_all_order(raw, previous, report_date, files.previous)
 
     temp_path: Path | None = None
     try:
@@ -1399,7 +1573,7 @@ def generate_ide_tracking(
     return {
         **validation,
         "refreshed_pivots": refreshed_count,
-        "collabs_fallback_rows": build.collabs_fallback_count,
+        "collabs_fallback_rows": 0,
         "zero_fallback_rows": build.zero_fallback_count,
         "duplicate_quote_ids": build.duplicate_quote_ids,
         "duplicate_rows_preserved": build.duplicate_rows_preserved,
@@ -1431,8 +1605,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "-c",
         "--collabs",
         type=Path,
-        default=Path(DEFAULT_COLLABS_DIR),
-        help=f"Collabs CSV fallback or directory. Defaults to .\\{DEFAULT_COLLABS_DIR}.",
+        help="Deprecated and ignored. OTC/MRC now use the previous workbook, then zero.",
     )
     parser.add_argument(
         "-o",
@@ -1453,21 +1626,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
         files = resolve_inputs(args)
-        report_date = determine_report_date(args.report_date, files.collabs, files.previous)
+        report_date = determine_report_date(args.report_date, files.raw)
         output_path = resolve_output_path(args.output, report_date)
-        print(f"[1/5] Reading raw data: {files.raw.name}")
-        print(f"[2/5] Loading previous mapping: {files.previous.name}")
-        print(f"[3/5] Loading OTC/MRC fallback: {files.collabs.name}")
-        print("[4/5] Updating ALL ORDER and refreshing PivotTables in Excel")
+        print(f"[1/4] Reading raw data: {files.raw.name}")
+        print(f"[2/4] Loading previous mapping and OTC/MRC: {files.previous.name}")
+        if args.collabs is not None:
+            print("[warn] --collabs is deprecated and ignored.", file=sys.stderr)
+        print("[3/4] Updating ALL ORDER and refreshing PivotTables in Excel")
         result = generate_ide_tracking(files, output_path, report_date)
-        print("[5/5] Validating output")
+        print("[4/4] Validating output")
         print(
             f"Wrote {output_path} | rows={result['rows']} | columns={result['columns']} | "
             f"pivots={result['pivot_tables']}"
         )
         print(
-            f"Fallbacks: collabs={result['collabs_fallback_rows']}, "
-            f"zero={result['zero_fallback_rows']}, "
+            f"Fallbacks: OTC/MRC zero={result['zero_fallback_rows']}, "
             f"dates={result['date_fallback_rows']}, "
             f"fields={result['field_fallback_rows']}"
         )

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Report 3 iPhone Parser</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260520-ui">
+  <title>Report 4 IDE Parser</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260812-ide">
 </head>
 <body>
   <main>
@@ -13,17 +13,17 @@
       <div class="nav-links">
         <a class="nav-link" href="/report-1">Report 1</a>
         <a class="nav-link" href="/report-2">Report 2</a>
-        <a class="nav-link active" href="/report-3">Report 3</a>
-        <a class="nav-link" href="/report-4">Report 4</a>
+        <a class="nav-link" href="/report-3">Report 3</a>
+        <a class="nav-link active" href="/report-4">Report 4</a>
         <a class="nav-link" href="/pipeline">Pipeline</a>
       </div>
     </nav>
 
     <header class="app-header">
       <div>
-        <p class="eyebrow">iPhone tracking workbook generator</p>
-        <h1>Report 3 iPhone Parser</h1>
-        <code>Powered by generate_iphone_tracking.py</code>
+        <p class="eyebrow">IDE tracking workbook generator</p>
+        <h1>Report 4 IDE Parser</h1>
+        <code>Powered by generate_ide_tracking.py</code>
       </div>
       <div class="health" id="health">API status: checking</div>
     </header>
@@ -31,21 +31,21 @@
     <div class="workspace">
       <section class="upload-panel">
         <div class="panel-heading">
-          <h2>Upload iPhone Files</h2>
-          <p>Generate the iPhone workbook from today's Daily Tracking workbook and previous iPhone workbook.</p>
+          <h2>Upload IDE Files</h2>
+          <p>Generate today's IDE workbook using the dashboard and previous IDE workbook.</p>
         </div>
         <form id="upload-form">
           <div class="field">
-            <label for="tracking_workbook">Daily Tracking Excel</label>
-            <input id="tracking_workbook" name="tracking_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+            <label for="raw_ide_workbook">IDE Dashboard DD Month YYYY Excel</label>
+            <input id="raw_ide_workbook" name="raw_ide_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
           </div>
 
           <div class="field">
-            <label for="previous_iphone_workbook">Previous iPhone Excel</label>
-            <input id="previous_iphone_workbook" name="previous_iphone_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+            <label for="previous_ide_workbook">Previous Daily Tracking IDE Excel</label>
+            <input id="previous_ide_workbook" name="previous_ide_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
           </div>
 
-          <button id="submit-button" type="submit">Generate iPhone Workbook</button>
+          <button id="submit-button" type="submit">Generate IDE Workbook</button>
         </form>
       </section>
 
@@ -60,6 +60,6 @@
     </div>
   </main>
 
-  <script src="/static/report-3.js?v=20260603-jobs"></script>
+  <script src="/static/report-4.js?v=20260813-no-collabs"></script>
 </body>
 </html>

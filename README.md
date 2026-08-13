@@ -24,6 +24,7 @@ By default, the script reads CSV files from `.\input-today` and writes results t
 - The daily tracking and iPhone generators now preserve header captions, header styling, and column widths from the reference/template workbook more closely.
 - Date-like columns are scanned and formatted as Excel dates using `mm/dd/yyyy`; date-time columns keep time using `mm/dd/yyyy hh:mm`.
 - The iPhone generator preserves the column model for both `ALL ORDER` and `ALL ORDER IPHONE`, including dynamic headers such as `TARGET ...` and `Phase ...`.
+- `generate_ide_tracking.py` adds a standalone IDE Daily Tracking flow with historical lookup, previous-workbook OTC/MRC mapping, normalized Excel dates, and PivotTable refresh.
 
 ## Run Locally
 
@@ -71,6 +72,34 @@ python .\generate_iphone_tracking.py .\input-iphone -r .\vlookup-iphone -o .\out
 ```
 
 The standalone scripts keep their original folders and commands. Use these when you only need one report.
+
+## Run IDE Tracking
+
+Required local folders:
+
+```text
+input-ide/
+  IDE DASHBOARD (*.xlsx)
+vlookup-ide/
+  Daily Tracking IDE <previous date>.xlsx
+output-ide/
+```
+
+Run with the default folders:
+
+```powershell
+python .\generate_ide_tracking.py
+```
+
+Or pass every location explicitly:
+
+```powershell
+python .\generate_ide_tracking.py .\input-ide `
+  -r .\vlookup-ide `
+  -o .\output-ide
+```
+
+Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and writes zero when the previous workbook has no valid OTC/MRC value. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
 
 ## Run Full Daily Pipeline
 
