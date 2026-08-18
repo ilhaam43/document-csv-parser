@@ -97,6 +97,36 @@ MIN_VALID_DATE_YEAR = 1900
 MAX_VALID_DATE_YEAR = 2100
 MISSING_TEXT = {"", "nan", "none", "null", "n/a", "#n/a", "nat"}
 MAX_OPERATIONAL_FUTURE_YEARS = 5
+REPORT_MONTH_NUMBERS = {
+    **{month_name.casefold(): month_number for month_number, month_name in enumerate(calendar.month_name) if month_name},
+    **{month_name.casefold(): month_number for month_number, month_name in enumerate(calendar.month_abbr) if month_name},
+    "sept": 9,
+    "januari": 1,
+    "februari": 2,
+    "maret": 3,
+    "april": 4,
+    "mei": 5,
+    "juni": 6,
+    "juli": 7,
+    "agustus": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "desember": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "mei": 5,
+    "jun": 6,
+    "jul": 7,
+    "agu": 8,
+    "agt": 8,
+    "sep": 9,
+    "okt": 10,
+    "nov": 11,
+    "des": 12,
+}
 PREVIOUS_FALLBACK_HEADERS = (
     DEPT_HEADER,
     PM_HEADER,
@@ -216,10 +246,13 @@ def date_from_filename(path: Path) -> date | None:
         flags=re.IGNORECASE,
     )
     if named_match:
-        try:
-            return datetime.strptime(" ".join(named_match.groups()), "%d %B %Y").date()
-        except ValueError:
-            pass
+        day_text, month_text, year_text = named_match.groups()
+        month_number = REPORT_MONTH_NUMBERS.get(month_text.casefold())
+        if month_number is not None:
+            try:
+                return date(int(year_text), month_number, int(day_text))
+            except ValueError:
+                pass
 
     separated_numeric_match = re.search(
         r"(?<!\d)(\d{1,2})[\s._-]+(\d{1,2})[\s._-]+((?:20)?\d{2})(?!\d)",

@@ -13,6 +13,7 @@ from generate_ide_tracking import (
     apply_current_date_first_match,
     apply_previous_field_fallbacks,
     completion_thresholds,
+    date_from_filename,
     financial_value_or_zero,
     is_missing,
     load_collabs_lookup,
@@ -27,6 +28,37 @@ from generate_ide_tracking import (
 
 
 class IdeDateParsingTests(unittest.TestCase):
+    def test_report_filename_accepts_english_month_with_any_case(self) -> None:
+        expected = date(2026, 8, 18)
+
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 August 2026.xlsx")), expected)
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 august 2026.xlsx")), expected)
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 AUGUST 2026.xlsx")), expected)
+
+    def test_report_filename_accepts_indonesian_month_with_any_case(self) -> None:
+        expected = date(2026, 8, 18)
+
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 Agustus 2026.xlsx")), expected)
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 agustus 2026.xlsx")), expected)
+        self.assertEqual(date_from_filename(Path("IDE DASHBOARD 18 AGUSTUS 2026.xlsx")), expected)
+
+    def test_report_filename_accepts_english_and_indonesian_month_abbreviations(self) -> None:
+        cases = {
+            "IDE DASHBOARD 18 Aug 2026.xlsx": date(2026, 8, 18),
+            "IDE DASHBOARD 18 AGU 2026.xlsx": date(2026, 8, 18),
+            "IDE DASHBOARD 18 Agt 2026.xlsx": date(2026, 8, 18),
+            "IDE DASHBOARD 18 Sep 2026.xlsx": date(2026, 9, 18),
+            "IDE DASHBOARD 18 Sept 2026.xlsx": date(2026, 9, 18),
+            "IDE DASHBOARD 18 Oct 2026.xlsx": date(2026, 10, 18),
+            "IDE DASHBOARD 18 Okt 2026.xlsx": date(2026, 10, 18),
+            "IDE DASHBOARD 18 Dec 2026.xlsx": date(2026, 12, 18),
+            "IDE DASHBOARD 18 Des 2026.xlsx": date(2026, 12, 18),
+        }
+
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(date_from_filename(Path(filename)), expected)
+
     def test_slash_dates_follow_dashboard_day_first_format(self) -> None:
         self.assertEqual(
             parse_excel_datetime("10/01/2026"),
