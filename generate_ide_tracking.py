@@ -24,6 +24,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 
 DEFAULT_INPUT_DIR = "input-ide"
 DEFAULT_REFERENCE_DIR = "vlookup-ide"
+DEFAULT_COLLABS_DIR = "collabs-ide"
 DEFAULT_OUTPUT_DIR = "output-ide"
 
 RAW_SHEET_NAME = "ICT ORDER 2026"
@@ -119,12 +120,14 @@ STATUS_NORMALIZATION = {
 class InputFiles:
     raw: Path
     previous: Path
+    collabs: Path
 
 
 @dataclass(frozen=True)
 class BuildResult:
     dataframe: pd.DataFrame
     invalid_dates: dict[str, list[str]]
+    collabs_fallback_count: int
     zero_fallback_count: int
     duplicate_quote_ids: tuple[str, ...]
     duplicate_rows_preserved: int
@@ -142,6 +145,14 @@ class PivotPercentageBlock:
     formula: str
     formula_row: int
     pivot_header_columns: dict[int, str]
+
+
+@dataclass(frozen=True)
+class CompletionThresholds:
+    week: int
+    green_percent: int
+    yellow_percent: int
+    red_percent: int
 
 
 def is_missing(value: object) -> bool:
@@ -268,6 +279,7 @@ def resolve_inputs(args: argparse.Namespace) -> InputFiles:
     return InputFiles(
         raw=resolve_single_file(args.input, ".xlsx", "IDE raw workbook"),
         previous=resolve_single_file(args.reference, ".xlsx", "previous IDE workbook"),
+        collabs=resolve_single_file(args.collabs, ".csv", "collabs fallback"),
     )
 
 
@@ -424,6 +436,74 @@ def numeric_value(value: object) -> int | float | None:
         return None
     number = float(number)
     return int(number) if number.is_integer() else number
+
+
+def load_collabs_lookup(
+    collabs_path: Path,
+    required_quote_ids: set[str],
+) -> dict[str, tuple[int | float | None, int | float | None]]:
+    """Load only OTC/MRC rows needed as fallback from the large collabs CSV."""
+    if not required_quote_ids:
+        return {}
+
+    lookup: dict[str, tuple[int | float | None, int | float | None]] = {}
+    required_headers = {"quote_num", "otc", "mrc"}
+    reader = pd.read_csv(
+        collabs_path,
+        usecols=lambda column: str(column).strip().lower() in required_headers,
+        dtype="string",
+        chunksize=200_000,
+        low_memory=False,
+    )
+    with reader:
+        for chunk in reader:
+            chunk.columns = [str(column).strip().lower() for column in chunk.columns]
+            missing_headers = required_headers.difference(chunk.columns)
+            if missing_headers:
+                raise ValueError(
+                    "Collabs CSV is missing required columns: "
+                    + ", ".join(sorted(missing_headers))
+                )
+
+            chunk["quote_num"] = chunk["quote_num"].map(normalize_quote_id)
+            matches = chunk.loc[chunk["quote_num"].isin(required_quote_ids)]
+            for row in matches.itertuples(index=False):
+                quote_id = normalize_quote_id(row.quote_num)
+                if quote_id and quote_id not in lookup:
+                    lookup[quote_id] = (numeric_value(row.otc), numeric_value(row.mrc))
+            if required_quote_ids.issubset(lookup):
+                break
+
+    return lookup
+
+
+def resolve_financial_values(
+    previous_otc: object,
+    previous_mrc: object,
+    collabs_values: tuple[object, object] = (None, None),
+) -> tuple[int | float, int | float, bool, bool]:
+    """Resolve OTC/MRC using previous workbook, collabs CSV, then zero."""
+    otc_value = numeric_value(previous_otc)
+    mrc_value = numeric_value(previous_mrc)
+    collabs_otc = numeric_value(collabs_values[0])
+    collabs_mrc = numeric_value(collabs_values[1])
+    used_collabs = False
+    used_zero = False
+
+    if otc_value is None and collabs_otc is not None:
+        otc_value = collabs_otc
+        used_collabs = True
+    if mrc_value is None and collabs_mrc is not None:
+        mrc_value = collabs_mrc
+        used_collabs = True
+    if otc_value is None:
+        otc_value = 0
+        used_zero = True
+    if mrc_value is None:
+        mrc_value = 0
+        used_zero = True
+
+    return otc_value, mrc_value, used_collabs, used_zero
 
 
 def parse_excel_datetime(value: object, *, dayfirst: bool = True) -> datetime | None:
@@ -702,6 +782,7 @@ def insert_after(df: pd.DataFrame, after_header: str, header: str, values: Itera
 def build_all_order(
     raw: pd.DataFrame,
     previous: pd.DataFrame,
+    collabs_path: Path,
     report_date: date,
     previous_path: Path,
 ) -> BuildResult:
@@ -739,11 +820,20 @@ def build_all_order(
     previous_quote_ids = set(previous[QUOTE_ID_HEADER].map(normalize_quote_id))
     pre_installation_start_lookup = first_quote_lookup(previous, PRE_INSTALLATION_START_HEADER)
 
+    missing_financial_ids = {
+        quote_id
+        for quote_id in quote_ids
+        if numeric_value(otc_lookup.get(quote_id)) is None
+        or numeric_value(mrc_lookup.get(quote_id)) is None
+    }
+    collabs_lookup = load_collabs_lookup(collabs_path, missing_financial_ids)
+
     order_types: list[object] = []
     otc_values: list[object] = []
     mrc_values: list[object] = []
     previous_status_values: list[object] = []
     pre_installation_start_values: list[object] = []
+    collabs_fallback_count = 0
     zero_fallback_count = 0
 
     current_status_values = result[STATUS_DELIVERY_HEADER].map(normalize_status)
@@ -757,11 +847,16 @@ def build_all_order(
             "New Registration" if is_missing(previous_order_type) else str(previous_order_type).strip()
         )
 
-        previous_otc = numeric_value(otc_lookup.get(quote_id))
-        previous_mrc = numeric_value(mrc_lookup.get(quote_id))
-        zero_fallback_count += int(previous_otc is None or previous_mrc is None)
-        otc_values.append(financial_value_or_zero(previous_otc))
-        mrc_values.append(financial_value_or_zero(previous_mrc))
+        previous_otc, previous_mrc, used_collabs, used_zero = resolve_financial_values(
+            otc_lookup.get(quote_id),
+            mrc_lookup.get(quote_id),
+            collabs_lookup.get(quote_id, (None, None)),
+        )
+
+        otc_values.append(previous_otc)
+        mrc_values.append(previous_mrc)
+        collabs_fallback_count += int(used_collabs)
+        zero_fallback_count += int(used_zero)
 
         if quote_id not in previous_quote_ids:
             previous_status_values.append(EXCEL_NA_ERROR)
@@ -856,6 +951,7 @@ def build_all_order(
     return BuildResult(
         dataframe=result,
         invalid_dates=invalid_dates,
+        collabs_fallback_count=collabs_fallback_count,
         zero_fallback_count=zero_fallback_count,
         duplicate_quote_ids=duplicate_quote_ids,
         duplicate_rows_preserved=duplicate_rows_preserved,
@@ -1284,6 +1380,87 @@ def repair_pivot_percentage_ranges(worksheet) -> None:
         ).FormulaR1C1 = formula_r1c1
 
 
+def completion_thresholds(report_date: date) -> CompletionThresholds:
+    """Return the capped weekly completion thresholds for a report date."""
+    week = min(((report_date.day - 1) // 7) + 1, 4)
+    weekly_increment = (week - 1) * 10
+    return CompletionThresholds(
+        week=week,
+        green_percent=30 + weekly_increment,
+        yellow_percent=30 + weekly_increment,
+        red_percent=20 + weekly_increment,
+    )
+
+
+def apply_weekly_completion_thresholds(
+    worksheet,
+    blocks: list[PivotPercentageBlock],
+    report_date: date,
+) -> None:
+    """Update percentage legends and traffic-light rules for the report week."""
+    thresholds = completion_thresholds(report_date)
+    legend_values = {
+        "green": f"Green : >{thresholds.green_percent}%",
+        "yellow": f"Yellow : >={thresholds.yellow_percent}%",
+        "red": f"Red : <{thresholds.red_percent}%",
+    }
+
+    used_range = worksheet.UsedRange
+    used_values = used_range.Value2
+    if used_values is not None:
+        for row_offset, row in enumerate(used_values):
+            for column_offset, value in enumerate(row):
+                if not isinstance(value, str):
+                    continue
+                normalized = value.strip().casefold()
+                for prefix, replacement in legend_values.items():
+                    if normalized.startswith(prefix):
+                        worksheet.Cells(
+                            used_range.Row + row_offset,
+                            used_range.Column + column_offset,
+                        ).Value = replacement
+                        break
+
+    for block in blocks:
+        pivot_table = worksheet.PivotTables(block.pivot_name)
+        table_range = pivot_table.TableRange2
+        header_row = int(table_range.Row) + block.header_row_offset
+        formula_start_row = header_row + 1
+        end_row = int(table_range.Row) + int(table_range.Rows.Count) - 1
+        percentage_column = int(table_range.Column) + int(table_range.Columns.Count)
+        if end_row < formula_start_row:
+            continue
+
+        target_range = worksheet.Range(
+            worksheet.Cells(formula_start_row, percentage_column),
+            worksheet.Cells(end_row, percentage_column),
+        )
+        updated_rules = 0
+        format_conditions = target_range.FormatConditions
+        for condition_index in range(1, int(format_conditions.Count) + 1):
+            condition = format_conditions(condition_index)
+            try:
+                if int(condition.Type) != 6 or int(condition.IconSet.ID) != 4:
+                    continue
+                criteria = condition.IconCriteria
+                criteria(2).Type = 0  # xlConditionValueNumber
+                criteria(2).Value = thresholds.red_percent / 100
+                criteria(2).Operator = 7  # xlGreaterEqual
+                criteria(3).Type = 0  # xlConditionValueNumber
+                criteria(3).Value = thresholds.green_percent / 100
+                criteria(3).Operator = 5  # xlGreater
+                updated_rules += 1
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not update percentage color rule for '{block.pivot_name}': {exc}"
+                ) from exc
+
+        if updated_rules == 0:
+            raise RuntimeError(
+                f"No traffic-light rule found for percentage block '{block.pivot_name}'."
+            )
+
+
 def validate_target_complete_pivots(worksheet, dataframe: pd.DataFrame) -> None:
     pivot_tables = worksheet.PivotTables()
     top_pivots = [
@@ -1346,6 +1523,7 @@ def validate_target_complete_pivots(worksheet, dataframe: pd.DataFrame) -> None:
 def update_workbook_via_com(
     workbook_path: Path,
     df: pd.DataFrame,
+    report_date: date,
 ) -> int:
     try:
         import pythoncom  # type: ignore
@@ -1523,6 +1701,11 @@ def update_workbook_via_com(
         percentage_scratch.Delete()
         percentage_scratch = None
         repair_pivot_percentage_ranges(pivot_sheet)
+        apply_weekly_completion_thresholds(
+            pivot_sheet,
+            percentage_blocks,
+            report_date,
+        )
         adjust_pivot_column_widths(pivot_sheet)
         validate_target_complete_pivots(pivot_sheet, df)
 
@@ -1666,7 +1849,7 @@ def generate_ide_tracking(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw = read_raw_dataframe(files.raw)
     previous = read_previous_dataframe(files.previous)
-    build = build_all_order(raw, previous, report_date, files.previous)
+    build = build_all_order(raw, previous, files.collabs, report_date, files.previous)
 
     temp_path: Path | None = None
     try:
@@ -1678,7 +1861,7 @@ def generate_ide_tracking(
         ) as temp_file:
             temp_path = Path(temp_file.name)
         shutil.copy2(files.previous, temp_path)
-        refreshed_count = update_workbook_via_com(temp_path, build.dataframe)
+        refreshed_count = update_workbook_via_com(temp_path, build.dataframe, report_date)
         validation = validate_output(
             temp_path,
             build.dataframe[QUOTE_ID_HEADER].map(normalize_quote_id).tolist(),
@@ -1702,7 +1885,7 @@ def generate_ide_tracking(
     return {
         **validation,
         "refreshed_pivots": refreshed_count,
-        "collabs_fallback_rows": 0,
+        "collabs_fallback_rows": build.collabs_fallback_count,
         "zero_fallback_rows": build.zero_fallback_count,
         "duplicate_quote_ids": build.duplicate_quote_ids,
         "duplicate_rows_preserved": build.duplicate_rows_preserved,
@@ -1734,7 +1917,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "-c",
         "--collabs",
         type=Path,
-        help="Deprecated and ignored. OTC/MRC now use the previous workbook, then zero.",
+        default=Path(DEFAULT_COLLABS_DIR),
+        help=f"Collabs CSV fallback or directory. Defaults to .\\{DEFAULT_COLLABS_DIR}.",
     )
     parser.add_argument(
         "-o",
@@ -1757,19 +1941,19 @@ def main(argv: list[str] | None = None) -> int:
         files = resolve_inputs(args)
         report_date = determine_report_date(args.report_date, files.raw)
         output_path = resolve_output_path(args.output, report_date)
-        print(f"[1/4] Reading raw data: {files.raw.name}")
-        print(f"[2/4] Loading previous mapping and OTC/MRC: {files.previous.name}")
-        if args.collabs is not None:
-            print("[warn] --collabs is deprecated and ignored.", file=sys.stderr)
-        print("[3/4] Updating ALL ORDER and refreshing PivotTables in Excel")
+        print(f"[1/5] Reading raw data: {files.raw.name}")
+        print(f"[2/5] Loading previous mapping: {files.previous.name}")
+        print(f"[3/5] Loading OTC/MRC fallback: {files.collabs.name}")
+        print("[4/5] Updating ALL ORDER and refreshing PivotTables in Excel")
         result = generate_ide_tracking(files, output_path, report_date)
-        print("[4/4] Validating output")
+        print("[5/5] Validating output")
         print(
             f"Wrote {output_path} | rows={result['rows']} | columns={result['columns']} | "
             f"pivots={result['pivot_tables']}"
         )
         print(
-            f"Fallbacks: OTC/MRC zero={result['zero_fallback_rows']}, "
+            f"Fallbacks: collabs={result['collabs_fallback_rows']}, "
+            f"OTC/MRC zero={result['zero_fallback_rows']}, "
             f"dates={result['date_fallback_rows']}, "
             f"fields={result['field_fallback_rows']}"
         )

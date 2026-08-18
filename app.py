@@ -557,6 +557,7 @@ def _run_iphone_conversion(
 def _run_ide_conversion(
     raw_workbook_path: Path,
     previous_workbook_path: Path,
+    collabs_csv_path: Path,
     output_path: Path,
     report_date: date,
 ) -> dict[str, object]:
@@ -566,6 +567,7 @@ def _run_ide_conversion(
     files = IdeInputFiles(
         raw=raw_workbook_path,
         previous=previous_workbook_path,
+        collabs=collabs_csv_path,
     )
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         with _initialized_com_thread():
@@ -680,6 +682,7 @@ def _run_report_4_upload_job(
     job_id: str,
     raw_workbook_path: Path,
     previous_workbook_path: Path,
+    collabs_csv_path: Path,
     output_path: Path,
     report_date: date,
 ) -> None:
@@ -690,6 +693,7 @@ def _run_report_4_upload_job(
         return _run_ide_conversion(
             raw_workbook_path,
             previous_workbook_path,
+            collabs_csv_path,
             output_path,
             report_date,
         )
@@ -715,6 +719,8 @@ def _run_report_4_upload_job(
         rows=result["rows"],
         columns=result["columns"],
         pivot_tables=result["pivot_tables"],
+        collabs_fallback_rows=result["collabs_fallback_rows"],
+        zero_fallback_rows=result["zero_fallback_rows"],
         stdout=result.get("stdout", ""),
         stderr=result.get("stderr", ""),
     )
@@ -925,11 +931,14 @@ def report_4_job_status(request: Request, job_id: str) -> dict[str, object]:
         "updated_at": job["updated_at"],
         "raw_ide_workbook_filename": job.get("raw_ide_workbook_filename"),
         "previous_ide_workbook_filename": job.get("previous_ide_workbook_filename"),
+        "collabs_csv_filename": job.get("collabs_csv_filename"),
         "filename": job.get("filename"),
         "report_date": job.get("report_date"),
         "rows": job.get("rows"),
         "columns": job.get("columns"),
         "pivot_tables": job.get("pivot_tables"),
+        "collabs_fallback_rows": job.get("collabs_fallback_rows"),
+        "zero_fallback_rows": job.get("zero_fallback_rows"),
         "elapsed_seconds": job.get("elapsed_seconds"),
         "error": job.get("error"),
         "downloaded": job.get("downloaded", False),
@@ -1401,20 +1410,25 @@ async def start_report_4_upload_job(
     request: Request,
     raw_ide_workbook: UploadFile = File(...),
     previous_ide_workbook: UploadFile = File(...),
+    collabs_csv: UploadFile = File(...),
 ) -> dict[str, object]:
     if not raw_ide_workbook.filename or not raw_ide_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="raw_ide_workbook must be a .xlsx file.")
     if not previous_ide_workbook.filename or not previous_ide_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_ide_workbook must be a .xlsx file.")
+    if not collabs_csv.filename or not collabs_csv.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="collabs_csv must be a .csv file.")
     job_id = uuid.uuid4().hex
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     raw_path = job_dir / Path(raw_ide_workbook.filename).name
     previous_path = job_dir / Path(previous_ide_workbook.filename).name
+    collabs_path = job_dir / Path(collabs_csv.filename).name
 
     try:
         await _save_upload_file(raw_ide_workbook, raw_path)
         await _save_upload_file(previous_ide_workbook, previous_path)
+        await _save_upload_file(collabs_csv, collabs_path)
         resolved_report_date = determine_ide_report_date(None, raw_path)
     except Exception as exc:
         logger.exception("Report 4 upload save failed for job %s", job_id)
@@ -1429,6 +1443,7 @@ async def start_report_4_upload_job(
             "updated_at": _now_seconds(),
             "raw_ide_workbook_filename": raw_path.name,
             "previous_ide_workbook_filename": previous_path.name,
+            "collabs_csv_filename": collabs_path.name,
             "report_date": resolved_report_date.isoformat(),
             "filename": output_path.name,
         }
@@ -1438,6 +1453,7 @@ async def start_report_4_upload_job(
         job_id,
         raw_path,
         previous_path,
+        collabs_path,
         output_path,
         resolved_report_date,
     )
@@ -1452,6 +1468,7 @@ async def start_report_4_upload_job(
         "report_date": resolved_report_date.isoformat(),
         "raw_ide_workbook_filename": raw_path.name,
         "previous_ide_workbook_filename": previous_path.name,
+        "collabs_csv_filename": collabs_path.name,
     }
 
 

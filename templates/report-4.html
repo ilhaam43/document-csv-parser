@@ -32,7 +32,7 @@
       <section class="upload-panel">
         <div class="panel-heading">
           <h2>Upload IDE Files</h2>
-          <p>Generate today's IDE workbook using the dashboard and previous IDE workbook.</p>
+          <p>Generate today's IDE workbook using the dashboard, previous IDE workbook, and collabs fallback.</p>
         </div>
         <form id="upload-form">
           <div class="field">
@@ -43,6 +43,11 @@
           <div class="field">
             <label for="previous_ide_workbook">Previous Daily Tracking IDE Excel</label>
             <input id="previous_ide_workbook" name="previous_ide_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+
+          <div class="field">
+            <label for="collabs_csv">Collabs OTC/MRC CSV</label>
+            <input id="collabs_csv" name="collabs_csv" type="file" accept=".csv,text/csv" required>
           </div>
 
           <button id="submit-button" type="submit">Generate IDE Workbook</button>
@@ -60,6 +65,6 @@
     </div>
   </main>
 
-  <script src="/static/report-4.js?v=20260813-no-collabs"></script>
+  <script src="/static/report-4.js?v=20260818-collabs"></script>
 </body>
 </html>
