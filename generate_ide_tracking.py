@@ -27,6 +27,7 @@ DEFAULT_REFERENCE_DIR = "vlookup-ide"
 DEFAULT_OUTPUT_DIR = "output-ide"
 
 RAW_SHEET_NAME = "ICT ORDER 2026"
+RAW_SOURCE_SHEET_NAME = "source"
 ALL_ORDER_SHEET_NAME = "ALL ORDER"
 PIVOT_SHEET_NAME = "PIVOT"
 TABLE_NAME = "Table47"
@@ -66,6 +67,19 @@ DATE_HEADERS = (
     "SO COMPLETION DATE",
     PRE_INSTALLATION_START_HEADER,
 )
+
+# These dashboard fields are converted by the manual Excel workflow under a
+# United States regional setting. Other date fields retain day-first parsing.
+MONTH_FIRST_TEXT_DATE_HEADERS = (
+    FAB_UPLOAD_HEADER,
+    NEW_RFS_INITIAL_HEADER,
+    ACTUAL_RFS_DATE_HEADER,
+)
+FIRST_MATCH_CURRENT_DATE_HEADERS = (
+    ACTUAL_RFS_DATE_HEADER,
+)
+RAW_SOURCE_QUOTE_ID_COLUMN = 4  # D
+RAW_SOURCE_NEW_RFS_COLUMN = 38  # AL
 
 DATE_ONLY_FORMAT = "mm/dd/yy"
 DATE_TIME_FORMAT = "mm/dd/yy h:mm AM/PM"
@@ -289,6 +303,10 @@ def read_raw_dataframe(raw_path: Path) -> pd.DataFrame:
         skiprows=[1],
         dtype=object,
     )
+    raw.columns = [normalize_header(column) for column in raw.columns]
+    if QUOTE_ID_HEADER not in raw.columns:
+        raise ValueError(f"Raw sheet is missing required column: {QUOTE_ID_HEADER}")
+
     raw_workbook = load_workbook(raw_path, read_only=True, data_only=True, keep_links=False)
     try:
         raw_worksheet = raw_workbook[RAW_SHEET_NAME]
@@ -300,12 +318,23 @@ def read_raw_dataframe(raw_path: Path) -> pd.DataFrame:
             for column_index, cell in enumerate(worksheet_row):
                 if cell.data_type == "e":
                     raw.iat[dataframe_row, column_index] = str(cell.value)
+
+        if NEW_RFS_INITIAL_HEADER in raw.columns and RAW_SOURCE_SHEET_NAME in raw_workbook.sheetnames:
+            quote_ids = raw[QUOTE_ID_HEADER].map(normalize_quote_id)
+            string_new_rfs = raw[NEW_RFS_INITIAL_HEADER].map(
+                lambda value: isinstance(value, str) and not is_missing(value)
+            )
+            required_quote_ids = set(quote_ids.loc[string_new_rfs])
+            source_lookup = load_source_new_rfs_lookup(
+                raw_workbook[RAW_SOURCE_SHEET_NAME],
+                required_quote_ids,
+            )
+            has_source_value = string_new_rfs & quote_ids.isin(source_lookup)
+            raw.loc[has_source_value, NEW_RFS_INITIAL_HEADER] = quote_ids.loc[
+                has_source_value
+            ].map(source_lookup)
     finally:
         raw_workbook.close()
-
-    raw.columns = [normalize_header(column) for column in raw.columns]
-    if QUOTE_ID_HEADER not in raw.columns:
-        raise ValueError(f"Raw sheet is missing required column: {QUOTE_ID_HEADER}")
 
     quote_ids = raw[QUOTE_ID_HEADER].map(normalize_quote_id)
     raw = raw.loc[quote_ids.ne("")].copy()
@@ -363,17 +392,22 @@ def apply_previous_field_fallbacks(
     headers: Iterable[str],
 ) -> int:
     fallback_count = 0
-    current_keys = occurrence_keys(current)
     for header in headers:
         if header not in current.columns or header not in previous.columns:
             continue
-        previous_lookup = occurrence_lookup(previous, header)
+        previous_lookup = first_quote_lookup(previous, header)
         values: list[object] = []
-        for current_value, key in zip(current[header], current_keys, strict=False):
-            previous_value = previous_lookup.get(key)
+        for quote_id, current_value in zip(
+            current[QUOTE_ID_HEADER].map(normalize_quote_id),
+            current[header],
+            strict=False,
+        ):
+            previous_value = previous_lookup.get(quote_id)
             if is_missing(current_value) and not is_missing(previous_value):
                 values.append(previous_value)
                 fallback_count += 1
+            elif is_missing(current_value):
+                values.append(current_value)
             else:
                 values.append(current_value)
         current[header] = pd.Series(values, index=current.index, dtype=object)
@@ -392,7 +426,7 @@ def numeric_value(value: object) -> int | float | None:
     return int(number) if number.is_integer() else number
 
 
-def parse_excel_datetime(value: object) -> datetime | None:
+def parse_excel_datetime(value: object, *, dayfirst: bool = True) -> datetime | None:
     if is_missing(value) or isinstance(value, time):
         return None
     if isinstance(value, pd.Timestamp):
@@ -418,16 +452,22 @@ def parse_excel_datetime(value: object) -> datetime | None:
     text = re.sub(r"/{2,}", "/", text)
     text = re.sub(r"\s+UTC$", "", text, flags=re.IGNORECASE)
 
+    day_first_formats = (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+    )
+    month_first_formats = (
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+    )
     formats = (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
-        "%d/%m/%Y",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%m/%d/%Y",
+        *(day_first_formats if dayfirst else month_first_formats),
+        *(month_first_formats if dayfirst else day_first_formats),
     )
     for fmt in formats:
         try:
@@ -437,10 +477,70 @@ def parse_excel_datetime(value: object) -> datetime | None:
             continue
 
     try:
-        parsed = date_parser.parse(text, dayfirst=False, fuzzy=False)
+        parsed = date_parser.parse(text, dayfirst=dayfirst, fuzzy=False)
         return parsed if MIN_VALID_DATE_YEAR <= parsed.year <= MAX_VALID_DATE_YEAR else None
     except (OverflowError, TypeError, ValueError):
         return None
+
+
+def load_source_new_rfs_lookup(worksheet, required_quote_ids: set[str]) -> dict[str, object]:
+    """Reproduce the raw workbook's VLOOKUP(D:AL, 35, FALSE) first-match rule."""
+    if not required_quote_ids:
+        return {}
+
+    lookup: dict[str, object] = {}
+    for row in worksheet.iter_rows(
+        min_col=RAW_SOURCE_QUOTE_ID_COLUMN,
+        max_col=RAW_SOURCE_NEW_RFS_COLUMN,
+        values_only=True,
+    ):
+        quote_id = normalize_quote_id(row[0])
+        if not quote_id or quote_id not in required_quote_ids or quote_id in lookup:
+            continue
+
+        source_value = row[RAW_SOURCE_NEW_RFS_COLUMN - RAW_SOURCE_QUOTE_ID_COLUMN]
+        parsed = parse_excel_datetime(source_value, dayfirst=False)
+        lookup[quote_id] = (
+            datetime.combine(parsed.date(), time.min)
+            if parsed is not None
+            else source_value
+        )
+        if len(lookup) == len(required_quote_ids):
+            break
+
+    return lookup
+
+
+def normalize_month_first_dashboard_dates(df: pd.DataFrame) -> None:
+    """Resolve region-sensitive dashboard text dates before other lookups."""
+    for header in MONTH_FIRST_TEXT_DATE_HEADERS:
+        if header not in df.columns:
+            continue
+
+        values: list[object] = []
+        for value in df[header]:
+            if not isinstance(value, str) or is_missing(value) or value.strip() == "-":
+                values.append(value)
+                continue
+
+            parsed = parse_excel_datetime(value, dayfirst=False)
+            values.append(parsed if parsed is not None else value)
+        df[header] = pd.Series(values, index=df.index, dtype=object)
+
+
+def apply_current_date_first_match(df: pd.DataFrame) -> None:
+    """Match manual VLOOKUP behavior for nonblank duplicate date values."""
+    quote_ids = df[QUOTE_ID_HEADER].map(normalize_quote_id)
+    duplicate_mask = quote_ids.duplicated(keep=False)
+    if not duplicate_mask.any():
+        return
+
+    for header in FIRST_MATCH_CURRENT_DATE_HEADERS:
+        if header not in df.columns:
+            continue
+        first_values = first_quote_lookup(df, header)
+        nonblank_duplicate = duplicate_mask & ~df[header].map(is_missing)
+        df.loc[nonblank_duplicate, header] = quote_ids.loc[nonblank_duplicate].map(first_values)
 
 
 def normalize_date_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[str]]]:
@@ -508,6 +608,9 @@ def reconciled_date_value(
     if is_excel_zero_date(current_value):
         return EXCEL_ZERO_DATE_SERIAL, False
 
+    if is_missing(current_value) or str(current_value).strip() == "-":
+        return current_value, False
+
     current_date = parse_excel_datetime(current_value)
     previous_date = parse_excel_datetime(previous_value)
 
@@ -517,12 +620,45 @@ def reconciled_date_value(
     ):
         return previous_date, True
     if is_plausible_operational_date(current_date, report_date):
-        return current_value, False
+        return current_date, False
     if is_excel_zero_date(previous_value):
         return EXCEL_ZERO_DATE_SERIAL, True
     if is_plausible_operational_date(previous_date, report_date):
         return previous_date, True
     return current_value, False
+
+
+def reconcile_date_column(
+    current: pd.DataFrame,
+    previous: pd.DataFrame,
+    header: str,
+    report_date: date,
+) -> tuple[pd.Series, int]:
+    """Reconcile one date column with the lookup semantics used by Excel."""
+    use_first_match = header in FIRST_MATCH_CURRENT_DATE_HEADERS
+    previous_lookup = (
+        first_quote_lookup(previous, header)
+        if use_first_match
+        else occurrence_lookup(previous, header)
+    )
+    reconciled_values: list[object] = []
+    fallback_count = 0
+
+    for current_value, occurrence_key in zip(
+        current[header],
+        occurrence_keys(current),
+        strict=False,
+    ):
+        lookup_key = occurrence_key[0] if use_first_match else occurrence_key
+        reconciled_value, used_fallback = reconciled_date_value(
+            current_value,
+            previous_lookup.get(lookup_key),
+            report_date,
+        )
+        reconciled_values.append(reconciled_value)
+        fallback_count += int(used_fallback)
+
+    return pd.Series(reconciled_values, index=current.index, dtype=object), fallback_count
 
 
 def status_order_value(aging: object) -> object:
@@ -571,11 +707,12 @@ def build_all_order(
 ) -> BuildResult:
     result = raw.copy().reset_index(drop=True)
     previous = previous.copy().reset_index(drop=True)
+    normalize_month_first_dashboard_dates(result)
+    apply_current_date_first_match(result)
     quote_ids = result[QUOTE_ID_HEADER].map(normalize_quote_id)
     duplicate_mask = quote_ids.duplicated(keep=False)
     duplicate_quote_ids = tuple(sorted(quote_ids.loc[duplicate_mask].unique()))
     duplicate_rows_preserved = int(quote_ids.duplicated(keep="first").sum())
-    current_keys = occurrence_keys(result)
     previous_keys = set(occurrence_keys(previous))
     field_fallback_count = apply_previous_field_fallbacks(
         result,
@@ -587,21 +724,17 @@ def build_all_order(
     for header in DATE_HEADERS:
         if header not in result.columns:
             continue
-        previous_date_lookup = occurrence_lookup(previous, header)
-        reconciled_values: list[object] = []
-        for current_value, key in zip(result[header], current_keys, strict=False):
-            reconciled_value, used_fallback = reconciled_date_value(
-                current_value,
-                previous_date_lookup.get(key),
-                report_date,
-            )
-            reconciled_values.append(reconciled_value)
-            date_fallback_count += int(used_fallback)
-        result[header] = pd.Series(reconciled_values, index=result.index, dtype=object)
+        result[header], fallback_count = reconcile_date_column(
+            result,
+            previous,
+            header,
+            report_date,
+        )
+        date_fallback_count += fallback_count
 
-    order_type_lookup = occurrence_lookup(previous, ORDER_TYPE_HEADER)
-    otc_lookup = occurrence_lookup(previous, OTC_HEADER)
-    mrc_lookup = occurrence_lookup(previous, MRC_HEADER)
+    order_type_lookup = first_quote_lookup(previous, ORDER_TYPE_HEADER)
+    otc_lookup = first_quote_lookup(previous, OTC_HEADER)
+    mrc_lookup = first_quote_lookup(previous, MRC_HEADER)
     previous_status_lookup = first_quote_lookup(previous, STATUS_DELIVERY_HEADER)
     previous_quote_ids = set(previous[QUOTE_ID_HEADER].map(normalize_quote_id))
     pre_installation_start_lookup = first_quote_lookup(previous, PRE_INSTALLATION_START_HEADER)
@@ -614,19 +747,18 @@ def build_all_order(
     zero_fallback_count = 0
 
     current_status_values = result[STATUS_DELIVERY_HEADER].map(normalize_status)
-    for quote_id, key, current_status in zip(
+    for quote_id, current_status in zip(
         quote_ids,
-        current_keys,
         current_status_values,
         strict=False,
     ):
-        previous_order_type = order_type_lookup.get(key)
+        previous_order_type = order_type_lookup.get(quote_id)
         order_types.append(
             "New Registration" if is_missing(previous_order_type) else str(previous_order_type).strip()
         )
 
-        previous_otc = numeric_value(otc_lookup.get(key))
-        previous_mrc = numeric_value(mrc_lookup.get(key))
+        previous_otc = numeric_value(otc_lookup.get(quote_id))
+        previous_mrc = numeric_value(mrc_lookup.get(quote_id))
         zero_fallback_count += int(previous_otc is None or previous_mrc is None)
         otc_values.append(financial_value_or_zero(previous_otc))
         mrc_values.append(financial_value_or_zero(previous_mrc))
@@ -804,18 +936,9 @@ def apply_date_formats(worksheet, df: pd.DataFrame) -> None:
                 ).NumberFormat = number_format
 
 
-def apply_previous_status_na_errors(excel, worksheet, df: pd.DataFrame) -> None:
-    status_headers = [
-        header
-        for header in df.columns
-        if str(header).startswith(f"{STATUS_DELIVERY_HEADER} ")
-    ]
-    for header in status_headers:
-        column_number = df.columns.get_loc(header) + 1
-        worksheet.Range(
-            worksheet.Cells(2, column_number),
-            worksheet.Cells(len(df) + 1, column_number),
-        ).NumberFormat = "General"
+def apply_na_errors(excel, worksheet, df: pd.DataFrame) -> None:
+    """Restore #N/A sentinels as real Excel errors before PivotTable refresh."""
+    for header in df.columns:
         error_rows = [
             row_number
             for row_number, value in enumerate(df[header], start=2)
@@ -823,6 +946,12 @@ def apply_previous_status_na_errors(excel, worksheet, df: pd.DataFrame) -> None:
         ]
         if not error_rows:
             continue
+
+        column_number = df.columns.get_loc(header) + 1
+        worksheet.Range(
+            worksheet.Cells(2, column_number),
+            worksheet.Cells(len(df) + 1, column_number),
+        ).NumberFormat = "General"
 
         start = previous = error_rows[0]
         ranges: list[tuple[int, int]] = []
@@ -1283,7 +1412,7 @@ def update_workbook_via_com(
         ).Value = body_values
         for column_number, header in enumerate(df.columns, start=1):
             all_order_sheet.Cells(1, column_number).Value = str(header)
-        apply_previous_status_na_errors(excel, all_order_sheet, df)
+        apply_na_errors(excel, all_order_sheet, df)
         if old_last_row > row_count:
             all_order_sheet.Rows(f"{row_count + 1}:{old_last_row}").Delete()
 
