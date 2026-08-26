@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import io
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -14,6 +15,8 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
+from urllib import request as url_request
+from urllib.error import HTTPError, URLError
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -44,6 +47,7 @@ from generate_ide_tracking import (
     generate_ide_tracking,
     output_filename as ide_output_filename,
 )
+from send_report_1_email import excel_pivot_regions_to_png, send_email_images
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,7 @@ IPHONE_CONVERSION_OUTPUT_DIR = Path("output-iphone")
 IDE_CONVERSION_OUTPUT_DIR = Path("output-ide")
 PIPELINE_CONVERSION_OUTPUT_DIR = Path("output-pipeline")
 API_WORK_DIR = Path("output-today/api")
+EMAIL_WORK_DIR = Path("output-today/email")
 RUNTIME_DIRS = (
     Path("input-today"),
     CONVERSION_OUTPUT_DIR,
@@ -63,6 +68,7 @@ RUNTIME_DIRS = (
     PIPELINE_CONVERSION_OUTPUT_DIR,
     Path("vlookup-yesterday"),
     API_WORK_DIR,
+    EMAIL_WORK_DIR,
 )
 
 
@@ -142,6 +148,74 @@ def _resolve_path(value: str | Path) -> Path:
 
 def _download_url(request: Request, job_id: str, filename: str) -> str:
     return f"/outputs/{job_id}/{quote(filename)}"
+
+
+def _upload_image_to_onedrive(image_path: Path) -> dict[str, object]:
+    access_token = os.getenv("ONEDRIVE_ACCESS_TOKEN")
+    drive_id = os.getenv("ONEDRIVE_DRIVE_ID")
+    if not access_token or not drive_id:
+        raise RuntimeError("Set ONEDRIVE_ACCESS_TOKEN and ONEDRIVE_DRIVE_ID before sending an email.")
+
+    folder = os.getenv("ONEDRIVE_FOLDER", "Daily Reports").strip("/")
+    path_parts = [part for part in folder.split("/") if part] + [image_path.name]
+    encoded_path = "/".join(quote(part, safe="") for part in path_parts)
+    endpoint = f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/root:/{encoded_path}:/content"
+    upload_request = url_request.Request(
+        endpoint,
+        data=image_path.read_bytes(),
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "image/png",
+        },
+    )
+    try:
+        with url_request.urlopen(upload_request, timeout=60) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except (HTTPError, URLError) as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if isinstance(exc, HTTPError) else str(exc)
+        raise RuntimeError(f"OneDrive upload failed: {detail}") from exc
+
+    import json
+
+    result = json.loads(payload) if payload else {}
+    return {
+        "id": result.get("id"),
+        "name": result.get("name", image_path.name),
+        "web_url": result.get("webUrl"),
+    }
+
+
+def _run_email_report(
+    workbook_path: Path,
+    image_dir: Path,
+    recipient: str,
+    subject: str,
+    message: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    images = excel_pivot_regions_to_png(workbook_path, image_dir)
+    result: dict[str, object] = {
+        "image_filenames": [image_path.name for image_path, _, _ in images],
+        "ranges": [cell_range for _, _, cell_range in images],
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+    if dry_run:
+        result["status"] = "preview_created"
+        result["message"] = "Screenshot created. OneDrive and SMTP were skipped because dry_run=true."
+        return result
+
+    result["onedrive"] = [_upload_image_to_onedrive(image_path) for image_path, _, _ in images]
+    smtp_endpoint = os.getenv(
+        "SMTP_API_URL",
+        "http://10.34.144.197/secm-portal/smtp/api_send_email",
+    )
+    send_email_images(smtp_endpoint, recipient, subject, message, [(image_path, content_id) for image_path, content_id, _ in images], timeout=60)
+    result["status"] = "sent"
+    result["message"] = "Screenshot uploaded to OneDrive and sent through the SMTP API."
+    result["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    return result
 
 
 async def _save_upload_file(upload: UploadFile, destination: Path) -> None:
@@ -812,9 +886,58 @@ def pipeline_page() -> FileResponse:
     return FileResponse(APP_ROOT / "templates" / "pipeline.html", media_type="text/html")
 
 
+@app.get("/email-report-1")
+def email_report_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "email-report.html", media_type="text/html")
+
+
+@app.get("/email-report")
+def legacy_email_report_page() -> RedirectResponse:
+    return RedirectResponse(url="/email-report-1", status_code=307)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/email-report-1/send")
+@app.post("/email-report/send")
+async def send_email_report(
+    workbook: UploadFile = File(...),
+    recipient: str = Form(...),
+    subject: str = Form(default="Daily Tracking Report 1"),
+    message: str = Form(default="<p>Daily Tracking Report 1</p><p><img src=\"cid:target-complete-table\" alt=\"Target complete table\"></p><p><img src=\"cid:target-complete-legend\" alt=\"Target complete legend\"></p><p><img src=\"cid:target-after-table\" alt=\"Target after table\"></p><p><img src=\"cid:target-after-legend\" alt=\"Target after legend\"></p>"),
+    dry_run: bool = Form(default=True),
+) -> dict[str, object]:
+    if not workbook.filename or not workbook.filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="workbook must be an .xlsx or .xlsm file.")
+    if not recipient.strip():
+        raise HTTPException(status_code=400, detail="recipient is required.")
+    required_content_ids = ("target-complete-table", "target-complete-legend", "target-after-table", "target-after-legend")
+    if any(f"cid:{content_id}" not in message for content_id in required_content_ids):
+        raise HTTPException(status_code=400, detail="message must contain all four target image Content-IDs for inline Outlook rendering.")
+
+    job_dir = (APP_ROOT / EMAIL_WORK_DIR / uuid.uuid4().hex).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    workbook_path = job_dir / Path(workbook.filename).name
+    image_dir = job_dir / "images"
+    try:
+        await _save_upload_file(workbook, workbook_path)
+        result = await run_in_threadpool(
+            _run_email_report,
+            workbook_path,
+            image_dir,
+            recipient.strip(),
+            subject.strip(),
+            message,
+            dry_run,
+        )
+        result["image_dir"] = str(image_dir)
+        return result
+    except Exception as exc:
+        logger.exception("Email report failed for %s", workbook_path)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/jobs/report-1/{job_id}")

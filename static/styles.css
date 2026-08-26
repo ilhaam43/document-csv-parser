@@ -211,7 +211,9 @@ label {
 }
 
 input[type="file"],
-input[type="text"] {
+input[type="text"],
+input[type="email"],
+textarea {
   width: 100%;
   min-height: 50px;
   border: 1px solid var(--line-strong);
@@ -223,10 +225,24 @@ input[type="text"] {
 }
 
 input[type="file"]:focus,
-input[type="text"]:focus {
+input[type="text"]:focus,
+input[type="email"]:focus,
+textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(23, 105, 170, 0.14);
   outline: none;
+}
+
+textarea {
+  min-height: 132px;
+  resize: vertical;
+  font: inherit;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
 }
 
 input[type="file"]::file-selector-button {

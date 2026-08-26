@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report 1 Email</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260826-email">
+</head>
+<body>
+  <main>
+    <nav class="app-nav" aria-label="Report navigation">
+      <div class="nav-brand">Daily Report Generator</div>
+      <div class="nav-links">
+        <a class="nav-link" href="/report-1">Report 1</a>
+        <a class="nav-link" href="/report-2">Report 2</a>
+        <a class="nav-link" href="/report-3">Report 3</a>
+        <a class="nav-link" href="/report-4">Report 4</a>
+        <a class="nav-link" href="/pipeline">Pipeline</a>
+        <a class="nav-link active" href="/email-report-1">Report 1 Email</a>
+      </div>
+    </nav>
+
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">OneDrive and Outlook delivery</p>
+        <h1>Report 1 Email</h1>
+        <code>Report 1 workbook &rarr; PNG &rarr; OneDrive &rarr; inline SMTP email</code>
+      </div>
+      <div class="health" id="health">API status: checking</div>
+    </header>
+
+    <div class="workspace">
+      <section class="upload-panel">
+        <div class="panel-heading">
+          <h2>Prepare Report 1 Email</h2>
+          <p>Upload the Report 1 Excel workbook. The Windows server captures the PIVOT sections and sends them as inline Outlook images.</p>
+        </div>
+        <form id="email-form">
+          <div class="field">
+            <label for="workbook">Excel workbook</label>
+            <input id="workbook" name="workbook" type="file" accept=".xlsx,.xlsm" required>
+          </div>
+
+          <div class="status-box">
+            The workflow uses the <strong>PIVOT</strong> sheet and creates four Report 1 images automatically: Target Complete table, Target Complete legend, Target After table, and Target After legend.
+          </div>
+
+          <div class="field">
+            <label for="recipient">Recipient</label>
+            <input id="recipient" name="recipient" type="email" value="ilhaam.akmal@lintasarta.co.id" required>
+          </div>
+
+          <div class="field">
+            <label for="subject">Subject</label>
+            <input id="subject" name="subject" type="text" value="Daily Tracking Report 1" required>
+          </div>
+
+          <div class="field">
+            <label for="message">HTML message</label>
+            <textarea id="message" name="message" rows="9" required>&lt;p&gt;Daily Tracking Report 1&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:target-complete-table" alt="Target Complete table"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:target-complete-legend" alt="Target Complete legend"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:target-after-table" alt="Target After table"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:target-after-legend" alt="Target After legend"&gt;&lt;/p&gt;</textarea>
+          </div>
+
+          <label class="option">
+            <input id="dry_run" name="dry_run" type="checkbox" checked>
+            <span>Create screenshot only (skip OneDrive and SMTP)</span>
+          </label>
+
+          <button id="submit-button" type="submit">Create Report 1 Email</button>
+        </form>
+      </section>
+
+      <aside class="status">
+        <div class="panel-heading">
+          <h2>Status</h2>
+          <p>Processing result and OneDrive destination.</p>
+        </div>
+        <div id="status-box" class="status-box">Ready.</div>
+        <a id="onedrive-link" class="download" href="#" target="_blank" rel="noreferrer">Open OneDrive Image</a>
+      </aside>
+    </div>
+  </main>
+  <script src="/static/email-report.js?v=20260826-email"></script>
+</body>
+</html>
