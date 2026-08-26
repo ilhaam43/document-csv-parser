@@ -78,8 +78,11 @@ main {
 
 .nav-links {
   display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
   gap: 4px;
   align-items: center;
+  justify-content: flex-end;
   padding: 4px;
   border: 1px solid rgba(216, 225, 235, 0.9);
   border-radius: 8px;
@@ -376,6 +379,7 @@ button:disabled {
 
   .nav-links {
     display: grid;
+    flex: none;
     grid-template-columns: 1fr;
     padding: 6px;
   }
