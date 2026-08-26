@@ -47,7 +47,8 @@ from generate_ide_tracking import (
     generate_ide_tracking,
     output_filename as ide_output_filename,
 )
-from send_report_1_email import excel_pivot_regions_to_png, send_email_images
+from send_report_1_email import excel_range_to_png, excel_pivot_regions_to_png, send_email, send_email_images
+from send_report_2_email import REPORT_2_IMAGE_IDS, report_2_ranges
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ IDE_CONVERSION_OUTPUT_DIR = Path("output-ide")
 PIPELINE_CONVERSION_OUTPUT_DIR = Path("output-pipeline")
 API_WORK_DIR = Path("output-today/api")
 EMAIL_WORK_DIR = Path("output-today/email")
+EMAIL_2_WORK_DIR = Path("output-outgoing/email")
 RUNTIME_DIRS = (
     Path("input-today"),
     CONVERSION_OUTPUT_DIR,
@@ -69,6 +71,7 @@ RUNTIME_DIRS = (
     Path("vlookup-yesterday"),
     API_WORK_DIR,
     EMAIL_WORK_DIR,
+    EMAIL_2_WORK_DIR,
 )
 
 
@@ -215,6 +218,23 @@ def _run_email_report(
     result["status"] = "sent"
     result["message"] = "Screenshot uploaded to OneDrive and sent through the SMTP API."
     result["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    return result
+
+
+def _run_email_report_2(workbook_path: Path, image_path: Path, recipient: str, subject: str, message: str, dry_run: bool) -> dict[str, object]:
+    started = time.perf_counter()
+    images = []
+    for index, (cell_range, content_id) in enumerate(report_2_ranges(workbook_path), start=1):
+        output_path = image_path.parent / f"{workbook_path.stem} - report-2-pivot-{index}.png"
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        images.append((output_path, content_id, cell_range))
+    result: dict[str, object] = {"image_filenames": [path.name for path, _, _ in images], "ranges": [cell_range for _, _, cell_range in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
+    if dry_run:
+        result.update(status="preview_created", message="Report 2 screenshot created. OneDrive and SMTP were skipped because dry_run=true.")
+        return result
+    result["onedrive"] = [_upload_image_to_onedrive(path) for path, _, _ in images]
+    send_email_images(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, message, [(path, content_id) for path, content_id, _ in images], timeout=60)
+    result.update(status="sent", message="Report 2 screenshot uploaded to OneDrive and sent through the SMTP API.")
     return result
 
 
@@ -896,6 +916,11 @@ def legacy_email_report_page() -> RedirectResponse:
     return RedirectResponse(url="/email-report-1", status_code=307)
 
 
+@app.get("/email-report-2")
+def email_report_2_page() -> FileResponse:
+    return FileResponse(APP_ROOT / "templates" / "email-report-2.html", media_type="text/html")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -937,6 +962,35 @@ async def send_email_report(
         return result
     except Exception as exc:
         logger.exception("Email report failed for %s", workbook_path)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/email-report-2/send")
+async def send_email_report_2(
+    workbook: UploadFile = File(...),
+    recipient: str = Form(...),
+    subject: str = Form(default="Daily Tracking Report 2 Ongoing"),
+    message: str = Form(default='<p>Daily Tracking Report 2 Ongoing</p><p><img src="cid:report-2-ongoing-table" alt="Report 2 ongoing table"></p><p><img src="cid:report-2-ongoing-legend" alt="Report 2 ongoing legend"></p><p><img src="cid:report-2-after-table" alt="Report 2 target after table"></p><p><img src="cid:report-2-after-legend" alt="Report 2 target after legend"></p><p><img src="cid:report-2-aging-table" alt="Report 2 order aging table"></p>'),
+    dry_run: bool = Form(default=True),
+) -> dict[str, object]:
+    if not workbook.filename or not workbook.filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="workbook must be an .xlsx or .xlsm file.")
+    if not recipient.strip():
+        raise HTTPException(status_code=400, detail="recipient is required.")
+    if any(f"cid:{content_id}" not in message for content_id in REPORT_2_IMAGE_IDS):
+        raise HTTPException(status_code=400, detail="message must contain all five Report 2 image Content-IDs for inline Outlook rendering.")
+
+    job_dir = (APP_ROOT / EMAIL_2_WORK_DIR / uuid.uuid4().hex).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    workbook_path = job_dir / Path(workbook.filename).name
+    image_path = job_dir / f"{workbook_path.stem} - report-2-pivot.png"
+    try:
+        await _save_upload_file(workbook, workbook_path)
+        result = await run_in_threadpool(_run_email_report_2, workbook_path, image_path, recipient.strip(), subject.strip(), message, dry_run)
+        result["image_path"] = str(image_path)
+        return result
+    except Exception as exc:
+        logger.exception("Report 2 email failed for %s", workbook_path)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

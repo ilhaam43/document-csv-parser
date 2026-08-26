@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report 2 Email</title><link rel="stylesheet" href="/static/styles.css?v=20260826-email2"></head>
+<body><main>
+  <nav class="app-nav" aria-label="Report navigation"><div class="nav-brand">Daily Report Generator</div><div class="nav-links">
+    <a class="nav-link" href="/report-1">Report 1</a><a class="nav-link" href="/report-2">Report 2</a><a class="nav-link" href="/report-3">Report 3</a><a class="nav-link" href="/report-4">Report 4</a><a class="nav-link" href="/pipeline">Pipeline</a><a class="nav-link" href="/email-report-1">Report 1 Email</a><a class="nav-link active" href="/email-report-2">Report 2 Email</a>
+  </div></nav>
+  <header class="app-header"><div><p class="eyebrow">OneDrive and Outlook delivery</p><h1>Report 2 Email</h1><code>Report 2 ongoing workbook &rarr; PIVOT PNG &rarr; OneDrive &rarr; inline SMTP email</code></div><div class="health" id="health">API status: checking</div></header>
+  <div class="workspace"><section class="upload-panel"><div class="panel-heading"><h2>Prepare Report 2 Email</h2><p>Upload the output from csv_to_excel_on_going.py. The complete PIVOT sheet is captured and sent inline.</p></div>
+    <form id="email-form"><div class="field"><label for="workbook">Report 2 ongoing Excel</label><input id="workbook" name="workbook" type="file" accept=".xlsx,.xlsm" required></div>
+      <div class="status-box">The workflow captures five Report 2 <strong>PIVOT</strong> images: ongoing table, ongoing legend, Target After table, Target After legend, and order aging table.</div>
+      <div class="field"><label for="recipient">Recipient</label><input id="recipient" name="recipient" type="email" value="ilhaam.akmal@lintasarta.co.id" required></div>
+      <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" type="text" value="Daily Tracking Report 2 Ongoing" required></div>
+      <div class="field"><label for="message">HTML message</label><textarea id="message" name="message" rows="11" required>&lt;p&gt;Daily Tracking Report 2 Ongoing&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:report-2-ongoing-table" alt="Report 2 ongoing table"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:report-2-ongoing-legend" alt="Report 2 ongoing legend"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:report-2-after-table" alt="Report 2 target after table"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:report-2-after-legend" alt="Report 2 target after legend"&gt;&lt;/p&gt;
+&lt;p&gt;&lt;img src="cid:report-2-aging-table" alt="Report 2 order aging table"&gt;&lt;/p&gt;</textarea></div>
+      <label class="option"><input id="dry_run" name="dry_run" type="checkbox" checked><span>Create screenshot only (skip OneDrive and SMTP)</span></label>
+      <button id="submit-button" type="submit">Create Report 2 Email</button>
+    </form></section><aside class="status"><div class="panel-heading"><h2>Status</h2><p>Processing result and OneDrive destination.</p></div><div id="status-box" class="status-box">Ready.</div><a id="onedrive-link" class="download" href="#" target="_blank" rel="noreferrer">Open OneDrive Image</a></aside></div>
+</main><script src="/static/email-report-2.js?v=20260826-email2"></script></body></html>
