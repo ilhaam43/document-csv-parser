@@ -48,7 +48,7 @@ cd C:\Apps\document-csv-parser
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 In another PowerShell window on the server:
@@ -108,6 +108,28 @@ The install script:
 - configures service stdout/stderr logs in `logs`
 - sets the service to restart on failure and start automatically
 - starts the service and checks `http://localhost:8000/health`
+
+The service intentionally uses one Uvicorn worker. Excel automation jobs are queued and serialized, and the current job status store is in process memory. Increasing the worker count can split a submitted job and its status polling across different processes.
+
+## Excel Automation Deployment Rules
+
+The report generators automate the desktop Microsoft Excel application. Keep these rules in place on every deployment:
+
+- Run the app from a stable local directory such as `C:\Apps\document-csv-parser`, not a network share or synced folder.
+- Run the service under one dedicated Windows user that has Excel installed, activated, and permission to modify the application directory.
+- Keep Uvicorn at `--workers 1`. The app already queues Excel work and also uses a cross-process lock.
+- Do not open generated workbooks manually from the server's runtime directories while a report is running.
+- Ensure the service user has modify access to `output-today`, `output-outgoing`, `output-iphone`, `output-ide`, and the Windows temporary directory.
+
+After deploying this Excel-isolation update for the first time, clear Excel processes left by the previous app version before restarting the service:
+
+```powershell
+Stop-Service document-csv-parser
+Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Service document-csv-parser
+```
+
+This one-time cleanup is only for the deployment transition. The application now gives every upload a unique job directory, runs each generator in an isolated Python process, validates the complete XLSX container, and atomically publishes the result.
 
 To update service settings without reinstalling Python packages:
 

@@ -22,4 +22,4 @@ $env:PYTHONUNBUFFERED = "1"
 Set-Location -LiteralPath $AppPath
 
 $ErrorActionPreference = "Continue"
-& $PythonPath -m uvicorn app:app --host 0.0.0.0 --port $Port --proxy-headers --forwarded-allow-ips=* *> (Join-Path $logs "scheduled-uvicorn.log")
+& $PythonPath -m uvicorn app:app --host 0.0.0.0 --port $Port --workers 1 --proxy-headers --forwarded-allow-ips=* *> (Join-Path $logs "scheduled-uvicorn.log")

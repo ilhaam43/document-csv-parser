@@ -34,23 +34,21 @@ from csv_to_excel import (
     resolve_output_path,
 )
 from csv_to_excel_on_going import (
-    apply_logic_to_workbook as apply_ongoing_logic_to_workbook,
     output_filename_for_tracking as ongoing_output_filename_for_tracking,
 )
+from excel_automation_lock import excel_process_lock as _excel_process_lock
 from generate_iphone_tracking import (
     default_output_path as iphone_default_output_path,
-    generate_iphone_tracking,
 )
 from generate_ide_tracking import (
-    InputFiles as IdeInputFiles,
     determine_report_date as determine_ide_report_date,
-    generate_ide_tracking,
     output_filename as ide_output_filename,
 )
 from send_report_1_email import excel_range_to_png, excel_pivot_regions_to_png, send_email, send_email_images
 from send_report_2_email import REPORT_2_IMAGE_IDS, report_2_ranges
 from send_report_3_email import report_3_target_complete_range
 from send_report_4_email import REPORT_4_IMAGE_IDS, report_4_ranges
+from pipeline_stage_runner import run_daily_stage, run_ide_stage, run_iphone_stage, run_ongoing_stage
 
 
 logger = logging.getLogger(__name__)
@@ -121,17 +119,25 @@ app.mount("/static", StaticFiles(directory=APP_ROOT / "static"), name="static")
 def _initialized_com_thread():
     """Initialize Windows COM for worker threads that automate Excel."""
     with EXCEL_COM_LOCK:
-        try:
-            import pythoncom  # type: ignore
-        except ImportError:
-            yield
-            return
+        with _excel_process_lock(PIPELINE_EXCEL_TIMEOUT_SECONDS):
+            try:
+                import pythoncom  # type: ignore
+            except ImportError:
+                yield
+                return
 
-        pythoncom.CoInitialize()
-        try:
-            yield
-        finally:
-            pythoncom.CoUninitialize()
+            pythoncom.CoInitialize()
+            try:
+                yield
+            finally:
+                pythoncom.CoUninitialize()
+
+
+def _run_locked_excel_stage(stage_callable, timeout_seconds: int, *args):
+    """Run an isolated Excel stage while honoring the server-wide queue."""
+    with EXCEL_COM_LOCK:
+        with _excel_process_lock(timeout_seconds):
+            return stage_callable(*args)
 
 
 class ConvertPathRequest(BaseModel):
@@ -276,9 +282,15 @@ def _run_email_report_4(workbook_path: Path, image_path: Path, recipient: str, s
 
 
 async def _save_upload_file(upload: UploadFile, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as handle:
         while chunk := await upload.read(1024 * 1024):
             handle.write(chunk)
+
+
+def _job_input_path(job_dir: Path, input_name: str, filename: str) -> Path:
+    """Keep uploaded roles isolated while preserving source filenames."""
+    return (job_dir / "input" / input_name / Path(filename).name).resolve()
 
 
 def _now_seconds() -> float:
@@ -431,6 +443,7 @@ def _run_with_excel_watchdog(
     work,
 ) -> dict[str, object] | None:
     timed_out = threading.Event()
+    failed = False
 
     def expire_job() -> None:
         timed_out.set()
@@ -447,29 +460,42 @@ def _run_with_excel_watchdog(
         )
         _terminate_excel_processes(f"after {job_label} job {job_id} timed out")
 
-    with EXCEL_COM_LOCK:
-        timeout_timer = threading.Timer(timeout_seconds, expire_job)
-        timeout_timer.daemon = True
-        timeout_timer.start()
-        try:
-            result = work()
-            if timed_out.is_set():
-                return None
-            return result
-        except Exception as exc:
-            logger.exception("%s background conversion failed for job %s", job_label, job_id)
-            if not timed_out.is_set():
-                set_job(
-                    job_id,
-                    status="failed",
-                    completed_at=_now_seconds(),
-                    error=str(exc),
-                )
-            return None
-        finally:
-            timeout_timer.cancel()
-            _terminate_excel_processes(f"after {job_label} job {job_id}")
-            _cleanup_excel_lock_markers(cleanup_dir)
+    try:
+        with EXCEL_COM_LOCK:
+            with _excel_process_lock(timeout_seconds):
+                timeout_timer = threading.Timer(timeout_seconds, expire_job)
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                try:
+                    result = work()
+                    if timed_out.is_set():
+                        return None
+                    return result
+                except Exception as exc:
+                    failed = True
+                    logger.exception("%s background conversion failed for job %s", job_label, job_id)
+                    if not timed_out.is_set():
+                        set_job(
+                            job_id,
+                            status="failed",
+                            completed_at=_now_seconds(),
+                            error=str(exc),
+                        )
+                    return None
+                finally:
+                    timeout_timer.cancel()
+                    if timed_out.is_set() or failed:
+                        _terminate_excel_processes(f"after failed {job_label} job {job_id}")
+                    _cleanup_excel_lock_markers(cleanup_dir)
+    except Exception as exc:
+        logger.exception("%s could not acquire the Excel automation lock for job %s", job_label, job_id)
+        set_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
+        return None
 
 
 def _run_conversion(
@@ -526,21 +552,31 @@ def _run_report_1_upload_job(
     job_id: str,
     input_path: Path,
     lookup_workbook_path: Path,
-    conversion_output_path: Path,
     output_path: Path,
     conversion_request: ConvertPathRequest,
 ) -> None:
     _set_report_1_job(job_id, status="running", started_at=_now_seconds())
+
     def work() -> dict[str, object]:
-        conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
-        result = _run_conversion(
+        result = run_daily_stage(
             input_path,
-            conversion_output_path,
-            conversion_request,
             lookup_workbook_path,
+            output_path,
+            conversion_request.refresh_template,
+            delimiter=conversion_request.delimiter,
+            encoding=conversion_request.encoding,
+            normalize_headers=conversion_request.normalize_headers,
+            keep_empty=conversion_request.keep_empty,
+            drop_empty_columns=conversion_request.drop_empty_columns,
+            dedupe=conversion_request.dedupe,
+            infer_types=conversion_request.infer_types,
+            timeout_seconds=REPORT_1_EXCEL_TIMEOUT_SECONDS,
         )
-        shutil.copy2(conversion_output_path, output_path)
-        return result
+        return {
+            "elapsed_seconds": round(result.elapsed_seconds, 3),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
 
     result = _run_with_excel_watchdog(
         "Report 1",
@@ -565,38 +601,6 @@ def _run_report_1_upload_job(
     )
 
 
-def _run_ongoing_conversion(
-    tracking_workbook_path: Path,
-    log_csv_path: Path,
-    previous_ongoing_workbook_path: Path,
-    output_path: Path,
-    with_pivot: bool,
-) -> dict[str, object]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    started = time.perf_counter()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        with _initialized_com_thread():
-            apply_ongoing_logic_to_workbook(
-                tracking_workbook_path,
-                log_csv_path,
-                output_path,
-                with_pivot=with_pivot,
-                engine="com",
-                clone_pivot_template=True,
-                base_workbook_path=previous_ongoing_workbook_path,
-            )
-    elapsed_seconds = time.perf_counter() - started
-
-    return {
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "output_path": str(output_path),
-        "stdout": stdout.getvalue().strip(),
-        "stderr": stderr.getvalue().strip(),
-        "with_pivot": with_pivot,
-    }
-
-
 def _run_report_2_upload_job(
     job_id: str,
     tracking_path: Path,
@@ -606,113 +610,44 @@ def _run_report_2_upload_job(
     with_pivot: bool,
 ) -> None:
     _set_report_2_job(job_id, status="running", started_at=_now_seconds())
-    timed_out = threading.Event()
 
-    def expire_job() -> None:
-        timed_out.set()
-        error = (
-            f"Excel processing exceeded {REPORT_2_EXCEL_TIMEOUT_SECONDS // 60} minutes. "
-            "The workbook may be too large or Excel may be waiting on a hidden dialog."
-        )
-        logger.error("Report 2 background conversion timed out for job %s", job_id)
-        _set_report_2_job(
-            job_id,
-            status="failed",
-            completed_at=_now_seconds(),
-            error=error,
-        )
-        _terminate_excel_processes(f"after Report 2 job {job_id} timed out")
-
-    timeout_timer = threading.Timer(REPORT_2_EXCEL_TIMEOUT_SECONDS, expire_job)
-    timeout_timer.daemon = True
-    timeout_timer.start()
-    try:
+    def work() -> dict[str, object]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        result = _run_ongoing_conversion(
+        result = run_ongoing_stage(
             tracking_path,
             log_path,
             previous_ongoing_path,
             output_path,
             with_pivot,
+            timeout_seconds=REPORT_2_EXCEL_TIMEOUT_SECONDS,
         )
-        if timed_out.is_set():
-            return
-        _set_report_2_job(
-            job_id,
-            status="succeeded",
-            completed_at=_now_seconds(),
-            elapsed_seconds=result["elapsed_seconds"],
-            filename=output_path.name,
-            output_file=str(output_path),
-            with_pivot=with_pivot,
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-        )
-    except Exception as exc:
-        logger.exception("Report 2 background conversion failed for job %s", job_id)
-        if timed_out.is_set():
-            return
-        _set_report_2_job(
-            job_id,
-            status="failed",
-            completed_at=_now_seconds(),
-            error=str(exc),
-        )
-    finally:
-        timeout_timer.cancel()
-        _terminate_excel_processes(f"after Report 2 job {job_id}")
-        _cleanup_excel_lock_markers(output_path.parent)
+        return {
+            "elapsed_seconds": round(result.elapsed_seconds, 3),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
 
-
-def _run_iphone_conversion(
-    tracking_workbook_path: Path,
-    reference_workbook_path: Path,
-    output_path: Path,
-) -> dict[str, object]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    started = time.perf_counter()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        with _initialized_com_thread():
-            generate_iphone_tracking(tracking_workbook_path, reference_workbook_path, output_path)
-    elapsed_seconds = time.perf_counter() - started
-
-    return {
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "output_path": str(output_path),
-        "stdout": stdout.getvalue().strip(),
-        "stderr": stderr.getvalue().strip(),
-    }
-
-
-def _run_ide_conversion(
-    raw_workbook_path: Path,
-    previous_workbook_path: Path,
-    collabs_csv_path: Path,
-    output_path: Path,
-    report_date: date,
-) -> dict[str, object]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    started = time.perf_counter()
-    files = IdeInputFiles(
-        raw=raw_workbook_path,
-        previous=previous_workbook_path,
-        collabs=collabs_csv_path,
+    result = _run_with_excel_watchdog(
+        "Report 2",
+        job_id,
+        _set_report_2_job,
+        output_path.parent,
+        REPORT_2_EXCEL_TIMEOUT_SECONDS,
+        work,
     )
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        with _initialized_com_thread():
-            result = generate_ide_tracking(files, output_path, report_date)
-    elapsed_seconds = time.perf_counter() - started
-
-    return {
-        **result,
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "output_path": str(output_path),
-        "report_date": report_date.isoformat(),
-        "stdout": stdout.getvalue().strip(),
-        "stderr": stderr.getvalue().strip(),
-    }
+    if result is None:
+        return
+    _set_report_2_job(
+        job_id,
+        status="succeeded",
+        completed_at=_now_seconds(),
+        elapsed_seconds=result["elapsed_seconds"],
+        filename=output_path.name,
+        output_file=str(output_path),
+        with_pivot=with_pivot,
+        stdout=result.get("stdout", ""),
+        stderr=result.get("stderr", ""),
+    )
 
 
 def _run_pipeline_conversion(
@@ -725,8 +660,6 @@ def _run_pipeline_conversion(
     refresh_template: bool,
     ongoing_with_pivot: bool,
 ) -> dict[str, object]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -734,38 +667,57 @@ def _run_pipeline_conversion(
     ongoing_output_path = (output_dir / ongoing_output_filename_for_tracking(daily_output_path)).resolve()
     iphone_output_path = (output_dir / iphone_default_output_path(daily_output_path).name).resolve()
 
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        with _initialized_com_thread():
-            daily_request = ConvertPathRequest(
-                input_path=str(data_order_csv_path),
-                output_path=str(daily_output_path),
-                refresh_template=refresh_template,
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def record_stage(stage_name: str, stage_result) -> None:
+        if stage_result.stdout:
+            stdout_parts.append(f"[{stage_name}]\n{stage_result.stdout}")
+        if stage_result.stderr:
+            stderr_parts.append(f"[{stage_name}]\n{stage_result.stderr}")
+
+    # Each generator runs in its own process. Process exit guarantees that its
+    # Excel COM apartment and workbook handles are released before the next
+    # generator opens the output.
+    with EXCEL_COM_LOCK:
+        with _excel_process_lock(PIPELINE_EXCEL_TIMEOUT_SECONDS):
+            record_stage(
+                "Daily Tracking",
+                run_daily_stage(
+                    data_order_csv_path,
+                    daily_reference_workbook_path,
+                    daily_output_path,
+                    refresh_template,
+                    timeout_seconds=REPORT_1_EXCEL_TIMEOUT_SECONDS,
+                ),
             )
-            _run_conversion(
-                data_order_csv_path,
-                daily_output_path,
-                daily_request,
-                daily_reference_workbook_path,
+            record_stage(
+                "Ongoing Tracking",
+                run_ongoing_stage(
+                    daily_output_path,
+                    log_csv_path,
+                    previous_ongoing_workbook_path,
+                    ongoing_output_path,
+                    ongoing_with_pivot,
+                    timeout_seconds=REPORT_2_EXCEL_TIMEOUT_SECONDS,
+                ),
             )
-            _run_ongoing_conversion(
-                daily_output_path,
-                log_csv_path,
-                previous_ongoing_workbook_path,
-                ongoing_output_path,
-                ongoing_with_pivot,
-            )
-            _run_iphone_conversion(
-                daily_output_path,
-                previous_iphone_workbook_path,
-                iphone_output_path,
+            record_stage(
+                "iPhone Tracking",
+                run_iphone_stage(
+                    daily_output_path,
+                    previous_iphone_workbook_path,
+                    iphone_output_path,
+                    REPORT_3_EXCEL_TIMEOUT_SECONDS,
+                ),
             )
     elapsed_seconds = time.perf_counter() - started
 
     return {
         "elapsed_seconds": round(elapsed_seconds, 3),
         "output_files": [str(daily_output_path), str(ongoing_output_path), str(iphone_output_path)],
-        "stdout": stdout.getvalue().strip(),
-        "stderr": stderr.getvalue().strip(),
+        "stdout": "\n".join(stdout_parts),
+        "stderr": "\n".join(stderr_parts),
         "refresh_template": refresh_template,
         "ongoing_with_pivot": ongoing_with_pivot,
     }
@@ -781,11 +733,17 @@ def _run_report_3_upload_job(
 
     def work() -> dict[str, object]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        return _run_iphone_conversion(
+        result = run_iphone_stage(
             tracking_path,
             reference_path,
             output_path,
+            REPORT_3_EXCEL_TIMEOUT_SECONDS,
         )
+        return {
+            "elapsed_seconds": round(result.elapsed_seconds, 3),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
 
     result = _run_with_excel_watchdog(
         "Report 3",
@@ -821,13 +779,21 @@ def _run_report_4_upload_job(
 
     def work() -> dict[str, object]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        return _run_ide_conversion(
+        stage_result = run_ide_stage(
             raw_workbook_path,
             previous_workbook_path,
             collabs_csv_path,
             output_path,
             report_date,
+            REPORT_4_EXCEL_TIMEOUT_SECONDS,
         )
+        return {
+            **(stage_result.metadata or {}),
+            "elapsed_seconds": round(stage_result.elapsed_seconds, 3),
+            "report_date": report_date.isoformat(),
+            "stdout": stage_result.stdout,
+            "stderr": stage_result.stderr,
+        }
 
     result = _run_with_excel_watchdog(
         "Report 4",
@@ -1330,11 +1296,10 @@ async def start_report_1_upload_job(
     job_id = uuid.uuid4().hex
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    input_path = job_dir / Path(raw_data.filename).name
-    lookup_workbook_path = job_dir / Path(yesterday_cleaned_data.filename).name
+    input_path = _job_input_path(job_dir, "raw-data", raw_data.filename)
+    lookup_workbook_path = _job_input_path(job_dir, "daily-reference", yesterday_cleaned_data.filename)
     output_filename = output_filename_from_csv_path(input_path)
-    conversion_output_path = (APP_ROOT / CONVERSION_OUTPUT_DIR / output_filename).resolve()
-    output_path = job_dir / output_filename
+    output_path = (job_dir / output_filename).resolve()
 
     try:
         await _save_upload_file(raw_data, input_path)
@@ -1345,7 +1310,7 @@ async def start_report_1_upload_job(
 
     conversion_request = ConvertPathRequest(
         input_path=str(input_path),
-        output_path=str(conversion_output_path),
+        output_path=str(output_path),
         delimiter=delimiter or None,
         encoding=encoding or None,
         normalize_headers=normalize_headers,
@@ -1372,7 +1337,6 @@ async def start_report_1_upload_job(
         job_id,
         input_path,
         lookup_workbook_path,
-        conversion_output_path,
         output_path,
         conversion_request,
     )
@@ -1411,11 +1375,10 @@ async def convert_upload(
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    input_path = job_dir / Path(raw_data.filename).name
-    lookup_workbook_path = job_dir / Path(yesterday_cleaned_data.filename).name
+    input_path = _job_input_path(job_dir, "raw-data", raw_data.filename)
+    lookup_workbook_path = _job_input_path(job_dir, "daily-reference", yesterday_cleaned_data.filename)
     output_filename = output_filename_from_csv_path(input_path)
-    conversion_output_path = (APP_ROOT / CONVERSION_OUTPUT_DIR / output_filename).resolve()
-    output_path = job_dir / output_filename
+    output_path = (job_dir / output_filename).resolve()
 
     try:
         await _save_upload_file(raw_data, input_path)
@@ -1423,7 +1386,7 @@ async def convert_upload(
 
         conversion_request = ConvertPathRequest(
             input_path=str(input_path),
-            output_path=str(conversion_output_path),
+            output_path=str(output_path),
             delimiter=delimiter or None,
             encoding=encoding or None,
             normalize_headers=normalize_headers,
@@ -1433,14 +1396,24 @@ async def convert_upload(
             infer_types=infer_types,
             refresh_template=refresh_template,
         )
-        result = await run_in_threadpool(
-            _run_conversion,
+        stage_result = await run_in_threadpool(
+            _run_locked_excel_stage,
+            run_daily_stage,
+            REPORT_1_EXCEL_TIMEOUT_SECONDS,
             input_path,
-            conversion_output_path,
-            conversion_request,
             lookup_workbook_path,
+            output_path,
+            conversion_request.refresh_template,
+            conversion_request.delimiter,
+            conversion_request.encoding,
+            conversion_request.normalize_headers,
+            conversion_request.keep_empty,
+            conversion_request.drop_empty_columns,
+            conversion_request.dedupe,
+            conversion_request.infer_types,
+            REPORT_1_EXCEL_TIMEOUT_SECONDS,
         )
-        shutil.copy2(conversion_output_path, output_path)
+        result = {"elapsed_seconds": round(stage_result.elapsed_seconds, 3)}
     except Exception as exc:
         logger.exception("Report 1 upload conversion failed for job %s", job_dir.name)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1476,9 +1449,9 @@ async def start_report_2_upload_job(
     job_id = uuid.uuid4().hex
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    tracking_path = job_dir / Path(tracking_workbook.filename).name
-    log_path = job_dir / Path(log_update_status.filename).name
-    previous_ongoing_path = job_dir / Path(previous_ongoing_workbook.filename).name
+    tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
+    log_path = _job_input_path(job_dir, "log-update", log_update_status.filename)
+    previous_ongoing_path = _job_input_path(job_dir, "ongoing-reference", previous_ongoing_workbook.filename)
     output_filename = ongoing_output_filename_for_tracking(tracking_path)
     output_path = (job_dir / output_filename).resolve()
 
@@ -1543,9 +1516,9 @@ async def convert_report_2_upload(
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    tracking_path = job_dir / Path(tracking_workbook.filename).name
-    log_path = job_dir / Path(log_update_status.filename).name
-    previous_ongoing_path = job_dir / Path(previous_ongoing_workbook.filename).name
+    tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
+    log_path = _job_input_path(job_dir, "log-update", log_update_status.filename)
+    previous_ongoing_path = _job_input_path(job_dir, "ongoing-reference", previous_ongoing_workbook.filename)
     output_filename = ongoing_output_filename_for_tracking(tracking_path)
     output_path = (job_dir / output_filename).resolve()
     conversion_output_path = output_path
@@ -1556,14 +1529,19 @@ async def convert_report_2_upload(
         await _save_upload_file(previous_ongoing_workbook, previous_ongoing_path)
         conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = await run_in_threadpool(
-            _run_ongoing_conversion,
+        stage_result = await run_in_threadpool(
+            _run_locked_excel_stage,
+            run_ongoing_stage,
+            REPORT_2_EXCEL_TIMEOUT_SECONDS,
             tracking_path,
             log_path,
             previous_ongoing_path,
             conversion_output_path,
             with_pivot,
+            None,
+            REPORT_2_EXCEL_TIMEOUT_SECONDS,
         )
+        result = {"elapsed_seconds": round(stage_result.elapsed_seconds, 3)}
     except Exception as exc:
         logger.exception("Report 2 upload conversion failed for job %s", job_dir.name)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1596,8 +1574,8 @@ async def start_report_3_upload_job(
     job_id = uuid.uuid4().hex
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    tracking_path = job_dir / Path(tracking_workbook.filename).name
-    reference_path = job_dir / Path(previous_iphone_workbook.filename).name
+    tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
+    reference_path = _job_input_path(job_dir, "iphone-reference", previous_iphone_workbook.filename)
     output_filename = iphone_default_output_path(tracking_path).name
     output_path = (job_dir / output_filename).resolve()
 
@@ -1651,24 +1629,24 @@ async def convert_report_3_upload(
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    tracking_path = job_dir / Path(tracking_workbook.filename).name
-    reference_path = job_dir / Path(previous_iphone_workbook.filename).name
+    tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
+    reference_path = _job_input_path(job_dir, "iphone-reference", previous_iphone_workbook.filename)
     output_filename = iphone_default_output_path(tracking_path).name
-    conversion_output_path = (APP_ROOT / IPHONE_CONVERSION_OUTPUT_DIR / output_filename).resolve()
-    output_path = job_dir / output_filename
+    output_path = (job_dir / output_filename).resolve()
 
     try:
         await _save_upload_file(tracking_workbook, tracking_path)
         await _save_upload_file(previous_iphone_workbook, reference_path)
-        conversion_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = await run_in_threadpool(
-            _run_iphone_conversion,
+        stage_result = await run_in_threadpool(
+            _run_locked_excel_stage,
+            run_iphone_stage,
+            REPORT_3_EXCEL_TIMEOUT_SECONDS,
             tracking_path,
             reference_path,
-            conversion_output_path,
+            output_path,
+            REPORT_3_EXCEL_TIMEOUT_SECONDS,
         )
-        shutil.copy2(conversion_output_path, output_path)
+        result = {"elapsed_seconds": round(stage_result.elapsed_seconds, 3)}
     except Exception as exc:
         logger.exception("Report 3 upload conversion failed for job %s", job_dir.name)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1701,9 +1679,9 @@ async def start_report_4_upload_job(
     job_id = uuid.uuid4().hex
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = job_dir / Path(raw_ide_workbook.filename).name
-    previous_path = job_dir / Path(previous_ide_workbook.filename).name
-    collabs_path = job_dir / Path(collabs_csv.filename).name
+    raw_path = _job_input_path(job_dir, "raw-ide", raw_ide_workbook.filename)
+    previous_path = _job_input_path(job_dir, "ide-reference", previous_ide_workbook.filename)
+    collabs_path = _job_input_path(job_dir, "collabs", collabs_csv.filename)
 
     try:
         await _save_upload_file(raw_ide_workbook, raw_path)
@@ -1760,6 +1738,7 @@ async def start_pipeline_upload_job(
     log_update_status: UploadFile = File(...),
     previous_ongoing_workbook: UploadFile = File(...),
     previous_iphone_workbook: UploadFile = File(...),
+    job_id: str | None = Form(default=None),
     refresh_template: bool = Form(default=True),
     ongoing_with_pivot: bool = Form(default=False),
 ) -> dict[str, object]:
@@ -1774,17 +1753,30 @@ async def start_pipeline_upload_job(
     if not previous_iphone_workbook.filename or not previous_iphone_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_iphone_workbook must be a .xlsx file.")
 
-    job_id = uuid.uuid4().hex
+    if job_id:
+        try:
+            job_id = uuid.UUID(job_id).hex
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="job_id must be a valid UUID.") from exc
+    else:
+        job_id = uuid.uuid4().hex
+
+    with PIPELINE_JOBS_LOCK:
+        if job_id in PIPELINE_JOBS:
+            raise HTTPException(status_code=409, detail="Pipeline job already exists.")
+        PIPELINE_JOBS[job_id] = {
+            "status": "uploading",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+        }
+
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    input_dir = job_dir / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-
-    raw_path = input_dir / Path(raw_data.filename).name
-    daily_reference_path = input_dir / Path(yesterday_cleaned_data.filename).name
-    log_path = input_dir / Path(log_update_status.filename).name
-    previous_ongoing_path = input_dir / Path(previous_ongoing_workbook.filename).name
-    previous_iphone_path = input_dir / Path(previous_iphone_workbook.filename).name
+    raw_path = _job_input_path(job_dir, "raw-data", raw_data.filename)
+    daily_reference_path = _job_input_path(job_dir, "daily-reference", yesterday_cleaned_data.filename)
+    log_path = _job_input_path(job_dir, "log-update", log_update_status.filename)
+    previous_ongoing_path = _job_input_path(job_dir, "ongoing-reference", previous_ongoing_workbook.filename)
+    previous_iphone_path = _job_input_path(job_dir, "iphone-reference", previous_iphone_workbook.filename)
     output_dir = (job_dir / "pipeline-output").resolve()
     pipeline_zip_path = (job_dir / "daily-pipeline-output.zip").resolve()
 
@@ -1796,12 +1788,17 @@ async def start_pipeline_upload_job(
         await _save_upload_file(previous_iphone_workbook, previous_iphone_path)
     except Exception as exc:
         logger.exception("Pipeline upload save failed for job %s", job_id)
+        _set_pipeline_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     with PIPELINE_JOBS_LOCK:
-        PIPELINE_JOBS[job_id] = {
+        PIPELINE_JOBS[job_id].update({
             "status": "queued",
-            "created_at": _now_seconds(),
             "updated_at": _now_seconds(),
             "raw_data_filename": raw_path.name,
             "yesterday_cleaned_data_filename": daily_reference_path.name,
@@ -1811,7 +1808,7 @@ async def start_pipeline_upload_job(
             "filename": pipeline_zip_path.name,
             "refresh_template": refresh_template,
             "ongoing_with_pivot": ongoing_with_pivot,
-        }
+        })
 
     PIPELINE_EXECUTOR.submit(
         _run_pipeline_upload_job,
@@ -1868,15 +1865,12 @@ async def convert_pipeline_upload(
 
     job_dir = (APP_ROOT / API_WORK_DIR / uuid.uuid4().hex).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
-    input_dir = job_dir / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-
-    raw_path = input_dir / Path(raw_data.filename).name
-    daily_reference_path = input_dir / Path(yesterday_cleaned_data.filename).name
-    log_path = input_dir / Path(log_update_status.filename).name
-    previous_ongoing_path = input_dir / Path(previous_ongoing_workbook.filename).name
-    previous_iphone_path = input_dir / Path(previous_iphone_workbook.filename).name
-    conversion_output_dir = (APP_ROOT / PIPELINE_CONVERSION_OUTPUT_DIR).resolve()
+    raw_path = _job_input_path(job_dir, "raw-data", raw_data.filename)
+    daily_reference_path = _job_input_path(job_dir, "daily-reference", yesterday_cleaned_data.filename)
+    log_path = _job_input_path(job_dir, "log-update", log_update_status.filename)
+    previous_ongoing_path = _job_input_path(job_dir, "ongoing-reference", previous_ongoing_workbook.filename)
+    previous_iphone_path = _job_input_path(job_dir, "iphone-reference", previous_iphone_workbook.filename)
+    conversion_output_dir = (job_dir / "pipeline-output").resolve()
     pipeline_zip_path = job_dir / "daily-pipeline-output.zip"
 
     try:

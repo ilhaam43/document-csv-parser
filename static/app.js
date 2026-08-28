@@ -119,6 +119,19 @@ async function waitForJob(statusUrl) {
   }
 }
 
+const jobMonitor = window.createPersistentJobMonitor({
+  storageKey: "document-csv-parser:report-1-active-job",
+  statusPrefix: "/jobs/report-1/",
+  button,
+  statusBox,
+  downloadLink,
+  processingStage,
+  formatDuration,
+  waitForJob,
+  successMessage: (payload) => `Generated ${payload.filename} in ${formatDuration(payload.elapsed_seconds)}.`,
+  fallbackError: "Conversion failed.",
+});
+
 fetch("/health")
   .then((response) => (response.ok ? response.json() : Promise.reject()))
   .then(() => {
@@ -130,16 +143,7 @@ fetch("/health")
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  downloadLink.classList.remove("visible");
-  downloadLink.removeAttribute("href");
-  statusBox.className = "status-box";
-  button.disabled = true;
-
-  const started = Date.now();
-  const timer = window.setInterval(() => {
-    const seconds = Math.round((Date.now() - started) / 1000);
-    statusBox.textContent = `${processingStage(seconds)}... ${formatDuration(seconds)}`;
-  }, 1000);
+  const started = jobMonitor.startSubmission();
 
   try {
     const body = new FormData(form);
@@ -149,18 +153,8 @@ form.addEventListener("submit", async (event) => {
       method: "POST",
       body,
     });
-    statusBox.textContent = `Job queued. Processing ${queued.filename}...`;
-    const payload = await waitForJob(queued.status_url);
-
-    statusBox.className = "status-box ok";
-    statusBox.textContent = `Generated ${payload.filename} in ${formatDuration(payload.elapsed_seconds)}.`;
-    downloadLink.href = payload.download_url;
-    downloadLink.classList.add("visible");
+    await jobMonitor.trackQueuedJob(queued, started);
   } catch (error) {
-    statusBox.className = "status-box bad";
-    statusBox.textContent = error.message || "Conversion failed.";
-  } finally {
-    window.clearInterval(timer);
-    button.disabled = false;
+    jobMonitor.fail(error);
   }
 });

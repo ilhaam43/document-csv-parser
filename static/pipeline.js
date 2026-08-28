@@ -3,6 +3,64 @@ const button = document.getElementById("submit-button");
 const statusBox = document.getElementById("status-box");
 const downloadLink = document.getElementById("download-link");
 const health = document.getElementById("health");
+const activeJobStorageKey = "document-csv-parser:pipeline-active-job";
+let progressTimer = null;
+let pageIsUnloading = false;
+
+window.addEventListener("pagehide", () => {
+  pageIsUnloading = true;
+  stopProgressTimer();
+});
+
+function loadActiveJob() {
+  try {
+    const value = window.localStorage.getItem(activeJobStorageKey);
+    if (!value) {
+      return null;
+    }
+
+    const job = JSON.parse(value);
+    if (
+      typeof job.statusUrl !== "string" ||
+      !job.statusUrl.startsWith("/jobs/pipeline/") ||
+      !Number.isFinite(job.startedAt)
+    ) {
+      window.localStorage.removeItem(activeJobStorageKey);
+      return null;
+    }
+    return job;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function saveActiveJob(job) {
+  try {
+    window.localStorage.setItem(activeJobStorageKey, JSON.stringify(job));
+  } catch (_error) {
+    // Polling still works in the current page when storage is unavailable.
+  }
+}
+
+function clearActiveJob() {
+  try {
+    window.localStorage.removeItem(activeJobStorageKey);
+  } catch (_error) {
+    // Nothing else is required when storage is unavailable.
+  }
+}
+
+function createJobId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID().replaceAll("-", "");
+  }
+
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
 
 function formatDuration(totalSeconds) {
   const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
@@ -31,6 +89,26 @@ function processingStage(seconds) {
   }
 
   return "Packaging output ZIP";
+}
+
+function startProgressTimer(startedAt) {
+  if (progressTimer !== null) {
+    window.clearInterval(progressTimer);
+  }
+
+  const updateProgress = () => {
+    const seconds = Math.round((Date.now() - startedAt) / 1000);
+    statusBox.textContent = `${processingStage(seconds)}... ${formatDuration(seconds)}`;
+  };
+  updateProgress();
+  progressTimer = window.setInterval(updateProgress, 1000);
+}
+
+function stopProgressTimer() {
+  if (progressTimer !== null) {
+    window.clearInterval(progressTimer);
+    progressTimer = null;
+  }
 }
 
 class TransientGatewayError extends Error {
@@ -78,7 +156,9 @@ async function fetchJson(url, options = {}) {
   });
   const payload = await readJsonResponse(response);
   if (!response.ok) {
-    throw new Error(payload.detail || payload.error || `Request failed: HTTP ${response.status}`);
+    const error = new Error(payload.detail || payload.error || `Request failed: HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -86,6 +166,7 @@ async function fetchJson(url, options = {}) {
 async function waitForJob(statusUrl) {
   const startedAt = Date.now();
   let transientFailures = 0;
+  const registrationGracePeriodMs = 10 * 60 * 1000;
 
   while (true) {
     let payload;
@@ -94,10 +175,13 @@ async function waitForJob(statusUrl) {
       transientFailures = 0;
     } catch (error) {
       const retryWindowMs = 60 * 60 * 1000;
+      const waitingForRegistration =
+        error.status === 404 && Date.now() - startedAt < registrationGracePeriodMs;
       const canRetry =
-        error instanceof TransientGatewayError &&
-        Date.now() - startedAt < retryWindowMs &&
-        transientFailures < 240;
+        waitingForRegistration ||
+        (error instanceof TransientGatewayError &&
+          Date.now() - startedAt < retryWindowMs &&
+          transientFailures < 240);
 
       if (!canRetry) {
         throw error;
@@ -119,6 +203,34 @@ async function waitForJob(statusUrl) {
   }
 }
 
+async function monitorActiveJob(job) {
+  button.disabled = true;
+  downloadLink.classList.remove("visible");
+  downloadLink.removeAttribute("href");
+  statusBox.className = "status-box";
+  startProgressTimer(job.startedAt);
+
+  try {
+    const payload = await waitForJob(job.statusUrl);
+    stopProgressTimer();
+    statusBox.className = "status-box ok";
+    statusBox.textContent = `Generated ${payload.output_files.join(", ")} in ${formatDuration(payload.elapsed_seconds)}.`;
+    downloadLink.href = payload.download_url;
+    downloadLink.classList.add("visible");
+  } catch (error) {
+    if (!pageIsUnloading) {
+      clearActiveJob();
+      stopProgressTimer();
+      statusBox.className = "status-box bad";
+      statusBox.textContent = error.message || "Pipeline failed.";
+    }
+  } finally {
+    if (!pageIsUnloading) {
+      button.disabled = false;
+    }
+  }
+}
+
 fetch("/health")
   .then((response) => (response.ok ? response.json() : Promise.reject()))
   .then(() => {
@@ -136,13 +248,18 @@ form.addEventListener("submit", async (event) => {
   button.disabled = true;
 
   const started = Date.now();
-  const timer = window.setInterval(() => {
-    const seconds = Math.round((Date.now() - started) / 1000);
-    statusBox.textContent = `${processingStage(seconds)}... ${formatDuration(seconds)}`;
-  }, 1000);
+  const jobId = createJobId();
+  const activeJob = {
+    statusUrl: `/jobs/pipeline/${jobId}`,
+    startedAt: started,
+    filename: "daily-pipeline-output.zip",
+  };
+  saveActiveJob(activeJob);
+  startProgressTimer(started);
 
   try {
     const body = new FormData(form);
+    body.set("job_id", jobId);
     body.set("refresh_template", document.getElementById("refresh_template").checked ? "true" : "false");
     body.set("ongoing_with_pivot", document.getElementById("ongoing_with_pivot").checked ? "true" : "false");
 
@@ -150,18 +267,28 @@ form.addEventListener("submit", async (event) => {
       method: "POST",
       body,
     });
-    statusBox.textContent = `Job queued. Processing ${queued.filename}...`;
-    const payload = await waitForJob(queued.status_url);
-
-    statusBox.className = "status-box ok";
-    statusBox.textContent = `Generated ${payload.output_files.join(", ")} in ${formatDuration(payload.elapsed_seconds)}.`;
-    downloadLink.href = payload.download_url;
-    downloadLink.classList.add("visible");
+    activeJob.statusUrl = queued.status_url;
+    activeJob.filename = queued.filename;
+    saveActiveJob(activeJob);
+    await monitorActiveJob(activeJob);
   } catch (error) {
-    statusBox.className = "status-box bad";
-    statusBox.textContent = error.message || "Pipeline failed.";
+    if (!pageIsUnloading) {
+      clearActiveJob();
+      stopProgressTimer();
+      statusBox.className = "status-box bad";
+      statusBox.textContent = error.message || "Pipeline failed.";
+    }
   } finally {
-    window.clearInterval(timer);
-    button.disabled = false;
+    stopProgressTimer();
+    if (!pageIsUnloading) {
+      button.disabled = false;
+    }
   }
 });
+
+downloadLink.addEventListener("click", clearActiveJob);
+
+const activeJob = loadActiveJob();
+if (activeJob) {
+  monitorActiveJob(activeJob);
+}

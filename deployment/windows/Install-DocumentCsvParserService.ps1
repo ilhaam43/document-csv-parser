@@ -122,7 +122,7 @@ if (-not $SkipFirewall) {
 }
 
 $nssm = Resolve-Executable -Command $NssmPath
-$pythonArgs = "-m uvicorn app:app --host 0.0.0.0 --port $Port --proxy-headers --forwarded-allow-ips=*"
+$pythonArgs = "-m uvicorn app:app --host 0.0.0.0 --port $Port --workers 1 --proxy-headers --forwarded-allow-ips=*"
 $stdoutLog = Join-Path $AppPath "logs\service-out.log"
 $stderrLog = Join-Path $AppPath "logs\service-error.log"
 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue

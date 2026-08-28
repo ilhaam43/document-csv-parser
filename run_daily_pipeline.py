@@ -13,6 +13,8 @@ from pathlib import Path
 import csv_to_excel
 import csv_to_excel_on_going
 import generate_iphone_tracking
+from excel_automation_lock import excel_process_lock
+from pipeline_stage_runner import run_daily_stage, run_iphone_stage, run_ongoing_stage
 
 
 def require_file(path: Path, label: str) -> Path:
@@ -57,20 +59,12 @@ def convert_daily_tracking(
     output_path: Path,
     skip_template_refresh: bool,
 ) -> Path:
-    options = csv_to_excel.ConvertOptions(
-        output=output_path,
-        delimiter=None,
-        encoding=None,
-        normalize_headers=True,
-        keep_empty=False,
-        drop_empty_columns=False,
-        dedupe=False,
-        infer_types=False,
-        combine=False,
+    run_daily_stage(
+        data_order_csv,
+        daily_reference_workbook,
+        output_path,
         refresh_template=not skip_template_refresh,
-        lookup_workbook=daily_reference_workbook,
     )
-    csv_to_excel.convert_one(data_order_csv, output_path, options)
     return output_path
 
 
@@ -85,12 +79,20 @@ def convert_ongoing_tracking(
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    temp_context = None
-    if keep_temp:
-        temp_dir = Path(tempfile.mkdtemp(prefix="daily_pipeline_ongoing_", dir=output_path.parent))
-    else:
-        temp_context = tempfile.TemporaryDirectory(prefix="daily_pipeline_ongoing_", dir=output_path.parent)
-        temp_dir = Path(temp_context.name)
+    if not keep_temp:
+        run_ongoing_stage(
+            daily_tracking_workbook,
+            log_update_csv,
+            ongoing_reference_workbook,
+            output_path,
+            with_pivot,
+            aging_date,
+        )
+        return output_path
+
+    # Debug mode retains the historical in-process temporary directory so its
+    # intermediate workbook can be inspected after a failure.
+    temp_dir = Path(tempfile.mkdtemp(prefix="daily_pipeline_ongoing_", dir=output_path.parent))
     try:
         validate_dir = temp_dir / "validate"
         validate_dir.mkdir(parents=True, exist_ok=True)
@@ -110,10 +112,7 @@ def convert_ongoing_tracking(
         )
         shutil.copy2(temp_output, output_path)
     finally:
-        if keep_temp:
-            print(f"[info] Kept ongoing temp directory: {temp_dir}")
-        elif temp_context is not None:
-            temp_context.cleanup()
+        print(f"[info] Kept ongoing temp directory: {temp_dir}")
 
     return output_path
 
@@ -123,7 +122,7 @@ def convert_iphone_tracking(
     iphone_reference_workbook: Path,
     output_path: Path,
 ) -> Path:
-    generate_iphone_tracking.generate_iphone_tracking(
+    run_iphone_stage(
         daily_tracking_workbook,
         iphone_reference_workbook,
         output_path,
@@ -199,9 +198,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
-
+def _main_locked(args: argparse.Namespace) -> int:
     try:
         data_order_csv = resolve_file_or_newest(args.data_order, "*.csv", "DataOrder")
         daily_reference = resolve_file_or_newest(args.daily_reference, "*.xlsx", "Daily Tracking reference")
@@ -264,6 +261,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    try:
+        with excel_process_lock(60 * 60):
+            return _main_locked(args)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
