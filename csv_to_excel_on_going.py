@@ -44,6 +44,7 @@ RANGE_AGING_PRE_INSTALLATION_HEADER = "Range Aging on Pre-Installation"
 EXCEL_RED_FONT_COLOR = "FF0000"
 EXCEL_YELLOW_HEADER_FILL = "FFFF00"
 EXCEL_ON_PROGRESS_TAB_COLOR = 15128749  # RGB(173,216,230) light blue for Excel COM
+DEFAULT_ON_PROGRESS_PIVOT_STYLE = "PivotStyleLight16"
 
 NULL_LIKE_VALUES = {"", "na", "n/a", "null", "none", "nan", "-", "(blank)"}
 COMMON_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin1")
@@ -1110,6 +1111,19 @@ def find_on_progress_pivot(progress_sheet, preferred_name: str, fallback_positio
     return None
 
 
+def resolve_on_progress_pivot_style(progress_sheet, preferred_pivot_names: list[str]) -> str:
+    """Use the template's existing PivotTable style when rebuilding a progress pivot."""
+    for pivot_name in preferred_pivot_names:
+        try:
+            style_name = str(progress_sheet.PivotTables(pivot_name).TableStyle2 or "").strip()
+        except Exception:
+            continue
+        if style_name:
+            return style_name
+
+    return DEFAULT_ON_PROGRESS_PIVOT_STYLE
+
+
 def enforce_on_progress_row_label_filters(progress_sheet, reference_date: date) -> None:
     month_name = reference_date.strftime("%B")
     target_not_yet = "Target Not Yet Inputted"
@@ -1878,6 +1892,7 @@ def update_on_progress_sheet_pivots_via_com(
         top_candidates.sort()
         top_pivot_names = [name for _, _, name in top_candidates[:2]]
         top_pivot_count = len(top_pivot_names)
+        progress_pivot_style = resolve_on_progress_pivot_style(progress_sheet, top_pivot_names)
         target_row_field_name = resolve_top_pivot_row_field_for_reference_date(data_sheet, reference_date)
         for top_name in top_pivot_names:
             pt = progress_sheet.PivotTables(top_name)
@@ -2029,7 +2044,7 @@ def update_on_progress_sheet_pivots_via_com(
                 pass
 
         try:
-            third_pivot.TableStyle2 = "PivotStyleMedium2"
+            third_pivot.TableStyle2 = progress_pivot_style
         except Exception:
             pass
 
@@ -2077,7 +2092,7 @@ def update_on_progress_sheet_pivots_via_com(
                     except Exception:
                         pass
                 try:
-                    third_pivot.TableStyle2 = "PivotStyleMedium2"
+                    third_pivot.TableStyle2 = progress_pivot_style
                 except Exception:
                     pass
                 apply_common_pivot_filters(third_pivot)
