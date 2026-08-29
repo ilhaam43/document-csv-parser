@@ -879,6 +879,20 @@ def _run_pipeline_upload_job(
     )
 
 
+FRONTEND_PAGE_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
+def frontend_page(filename: str) -> FileResponse:
+    return FileResponse(
+        APP_ROOT / "templates" / filename,
+        media_type="text/html",
+        headers=FRONTEND_PAGE_HEADERS,
+    )
+
+
 @app.get("/")
 def home() -> RedirectResponse:
     return RedirectResponse(url="/report-1", status_code=302)
@@ -886,32 +900,32 @@ def home() -> RedirectResponse:
 
 @app.get("/report-1")
 def upload_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "index.html", media_type="text/html")
+    return frontend_page("index.html")
 
 
 @app.get("/report-2")
 def report_2_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "report-2.html", media_type="text/html")
+    return frontend_page("report-2.html")
 
 
 @app.get("/report-3")
 def report_3_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "report-3.html", media_type="text/html")
+    return frontend_page("report-3.html")
 
 
 @app.get("/report-4")
 def report_4_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "report-4.html", media_type="text/html")
+    return frontend_page("report-4.html")
 
 
 @app.get("/pipeline")
 def pipeline_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "pipeline.html", media_type="text/html")
+    return frontend_page("pipeline.html")
 
 
 @app.get("/email-report-1")
 def email_report_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "email-report.html", media_type="text/html")
+    return frontend_page("email-report.html")
 
 
 @app.get("/email-report")
@@ -921,17 +935,17 @@ def legacy_email_report_page() -> RedirectResponse:
 
 @app.get("/email-report-2")
 def email_report_2_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "email-report-2.html", media_type="text/html")
+    return frontend_page("email-report-2.html")
 
 
 @app.get("/email-report-3")
 def email_report_3_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "email-report-3.html", media_type="text/html")
+    return frontend_page("email-report-3.html")
 
 
 @app.get("/email-report-4")
 def email_report_4_page() -> FileResponse:
-    return FileResponse(APP_ROOT / "templates" / "email-report-4.html", media_type="text/html")
+    return frontend_page("email-report-4.html")
 
 
 @app.get("/health")

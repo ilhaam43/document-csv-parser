@@ -4,22 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Report 3 iPhone Parser</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260520-ui">
+  <link rel="stylesheet" href="/static/styles.css?v=20260829-ui-v2">
 </head>
 <body>
   <main>
     <nav class="app-nav" aria-label="Report navigation">
-      <div class="nav-brand">Daily Report Generator</div>
+      <a class="nav-brand" href="/report-1" aria-label="Daily Report Generator home">
+        <span class="brand-mark">DT</span>
+        <span class="brand-copy"><strong>Daily Report</strong><small>Workbook Generator</small></span>
+      </a>
       <div class="nav-links">
         <a class="nav-link" href="/report-1">Report 1</a>
         <a class="nav-link" href="/report-2">Report 2</a>
         <a class="nav-link active" href="/report-3">Report 3</a>
         <a class="nav-link" href="/report-4">Report 4</a>
         <a class="nav-link" href="/pipeline">Pipeline</a>
-        <a class="nav-link" href="/email-report-1">Email Report 1</a>
-        <a class="nav-link" href="/email-report-2">Email Report 2</a>
-        <a class="nav-link" href="/email-report-3">Email Report 3</a>
-        <a class="nav-link" href="/email-report-4">Email Report 4</a>
+        <details class="nav-menu">
+          <summary class="nav-menu-trigger">Email tools</summary>
+          <div class="nav-menu-popover">
+            <a class="nav-link" href="/email-report-1">Email Report 1</a>
+            <a class="nav-link" href="/email-report-2">Email Report 2</a>
+            <a class="nav-link" href="/email-report-3">Email Report 3</a>
+            <a class="nav-link" href="/email-report-4">Email Report 4</a>
+          </div>
+        </details>
       </div>
     </nav>
 
@@ -58,7 +66,7 @@
           <h2>Status</h2>
           <p>Conversion progress and download link.</p>
         </div>
-        <div id="status-box" class="status-box">Ready.</div>
+        <div id="status-box" class="status-box" role="status" aria-live="polite">Ready.</div>
         <a id="download-link" class="download" href="#">Download Workbook</a>
       </aside>
     </div>
