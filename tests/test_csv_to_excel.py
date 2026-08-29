@@ -13,11 +13,32 @@ from csv_to_excel import (
     TARGET_SO_COMPLETE_DATE_HEADERS,
     add_pivot_template_compatibility_columns,
     apply_previous_target_date_fallback,
+    ensure_percentage_completion_column_widths,
     target_header_month_name,
 )
 
 
 class ReportOneBusinessRuleTests(unittest.TestCase):
+    def test_percentage_column_width_is_enforced_after_pivot_refresh(self) -> None:
+        percentage_header = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+
+        class Worksheet:
+            def __init__(self) -> None:
+                self.widths = {column: SimpleNamespace(ColumnWidth=10.0) for column in range(4, 20)}
+
+            def Cells(self, row: int, column: int):
+                value = percentage_header if (row, column) == (114, 10) else None
+                return SimpleNamespace(Value=value)
+
+            def Columns(self, column: int):
+                return self.widths[column]
+
+        worksheet = Worksheet()
+        ensure_percentage_completion_column_widths(worksheet)
+
+        self.assertEqual(worksheet.widths[10].ColumnWidth, 22.0)
+        self.assertEqual(worksheet.widths[9].ColumnWidth, 10.0)
+
     def test_target_header_month_accepts_short_and_long_year_formats(self) -> None:
         self.assertEqual(target_header_month_name("TARGET  Detemined as 1 Aug 26"), "August")
         self.assertEqual(target_header_month_name("TARGET Determined as 1 August 2026"), "August")

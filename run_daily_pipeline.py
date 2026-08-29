@@ -53,6 +53,10 @@ def default_iphone_output_path(output_dir: Path, daily_tracking_output: Path) ->
     return output_dir / generate_iphone_tracking.default_output_path(daily_tracking_output).name
 
 
+def default_ongoing_aging_date(daily_tracking_output: Path) -> date:
+    return csv_to_excel_on_going.reference_date_from_tracking_workbook_path(daily_tracking_output)
+
+
 def convert_daily_tracking(
     data_order_csv: Path,
     daily_reference_workbook: Path,
@@ -188,7 +192,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--ongoing-aging-date",
         type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(),
         default=None,
-        help="Date used to calculate ongoing Pre-Installation Aging. Defaults to today's date.",
+        help="Date used to calculate ongoing Pre-Installation Aging. Defaults to the generated report date.",
     )
     parser.add_argument(
         "--keep-temp",
@@ -240,7 +244,7 @@ def _main_locked(args: argparse.Namespace) -> int:
                     ongoing_output,
                     args.ongoing_with_pivot,
                     args.keep_temp,
-                    args.ongoing_aging_date or date.today(),
+                    args.ongoing_aging_date or default_ongoing_aging_date(daily_output),
                 )
             )
         else:

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 from charset_normalizer import from_path
+from excel_pivot_layout import resize_dynamic_pivot_section_banners
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -689,6 +690,19 @@ def synchronize_dynamic_headers_on_com_sheet(target_ws, target_table_cols: int, 
             target_ws.Cells(1, column_index).Value = phase_header
 
 
+def canonical_sales_hierarchy_header_key(header_value: object) -> str:
+    normalized = normalize_header_key(header_value)
+    return "divisionsales" if normalized == "column1" else normalized
+
+
+def preserve_or_set_on_progress_tab_color(worksheet) -> None:
+    try:
+        if worksheet.Tab.Color in (None, False, 0):
+            worksheet.Tab.Color = EXCEL_ON_PROGRESS_TAB_COLOR
+    except Exception:
+        pass
+
+
 def apply_sales_hierarchy_header_style_on_com_sheet(worksheet) -> None:
     header_labels = {
         "groupsales": "group_sales",
@@ -707,7 +721,7 @@ def apply_sales_hierarchy_header_style_on_com_sheet(worksheet) -> None:
         return
 
     for column_index, header_value in enumerate(headers, start=1):
-        normalized = normalize_header_key(header_value)
+        normalized = canonical_sales_hierarchy_header_key(header_value)
         replacement = header_labels.get(normalized)
         if replacement is None:
             continue
@@ -1692,6 +1706,20 @@ def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date 
     phase_start = time.perf_counter()
     normalize_percentage_block_formatting(pivot_sheet)
     profile_log("normalize percentage formatting", phase_start)
+    phase_start = time.perf_counter()
+    resize_dynamic_pivot_section_banners(
+        pivot_sheet,
+        title_markers=(
+            "target order on going process",
+            "delay completion",
+            "target after",
+            "all target order",
+            "target not inputted",
+            "order aging start from pre-installation",
+        ),
+        side_header_markers=("percentage of order on going from pre-installation to uat",),
+    )
+    profile_log("resize pivot section banners", phase_start)
 
 
 def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) -> bool:
@@ -1743,9 +1771,9 @@ def refresh_reporting_sheets_fast_in_workbook(workbook, reference_date: date) ->
     try:
         if progress_sheet.Name != target_progress_name:
             progress_sheet.Name = target_progress_name
-        progress_sheet.Tab.Color = EXCEL_ON_PROGRESS_TAB_COLOR
     except Exception:
         pass
+    preserve_or_set_on_progress_tab_color(progress_sheet)
 
     try:
         phase_start = time.perf_counter()
@@ -1876,10 +1904,7 @@ def update_on_progress_sheet_pivots_via_com(
         if progress_sheet.Name != target_progress_name:
             progress_sheet.Name = target_progress_name
 
-        try:
-            progress_sheet.Tab.Color = EXCEL_ON_PROGRESS_TAB_COLOR
-        except Exception:
-            pass
+        preserve_or_set_on_progress_tab_color(progress_sheet)
 
         pivot_tables = progress_sheet.PivotTables()
         top_candidates = []
@@ -2679,10 +2704,10 @@ def apply_logic_to_workbook_com(
 
                 for target_col in range(1, target_table_cols + 1):
                     target_header_value = target_headers[target_col - 1] if target_col - 1 < len(target_headers) else ""
-                    target_key = normalize_header_key(target_header_value)
+                    target_key = canonical_sales_hierarchy_header_key(target_header_value)
                     source_col = source_header_to_col.get(target_key)
-                    if source_col is None and target_key == "divisionsales":
-                        source_col = source_header_to_col.get("column1")
+                    if source_col is None:
+                        source_col = source_header_model_by_target_key.get(target_key)
                     if source_col is None and is_target_determined_header(target_header_value):
                         source_col = source_target_determined_col
                     if source_col is None:

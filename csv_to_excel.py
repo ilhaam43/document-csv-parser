@@ -80,6 +80,7 @@ EXCEL_YELLOW_HEADER_FILL = "FFFF00"
 EXCEL_HEADER_ROW_HEIGHT_POINTS = 22.5
 EXCEL_ON_PROGRESS_TAB_COLOR = "ADD8E6"
 EXCEL_PIVOT_TAB_COLOR = "FFFF00"
+MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH = 22.0
 VLOOKUP_SHEET_NAME = "ALL ORDER"
 ON_PROGRESS_SHEET_PREFIX = "ALL ORDER ON PROGRESS"
 PIVOT_SHEET_NAME = "PIVOT"
@@ -1605,6 +1606,28 @@ def resize_pivot_section_banners(pivot_sheet) -> None:
                 border.Color = color
 
 
+def ensure_percentage_completion_column_widths(pivot_sheet) -> None:
+    percentage_header_key = normalize_header_key(
+        "Percentage of Completion (SO Complete, Cancel & Change Target)"
+    )
+    for header_row in (9, 114, 377):
+        for column_index in range(4, 20):
+            try:
+                header_value = pivot_sheet.Cells(header_row, column_index).Value
+            except Exception:
+                continue
+            if normalize_header_key(header_value) != percentage_header_key:
+                continue
+
+            try:
+                column = pivot_sheet.Columns(column_index)
+                if float(column.ColumnWidth) < MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH:
+                    column.ColumnWidth = MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH
+            except Exception:
+                pass
+            break
+
+
 def add_pivot_sheet_via_com(
     output_path: Path,
     source_workbook_path: Path,
@@ -2149,6 +2172,7 @@ def add_pivot_sheet_via_com(
         _write_side_percentage(pt9, 3, "C", "source_non_new")
         _write_side_percentage(pt10, 2, "C", "target_after")
         _format_percentage_completion_columns()
+        ensure_percentage_completion_column_widths(pivot_sheet)
         resize_pivot_section_banners(pivot_sheet)
 
         target_wb.Save()
@@ -3405,14 +3429,17 @@ def update_template_workbook_via_com(
                     file=sys.stderr,
                 )
 
-        _format_percentage_completion_columns()
-        resize_pivot_section_banners(pivot_sheet)
-        _profile("refresh PIVOT sheet pivots")
-
         if progress_sheet is not None:
             on_progress_cache = pivot_sheet.PivotTables()(1).PivotCache()
             _add_on_progress_pivots(on_progress_cache)
         _profile("build ALL ORDER ON PROGRESS pivots")
+
+        # Refreshing another PivotTable from the shared cache can auto-fit
+        # PIVOT columns again, so presentation must be the final pivot pass.
+        _format_percentage_completion_columns()
+        ensure_percentage_completion_column_widths(pivot_sheet)
+        resize_pivot_section_banners(pivot_sheet)
+        _profile("finalize PIVOT presentation")
 
         if target_after_percentage_format_sheet is not None:
             try:

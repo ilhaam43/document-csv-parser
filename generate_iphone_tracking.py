@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from excel_pivot_layout import resize_dynamic_pivot_section_banners
+
 
 ALL_ORDER_SHEET_NAME = "ALL ORDER"
 IPHONE_SHEET_NAME = "ALL ORDER IPHONE"
@@ -827,6 +829,7 @@ def capture_percentage_completion_formats(workbook, xl):
     format_sources = {}
     column_widths = {}
     formula_offsets = {}
+    grand_total_format_offsets = {}
     for header_row in (9, 56, 167):
         percentage_col = header_column(pivot_sheet, header_row, PERCENTAGE_COMPLETION_HEADER)
         if percentage_col is None:
@@ -856,8 +859,12 @@ def capture_percentage_completion_formats(workbook, xl):
             for offset in formula_column_offsets(str(pivot_sheet.Cells(header_row + 1, percentage_col).FormulaR1C1))
             if percentage_col + offset != 3
         ]
+        grand_total_format_offsets[header_row] = max(
+            2,
+            contiguous_left_pivot_last_row(pivot_sheet, header_row) - header_row + 1,
+        )
 
-    return format_sheet, format_sources, column_widths, formula_offsets
+    return format_sheet, format_sources, column_widths, formula_offsets, grand_total_format_offsets
 
 
 def clear_stale_percentage_completion_columns(workbook) -> None:
@@ -886,6 +893,7 @@ def repair_percentage_completion_columns(
     format_sources=None,
     column_widths=None,
     formula_offsets=None,
+    grand_total_format_offsets=None,
 ) -> None:
     pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
     if pivot_sheet is None:
@@ -894,6 +902,7 @@ def repair_percentage_completion_columns(
     format_sources = format_sources or {}
     column_widths = column_widths or {}
     formula_offsets = formula_offsets or {}
+    grand_total_format_offsets = grand_total_format_offsets or {}
 
     for header_row in (9, 56, 167):
         so_col = header_column(pivot_sheet, header_row, "SO Complete")
@@ -922,6 +931,14 @@ def repair_percentage_completion_columns(
                     pivot_sheet.Cells(data_row_end, column_index),
                 ).Clear()
 
+        try:
+            pivot_sheet.Range(
+                pivot_sheet.Cells(header_row, formula_col),
+                pivot_sheet.Cells(header_row + 79, formula_col),
+            ).Clear()
+        except Exception:
+            pass
+
         pivot_sheet.Cells(header_row, formula_col).Value = PERCENTAGE_COMPLETION_HEADER
         formula_letter = column_letter(formula_col)
         source_offsets = formula_offsets.get(header_row) or [-1, 1]
@@ -938,11 +955,25 @@ def repair_percentage_completion_columns(
         format_source = format_sources.get(header_row)
         if format_source is not None:
             try:
-                format_source.Copy()
-                pivot_sheet.Range(
-                    pivot_sheet.Cells(header_row, formula_col),
-                    pivot_sheet.Cells(header_row + 79, formula_col),
-                ).PasteSpecial(Paste=-4122)  # xlPasteFormats
+                format_source.Cells(1, 1).Copy()
+                pivot_sheet.Cells(header_row, formula_col).PasteSpecial(Paste=-4122)  # xlPasteFormats
+
+                body_last_row = data_row_end - 1
+                if body_last_row >= data_row_start:
+                    format_source.Cells(2, 1).Copy()
+                    body_range = pivot_sheet.Range(
+                        pivot_sheet.Cells(data_row_start, formula_col),
+                        pivot_sheet.Cells(body_last_row, formula_col),
+                    )
+                    body_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
+                    body_range.Borders(12).LineStyle = -4142  # xlInsideHorizontal / xlLineStyleNone
+
+                grand_total_offset = min(
+                    max(grand_total_format_offsets.get(header_row, 2), 2),
+                    int(format_source.Rows.Count),
+                )
+                format_source.Cells(grand_total_offset, 1).Copy()
+                pivot_sheet.Cells(data_row_end, formula_col).PasteSpecial(Paste=-4122)  # xlPasteFormats
                 xl.CutCopyMode = False
             except Exception:
                 pass
@@ -999,7 +1030,13 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             raise ValueError("Input/reference workbook must contain ALL ORDER and ALL ORDER IPHONE sheets.")
 
         phase_start = time.perf_counter()
-        pct_format_sheet, pct_format_sources, pct_column_widths, pct_formula_offsets = (
+        (
+            pct_format_sheet,
+            pct_format_sources,
+            pct_column_widths,
+            pct_formula_offsets,
+            pct_grand_total_format_offsets,
+        ) = (
             capture_percentage_completion_formats(target_wb, xl)
         )
         profile_log("capture percentage formats", phase_start)
@@ -1046,8 +1083,21 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             pct_format_sources,
             pct_column_widths,
             pct_formula_offsets,
+            pct_grand_total_format_offsets,
         )
         profile_log("repair percentage columns", phase_start)
+        phase_start = time.perf_counter()
+        resize_dynamic_pivot_section_banners(
+            target_wb.Worksheets(PIVOT_SHEET_NAME),
+            title_markers=(
+                "target complete",
+                "delay completion",
+                "all target",
+                "target not inputted",
+            ),
+            side_header_markers=(PERCENTAGE_COMPLETION_HEADER,),
+        )
+        profile_log("resize pivot section banners", phase_start)
         phase_start = time.perf_counter()
         apply_column_widths(target_all_order, target_all_order_widths)
         apply_column_widths(target_iphone, target_iphone_widths)
