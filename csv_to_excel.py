@@ -33,6 +33,7 @@ DEFAULT_VLOOKUP_DIR = "vlookup-yesterday"
 TARGET_HEADER_INSERT_AFTER = "Quo"
 TARGET_SOURCE_HEADER = "Target + On Hold Duration"
 MIN_VALID_TARGET_DATE = date(2000, 1, 1)
+MAX_REASONABLE_TARGET_YEARS_AHEAD = 5
 UNKNOWN_YEAR_FAB_UPLOAD = "1900"
 YEAR_FAB_UPLOAD_BLANK_LIKE_VALUES = {"", UNKNOWN_YEAR_FAB_UPLOAD, "nan", "none", "n/a", "(blank)", "null"}
 QUO_EXCLUDE_TERM = "XBOT"
@@ -140,7 +141,19 @@ class LookupMappings:
     division_sales_by_quo: dict[str, str]
     segment_sales: dict[str, str]
     segment_sales_by_quo: dict[str, str]
+    target_so_complete_date: dict[str, str]
     phase_header: str
+
+
+@dataclass(frozen=True)
+class ProgressTemplateState:
+    hidden_year_values: set[str]
+    left_row_order: list[str]
+    right_row_order: list[str]
+    column_widths: dict[int, float]
+    row_heights: dict[int, float]
+    pivot_styles: dict[int, str]
+    tab_color: object | None
 
 
 def detect_encoding(path: Path) -> str:
@@ -246,6 +259,20 @@ def current_target_values(source: pd.Series, reference_date: date) -> pd.Series:
     values[source_months > target_month] = f"After {month_name}"
 
     return values
+
+
+def target_header_month_name(target_header: str) -> str:
+    match = re.search(r"\b1\s+([A-Za-z]+)(?:\s+\d{2,4})?\s*$", target_header, flags=re.IGNORECASE)
+    if not match:
+        return ""
+
+    month_text = match.group(1)
+    for date_format in ("%B", "%b"):
+        try:
+            return datetime.strptime(month_text, date_format).strftime("%B")
+        except ValueError:
+            continue
+    return ""
 
 
 def add_target_header(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
@@ -637,6 +664,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
     division_sales_by_quo_mapping: dict[str, str] = {}
     segment_sales_mapping: dict[str, str] = {}
     segment_sales_by_quo_mapping: dict[str, str] = {}
+    target_so_complete_date_mapping: dict[str, str] = {}
     quo_keys: set[str] = set()
     complete_sales_records: list[dict[str, str]] = []
     complete_sales_record_keys: set[str] = set()
@@ -647,6 +675,12 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         mapping_headers.append(STATUS_HEADER)
     if PROCESS_HEADER in lookup_df.columns:
         mapping_headers.append(PROCESS_HEADER)
+    lookup_target_date_header = next(
+        (header for header in TARGET_SO_COMPLETE_DATE_HEADERS if header in lookup_df.columns),
+        None,
+    )
+    if lookup_target_date_header is not None:
+        mapping_headers.append(lookup_target_date_header)
 
     for _, row in lookup_df[mapping_headers].iterrows():
         pm_value = str(row[PM_HEADER]).strip()
@@ -671,6 +705,12 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         remember_first_mapping(group_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_GROUP_SALES_HEADER))
         remember_first_mapping(division_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_DIVISION_SALES_HEADER))
         remember_first_mapping(segment_sales_by_quo_mapping, quo_value, row_value(row, LOOKUP_SEGMENT_SALES_HEADER))
+        if lookup_target_date_header is not None:
+            remember_first_mapping(
+                target_so_complete_date_mapping,
+                quo_value,
+                row[lookup_target_date_header],
+            )
 
         sales_value = str(row[SALES_HEADER]).strip()
         if sales_value and not pd.isna(row[SALES_HEADER]):
@@ -730,6 +770,7 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         division_sales_by_quo=division_sales_by_quo_mapping,
         segment_sales=segment_sales_mapping,
         segment_sales_by_quo=segment_sales_by_quo_mapping,
+        target_so_complete_date=target_so_complete_date_mapping,
         phase_header=phase_lookup_header(lookup_workbook),
     )
 
@@ -999,6 +1040,45 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
     return result
 
 
+def apply_previous_target_date_fallback(
+    df: pd.DataFrame,
+    mappings: LookupMappings,
+    reference_date: date,
+) -> pd.DataFrame:
+    """Replace implausible future target dates with a valid prior-day value."""
+    if QUO_HEADER not in df.columns or not mappings.target_so_complete_date:
+        return df
+
+    target_date_header = next((header for header in TARGET_SO_COMPLETE_DATE_HEADERS if header in df.columns), None)
+    if target_date_header is None:
+        return df
+
+    result = df.copy()
+    quo_values = result[QUO_HEADER].astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
+    current_dates = pd.to_datetime(result[target_date_header], errors="coerce", format="mixed")
+    previous_values = pd.Series(quo_values.map(mappings.target_so_complete_date), index=result.index, dtype="string")
+    previous_dates = pd.to_datetime(previous_values, errors="coerce", format="mixed")
+    maximum_year = reference_date.year + MAX_REASONABLE_TARGET_YEARS_AHEAD
+
+    implausible_current = current_dates.notna() & current_dates.dt.year.gt(maximum_year)
+    valid_previous = (
+        previous_dates.notna()
+        & previous_dates.dt.year.ge(MIN_VALID_TARGET_DATE.year)
+        & previous_dates.dt.year.le(maximum_year)
+    )
+    fallback_rows = implausible_current & valid_previous
+    if not fallback_rows.any():
+        return result
+
+    result.loc[fallback_rows, target_date_header] = previous_values.loc[fallback_rows]
+    target_header = next((column for column in result.columns if str(column).startswith("TARGET")), None)
+    if target_header is not None:
+        fallback_buckets = current_target_values(previous_dates, reference_date)
+        result.loc[fallback_rows, target_header] = fallback_buckets.loc[fallback_rows]
+
+    return result
+
+
 def write_excel_sheet(
     writer: pd.ExcelWriter,
     df: pd.DataFrame,
@@ -1034,8 +1114,17 @@ def add_pivot_template_compatibility_columns(
         hidden_columns.add(short_target_header)
 
     if SERVICE_DELIVERY_DIV_HEADER in result.columns:
-        result[PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER] = result[SERVICE_DELIVERY_DIV_HEADER]
-        hidden_columns.add(PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER)
+        if PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER in result.columns:
+            existing_values = result[PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER]
+            result[PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER] = existing_values.where(
+                existing_values.notna(),
+                result[SERVICE_DELIVERY_DIV_HEADER],
+            )
+            result = result.drop(columns=[SERVICE_DELIVERY_DIV_HEADER])
+        else:
+            result = result.rename(
+                columns={SERVICE_DELIVERY_DIV_HEADER: PIVOT_TEMPLATE_SERVICE_DELIVERY_DIV_HEADER}
+            )
 
     if phase_header in result.columns:
         if PHASE_HEADER_PREFIX not in result.columns:
@@ -1093,7 +1182,9 @@ def prepare_all_order_dataframe_for_template(
     mappings: LookupMappings,
 ) -> tuple[pd.DataFrame, set[str]]:
     output_df = apply_lookup_values(df, mappings)
-    apply_current_month_process_adjustment_overrides(output_df, reference_date_from_csv_path(csv_path))
+    reference_date = reference_date_from_csv_path(csv_path)
+    output_df = apply_previous_target_date_fallback(output_df, mappings, reference_date)
+    apply_current_month_process_adjustment_overrides(output_df, reference_date)
     output_df = coerce_numeric_columns_for_pivots(output_df)
     target_header = next((column for column in output_df.columns if str(column).startswith("TARGET")), "")
     return add_pivot_template_compatibility_columns(
@@ -1404,6 +1495,114 @@ def add_pivot_tables_via_com(output_path: Path, on_progress_name: str, target_he
                 xl.Quit()
             except Exception:
                 pass
+
+
+def resize_pivot_section_banners(pivot_sheet) -> None:
+    """Resize each yellow PIVOT title band to its current table width."""
+    title_markers = (
+        "target complete",
+        "status order with aging",
+        "delay completion",
+        "target after",
+        "target not inputted",
+    )
+    percentage_marker = "percentage of completion"
+    used_range = pivot_sheet.UsedRange
+    used_values = used_range.Value
+    if not used_values:
+        return
+
+    if not isinstance(used_values, tuple):
+        used_values = ((used_values,),)
+
+    titles: list[tuple[int, int]] = []
+    percentage_columns_by_row: dict[int, list[int]] = {}
+    for row_offset, row_values in enumerate(used_values, start=used_range.Row):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        for column_offset, raw_value in enumerate(row_values, start=used_range.Column):
+            normalized_value = str(raw_value or "").strip().lower()
+            if any(marker in normalized_value for marker in title_markers):
+                titles.append((row_offset, column_offset))
+            if percentage_marker in normalized_value:
+                percentage_columns_by_row.setdefault(row_offset, []).append(column_offset)
+
+    if not titles:
+        return
+
+    pivot_ranges: list[tuple[int, int]] = []
+    for pivot_index in range(1, pivot_sheet.PivotTables().Count + 1):
+        try:
+            table_range = pivot_sheet.PivotTables()(pivot_index).TableRange2
+            pivot_ranges.append(
+                (
+                    int(table_range.Row),
+                    int(table_range.Column + table_range.Columns.Count - 1),
+                )
+            )
+        except Exception:
+            pass
+
+    titles.sort()
+    for title_index, (title_row, title_column) in enumerate(titles):
+        next_title_row = titles[title_index + 1][0] if title_index + 1 < len(titles) else 1_048_577
+        section_end_columns = [
+            end_column
+            for pivot_row, end_column in pivot_ranges
+            if title_row < pivot_row < next_title_row
+        ]
+        for percentage_row, percentage_columns in percentage_columns_by_row.items():
+            if title_row < percentage_row < next_title_row:
+                section_end_columns.extend(percentage_columns)
+        if not section_end_columns:
+            continue
+
+        desired_end_column = max(section_end_columns)
+        title_cell = pivot_sheet.Cells(title_row, title_column)
+        title_text = title_cell.Value
+        merge_area = title_cell.MergeArea if bool(title_cell.MergeCells) else title_cell
+        merge_end_row = int(merge_area.Row + merge_area.Rows.Count - 1)
+        old_end_column = int(merge_area.Column + merge_area.Columns.Count - 1)
+        if old_end_column == desired_end_column:
+            continue
+
+        fill_pattern = merge_area.Interior.Pattern
+        fill_color = merge_area.Interior.Color
+        border_styles = {}
+        for border_index in (7, 8, 9, 10):  # left, top, bottom, right
+            border = merge_area.Borders(border_index)
+            border_styles[border_index] = (
+                border.LineStyle,
+                border.Weight,
+                border.Color,
+            )
+
+        if bool(title_cell.MergeCells):
+            merge_area.UnMerge()
+
+        if old_end_column > desired_end_column:
+            trailing_range = pivot_sheet.Range(
+                pivot_sheet.Cells(title_row, desired_end_column + 1),
+                pivot_sheet.Cells(merge_end_row, old_end_column),
+            )
+            trailing_range.ClearContents()
+            trailing_range.Interior.Pattern = -4142  # xlPatternNone
+            trailing_range.Borders.LineStyle = -4142  # xlLineStyleNone
+
+        new_merge_area = pivot_sheet.Range(
+            pivot_sheet.Cells(title_row, title_column),
+            pivot_sheet.Cells(merge_end_row, desired_end_column),
+        )
+        new_merge_area.Merge()
+        new_merge_area.Value = title_text
+        new_merge_area.Interior.Pattern = fill_pattern
+        new_merge_area.Interior.Color = fill_color
+        for border_index, (line_style, weight, color) in border_styles.items():
+            border = new_merge_area.Borders(border_index)
+            border.LineStyle = line_style
+            if line_style != -4142:
+                border.Weight = weight
+                border.Color = color
 
 
 def add_pivot_sheet_via_com(
@@ -1950,6 +2149,7 @@ def add_pivot_sheet_via_com(
         _write_side_percentage(pt9, 3, "C", "source_non_new")
         _write_side_percentage(pt10, 2, "C", "target_after")
         _format_percentage_completion_columns()
+        resize_pivot_section_banners(pivot_sheet)
 
         target_wb.Save()
         print(f"[info] Added '{PIVOT_SHEET_NAME}' sheet to {output_path.name}")
@@ -2177,12 +2377,6 @@ def update_template_workbook_via_com(
         def _generated_header_caption(header_value: object, template_caption: object | None) -> object:
             current = str(header_value or "").strip()
             normalized_current = normalize_header_key(current)
-            if normalized_current == normalize_header_key(GROUP_SALES_HEADER):
-                return "Group Sales"
-            if normalized_current == normalize_header_key(DIVISION_SALES_HEADER):
-                return "Column1"
-            if normalized_current == normalize_header_key(SEGMENT_SALES_HEADER):
-                return "Segment Sales"
             if template_caption is not None:
                 template = str(template_caption).strip()
                 if normalize_header_key(template) == normalized_current:
@@ -2208,24 +2402,6 @@ def update_template_workbook_via_com(
                         pass
                 return f"{target_match.group(1)}{month_short} {target_match.group(3)[-2:]}"
             return header_value
-
-        def _apply_sales_header_model(sheet, column_count: int) -> None:
-            sales_header_keys = {
-                normalize_header_key("Group Sales"),
-                normalize_header_key("Column1"),
-                normalize_header_key("Segment Sales"),
-                normalize_header_key(SALES_HEADER),
-            }
-            for column_index in range(1, column_count + 1):
-                header_key = normalize_header_key(sheet.Cells(1, column_index).Value)
-                if header_key not in sales_header_keys:
-                    continue
-                try:
-                    sheet.Cells(1, column_index).Interior.Color = 16777215
-                    sheet.Cells(1, column_index).Font.Color = 0
-                    sheet.Cells(1, column_index).Font.Bold = True
-                except Exception:
-                    pass
 
         def _apply_sheet_header_model(sheet, model: dict[str, object], column_count: int) -> None:
             model_sheet = model.get("sheet")
@@ -2275,7 +2451,6 @@ def update_template_workbook_via_com(
                     sheet.Rows(1).RowHeight = row_height
                 except Exception:
                     pass
-            _apply_sales_header_model(sheet, column_count)
 
         def _delete_sheet_header_model(model: dict[str, object]) -> None:
             model_sheet = model.get("sheet")
@@ -2368,10 +2543,14 @@ def update_template_workbook_via_com(
         def _normalized_pivot_item_name(value: object) -> str:
             return str(value).strip().lower()
 
-        def _capture_template_progress_state() -> tuple[set[str], list[str], list[str]]:
+        def _capture_template_progress_state() -> ProgressTemplateState:
             hidden_year_values: set[str] = set()
             left_row_order: list[str] = []
             right_row_order: list[str] = []
+            column_widths: dict[int, float] = {}
+            row_heights: dict[int, float] = {}
+            pivot_styles: dict[int, str] = {}
+            tab_color: object | None = None
 
             def _remember_order(target: list[str], values: list[str]) -> None:
                 for value in values:
@@ -2398,8 +2577,33 @@ def update_template_workbook_via_com(
                 _remember_order(left_row_order, _visible_labels_from_sheet(sheet, 1))
                 _remember_order(right_row_order, _visible_labels_from_sheet(sheet, 4))
 
+                if not column_widths:
+                    for column_index in range(1, 6):
+                        try:
+                            column_widths[column_index] = float(sheet.Columns(column_index).ColumnWidth)
+                        except Exception:
+                            pass
+                    for row_index in range(1, 11):
+                        try:
+                            row_heights[row_index] = float(sheet.Rows(row_index).RowHeight)
+                        except Exception:
+                            pass
+                    try:
+                        captured_tab_color = sheet.Tab.Color
+                        if captured_tab_color is not False:
+                            tab_color = captured_tab_color
+                    except Exception:
+                        pass
+
                 for pivot_index in range(1, sheet.PivotTables().Count + 1):
                     pivot_table = sheet.PivotTables()(pivot_index)
+                    try:
+                        destination_column = int(pivot_table.TableRange2.Column)
+                        style_name = str(pivot_table.TableStyle2 or "").strip()
+                        if style_name:
+                            pivot_styles[destination_column] = style_name
+                    except Exception:
+                        pass
                     try:
                         year_field = pivot_table.PivotFields(YEAR_FAB_UPLOAD_HEADER)
                         for item in year_field.PivotItems():
@@ -2408,7 +2612,15 @@ def update_template_workbook_via_com(
                     except Exception:
                         pass
 
-            return hidden_year_values, left_row_order, right_row_order
+            return ProgressTemplateState(
+                hidden_year_values=hidden_year_values,
+                left_row_order=left_row_order,
+                right_row_order=right_row_order,
+                column_widths=column_widths,
+                row_heights=row_heights,
+                pivot_styles=pivot_styles,
+                tab_color=tab_color,
+            )
 
         def _adapt_progress_row_order(
             template_order: list[str],
@@ -2482,8 +2694,85 @@ def update_template_workbook_via_com(
                 pass
             return changed
 
+        def _is_ongoing_target_summary(pivot_table) -> bool:
+            try:
+                target_field = pivot_table.PivotFields(target_header)
+                visible_items = [
+                    _normalized_pivot_item_name(item.Name)
+                    for item in target_field.PivotItems()
+                    if bool(item.Visible)
+                ]
+            except Exception:
+                return False
+
+            return len(visible_items) == 1 and (
+                visible_items[0].startswith("before ")
+                or visible_items[0] == "target not yet inputted"
+            )
+
+        def _restore_ongoing_phase_filter(pivot_table) -> bool:
+            if not _is_ongoing_target_summary(pivot_table):
+                return False
+
+            active_phase_order = (
+                "00-new",
+                "01-presales",
+                "02-survey",
+                "03-allocation",
+                "04-pre installation",
+                "05-customer preparation",
+                "06-installation",
+                "07-uat on hold",
+            )
+            terminal_phases = {"cancel", "so complete"}
+            changed = False
+            try:
+                field = pivot_table.PivotFields(PHASE_HEADER_PREFIX)
+                field.EnableMultiplePageItems = True
+
+                # Show active phases first so Excel never sees a field with no
+                # visible item while the inherited template filter is repaired.
+                for item in field.PivotItems():
+                    if _normalized_pivot_item_name(item.Name) in terminal_phases:
+                        continue
+                    try:
+                        if not bool(item.Visible):
+                            item.Visible = True
+                            changed = True
+                    except Exception:
+                        pass
+
+                for item in field.PivotItems():
+                    if _normalized_pivot_item_name(item.Name) not in terminal_phases:
+                        continue
+                    try:
+                        if bool(item.Visible):
+                            item.Visible = False
+                            changed = True
+                    except Exception:
+                        pass
+
+                items_by_name = {
+                    _normalized_pivot_item_name(item.Name): item
+                    for item in field.PivotItems()
+                }
+                for position, phase_name in enumerate(active_phase_order, start=1):
+                    item = items_by_name.get(phase_name)
+                    if item is None:
+                        continue
+                    try:
+                        if int(item.Position) != position:
+                            item.Position = position
+                            changed = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return changed
+
         def _restore_template_specific_pivot_filters(pivot_table) -> bool:
             changed = _show_pivot_items_except_excluded_years(pivot_table)
+            changed = _restore_ongoing_phase_filter(pivot_table) or changed
             if str(pivot_table.Name) == "PivotTable13":
                 changed = (
                     _hide_pivot_items(
@@ -2717,7 +3006,10 @@ def update_template_workbook_via_com(
 
         _capture_percentage_formats()
         _profile("capture PIVOT percentage formats")
-        hidden_progress_year_values, template_left_order, template_right_order = _capture_template_progress_state()
+        progress_template_state = _capture_template_progress_state()
+        hidden_progress_year_values = progress_template_state.hidden_year_values
+        template_left_order = progress_template_state.left_row_order
+        template_right_order = progress_template_state.right_row_order
         _profile("capture progress state")
         template_header_model = _capture_sheet_header_model(data_sheet, generated_data_sheet.UsedRange.Columns.Count)
         _profile("capture ALL ORDER header model")
@@ -2751,8 +3043,25 @@ def update_template_workbook_via_com(
             xl_row_field = 1
             xl_tabular_row = 1
             progress_sheet.Cells.Clear()
-            date_match = re.search(r"1\s+([A-Za-z]+)\s+(\d{4})", target_header)
-            month_full = date_match.group(1) if date_match else ""
+            if progress_template_state.tab_color is not None:
+                try:
+                    progress_sheet.Tab.Color = progress_template_state.tab_color
+                except Exception:
+                    pass
+            for column_index, width in progress_template_state.column_widths.items():
+                try:
+                    progress_sheet.Columns(column_index).ColumnWidth = width
+                except Exception:
+                    pass
+            for row_index, height in progress_template_state.row_heights.items():
+                try:
+                    progress_sheet.Rows(row_index).RowHeight = height
+                except Exception:
+                    pass
+
+            month_full = target_header_month_name(target_header)
+            if not month_full:
+                raise RuntimeError(f"Could not determine report month from target header: {target_header}")
             target_month_label = f"Target {month_full}" if month_full else ""
             source_month_label = f"This {month_full}" if month_full else ""
             after_month_label = f"After {month_full}" if month_full else ""
@@ -2829,39 +3138,37 @@ def update_template_workbook_via_com(
                     if not visible_row_items:
                         return
 
-                    try:
-                        row_field = pt.PivotFields(target_header)
-                        visible_lower = {value.lower() for value in visible_row_items}
+                    row_field = pt.PivotFields(target_header)
+                    visible_lower = {value.lower() for value in visible_row_items}
+                    for item in row_field.PivotItems():
+                        item_name = str(item.Name).strip()
+                        compare_name = target_month_label if item_name == source_month_label else item_name
+                        if compare_name.lower() in visible_lower:
+                            item.Visible = True
+                    for item in row_field.PivotItems():
+                        item_name = str(item.Name).strip()
+                        compare_name = target_month_label if item_name == source_month_label else item_name
+                        if compare_name.lower() not in visible_lower:
+                            item.Visible = False
+                    for position, label in enumerate(visible_row_items, start=1):
                         for item in row_field.PivotItems():
                             item_name = str(item.Name).strip()
                             compare_name = target_month_label if item_name == source_month_label else item_name
-                            if compare_name.lower() in visible_lower:
-                                try:
-                                    item.Visible = True
-                                except Exception:
-                                    pass
-                        for item in row_field.PivotItems():
-                            item_name = str(item.Name).strip()
-                            compare_name = target_month_label if item_name == source_month_label else item_name
-                            if compare_name.lower() not in visible_lower:
-                                try:
-                                    item.Visible = False
-                                except Exception:
-                                    pass
-                        for position, label in enumerate(visible_row_items, start=1):
-                            for item in row_field.PivotItems():
-                                item_name = str(item.Name).strip()
-                                compare_name = target_month_label if item_name == source_month_label else item_name
-                                if compare_name.lower() == label.lower():
-                                    try:
-                                        item.Position = position
-                                    except Exception:
-                                        pass
-                                    break
-                    except Exception:
-                        pass
+                            if compare_name.lower() == label.lower():
+                                item.Position = position
+                                break
 
-                _apply_row_filter()
+                    unexpected_visible = []
+                    for item in row_field.PivotItems():
+                        item_name = str(item.Name).strip()
+                        compare_name = target_month_label if item_name == source_month_label else item_name
+                        if bool(item.Visible) and compare_name.lower() not in visible_lower:
+                            unexpected_visible.append(item_name)
+                    if unexpected_visible:
+                        raise RuntimeError(
+                            f"Pivot row filter '{target_header}' retained unexpected items: "
+                            f"{', '.join(unexpected_visible)}"
+                        )
 
                 try:
                     count_field = pt.AddDataField(pt.PivotFields(QUO_HEADER), "Count of quo", xl_count)
@@ -2870,7 +3177,11 @@ def update_template_workbook_via_com(
                     pass
 
                 try:
-                    pt.TableStyle2 = "PivotStyleMedium2"
+                    destination_column = int(progress_sheet.Range(top_left_cell).Column)
+                    pt.TableStyle2 = progress_template_state.pivot_styles.get(
+                        destination_column,
+                        "PivotStyleLight16",
+                    )
                 except Exception:
                     pass
 
@@ -2887,6 +3198,7 @@ def update_template_workbook_via_com(
                         pass
 
                 _apply_row_filter()
+                pt.Update()
 
             _build_progress_pivot(
                 "A1",
@@ -2916,6 +3228,19 @@ def update_template_workbook_via_com(
             ):
                 try:
                     progress_sheet.Range(cell_address).Value = value
+                except Exception:
+                    pass
+
+            # Pivot creation can auto-fit the destination columns. Reapply the
+            # captured template dimensions after both PivotTables are complete.
+            for column_index, width in progress_template_state.column_widths.items():
+                try:
+                    progress_sheet.Columns(column_index).ColumnWidth = width
+                except Exception:
+                    pass
+            for row_index, height in progress_template_state.row_heights.items():
+                try:
+                    progress_sheet.Rows(row_index).RowHeight = height
                 except Exception:
                     pass
 
@@ -3081,6 +3406,7 @@ def update_template_workbook_via_com(
                 )
 
         _format_percentage_completion_columns()
+        resize_pivot_section_banners(pivot_sheet)
         _profile("refresh PIVOT sheet pivots")
 
         if progress_sheet is not None:
