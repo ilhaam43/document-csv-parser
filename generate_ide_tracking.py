@@ -1494,23 +1494,49 @@ def apply_weekly_completion_thresholds(
             )
 
 
-def validate_target_complete_pivots(worksheet, dataframe: pd.DataFrame) -> None:
+def identify_target_complete_pivots(worksheet):
     pivot_tables = worksheet.PivotTables()
-    top_pivots = [
-        pivot_tables(index)
-        for index in range(1, pivot_tables.Count + 1)
-        if pivot_tables(index).TableRange2.Row <= 6
+    pivots = [pivot_tables(index) for index in range(1, pivot_tables.Count + 1)]
+    summary_candidates = [
+        pivot for pivot in pivots if int(pivot.TableRange2.Column) == 1
     ]
-    summary_pivot = next(
-        (pivot for pivot in top_pivots if pivot.TableRange2.Column == 1),
-        None,
+    summary_pivot = min(
+        summary_candidates,
+        key=lambda pivot: int(pivot.TableRange2.Row),
+        default=None,
     )
-    status_pivot = next(
-        (pivot for pivot in top_pivots if pivot.TableRange2.Column > 1),
-        None,
-    )
+
+    status_pivot = None
+    if summary_pivot is not None:
+        summary_range = summary_pivot.TableRange2
+        summary_start = int(summary_range.Row)
+        summary_end = summary_start + int(summary_range.Rows.Count) - 1
+        status_candidates = []
+        for pivot in pivots:
+            table_range = pivot.TableRange2
+            if int(table_range.Column) <= 1:
+                continue
+            status_start = int(table_range.Row)
+            status_end = status_start + int(table_range.Rows.Count) - 1
+            if status_start <= summary_end and summary_start <= status_end:
+                status_candidates.append(pivot)
+        status_pivot = min(
+            status_candidates,
+            key=lambda pivot: (
+                int(pivot.TableRange2.Row),
+                int(pivot.TableRange2.Column),
+            ),
+            default=None,
+        )
+
     if summary_pivot is None or status_pivot is None:
         raise RuntimeError("Could not identify both TARGET COMPLETE PivotTables.")
+
+    return summary_pivot, status_pivot
+
+
+def validate_target_complete_pivots(worksheet, dataframe: pd.DataFrame) -> None:
+    summary_pivot, status_pivot = identify_target_complete_pivots(worksheet)
 
     mask = pd.Series(True, index=dataframe.index)
     for header in (YEAR_FAB_UPLOAD_HEADER, next(

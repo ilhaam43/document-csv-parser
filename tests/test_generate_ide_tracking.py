@@ -15,6 +15,7 @@ from generate_ide_tracking import (
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
+    identify_target_complete_pivots,
     is_missing,
     load_collabs_lookup,
     load_source_new_rfs_lookup,
@@ -27,7 +28,65 @@ from generate_ide_tracking import (
 )
 
 
+class FakeRangeDimension:
+    def __init__(self, count):
+        self.Count = count
+
+
+class FakeTableRange:
+    def __init__(self, row, column, rows, columns):
+        self.Row = row
+        self.Column = column
+        self.Rows = FakeRangeDimension(rows)
+        self.Columns = FakeRangeDimension(columns)
+
+
+class FakePivot:
+    def __init__(self, name, row, column, rows, columns):
+        self.Name = name
+        self.TableRange2 = FakeTableRange(row, column, rows, columns)
+
+
+class FakePivotCollection:
+    def __init__(self, pivots):
+        self._pivots = pivots
+        self.Count = len(pivots)
+
+    def __call__(self, index):
+        return self._pivots[index - 1]
+
+
+class FakePivotWorksheet:
+    def __init__(self, pivots):
+        self._pivots = FakePivotCollection(pivots)
+
+    def PivotTables(self):
+        return self._pivots
+
+
 class IdeDateParsingTests(unittest.TestCase):
+    def test_target_complete_pivots_allow_dynamic_start_rows(self) -> None:
+        summary = FakePivot("summary", 7, 1, 45, 3)
+        status = FakePivot("status", 6, 4, 46, 7)
+        later_left = FakePivot("later-left", 68, 1, 20, 5)
+        later_right = FakePivot("later-right", 65, 8, 18, 4)
+        worksheet = FakePivotWorksheet(
+            [later_right, status, later_left, summary]
+        )
+
+        actual_summary, actual_status = identify_target_complete_pivots(worksheet)
+
+        self.assertIs(actual_summary, summary)
+        self.assertIs(actual_status, status)
+
+    def test_target_complete_pivots_reject_unrelated_later_section(self) -> None:
+        summary = FakePivot("summary", 7, 1, 45, 3)
+        unrelated_status = FakePivot("later-right", 65, 8, 18, 4)
+        worksheet = FakePivotWorksheet([summary, unrelated_status])
+
+        with self.assertRaisesRegex(RuntimeError, "TARGET COMPLETE"):
+            identify_target_complete_pivots(worksheet)
+
     def test_report_filename_accepts_english_month_with_any_case(self) -> None:
         expected = date(2026, 8, 18)
 
