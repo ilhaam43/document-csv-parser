@@ -1,7 +1,9 @@
 import unittest
+from datetime import date
 
 from csv_to_excel_on_going import (
     DEFAULT_ON_PROGRESS_PIVOT_STYLE,
+    expected_on_progress_sheet_name,
     resolve_on_progress_pivot_style,
 )
 
@@ -40,6 +42,20 @@ class ResolveOnProgressPivotStyleTests(unittest.TestCase):
             resolve_on_progress_pivot_style(sheet, ["missing-pivot"]),
             DEFAULT_ON_PROGRESS_PIVOT_STYLE,
         )
+
+
+class OnProgressSheetNameTests(unittest.TestCase):
+    def test_keeps_full_month_name_when_it_fits_excel_limit(self):
+        self.assertEqual(
+            expected_on_progress_sheet_name(date(2026, 8, 31)),
+            "ALL ORDER ON PROGRESS 31 August",
+        )
+
+    def test_abbreviates_month_when_full_name_exceeds_excel_limit(self):
+        sheet_name = expected_on_progress_sheet_name(date(2026, 9, 1))
+
+        self.assertEqual(sheet_name, "ALL ORDER ON PROGRESS 1 Sep")
+        self.assertLessEqual(len(sheet_name), 31)
 
 
 if __name__ == "__main__":

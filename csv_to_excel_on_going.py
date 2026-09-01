@@ -32,6 +32,7 @@ EXAMPLE_TRACKING_GLOB = "Daily Tracking *.xlsx"
 SHEET_NAME = "ALL ORDER"
 PIVOT_SHEET_NAME = "PIVOT"
 ON_PROGRESS_SHEET_PREFIX = "ALL ORDER ON PROGRESS"
+EXCEL_MAX_SHEET_NAME_LENGTH = 31
 
 CATEGORY_MLD_HEADER = "Category MLD"
 QUO_HEADER = "Quo"
@@ -389,7 +390,16 @@ def output_filename_for_tracking(tracking_workbook_path: Path) -> str:
 
 
 def expected_on_progress_sheet_name(reference_date: date) -> str:
-    return f"{ON_PROGRESS_SHEET_PREFIX} {reference_date.day} {reference_date.strftime('%B')}"
+    full_month_name = (
+        f"{ON_PROGRESS_SHEET_PREFIX} {reference_date.day} {reference_date.strftime('%B')}"
+    )
+    if len(full_month_name) <= EXCEL_MAX_SHEET_NAME_LENGTH:
+        return full_month_name
+
+    abbreviated_month_name = (
+        f"{ON_PROGRESS_SHEET_PREFIX} {reference_date.day} {reference_date.strftime('%b')}"
+    )
+    return abbreviated_month_name[:EXCEL_MAX_SHEET_NAME_LENGTH]
 
 
 def fallback_target_determined_header(reference_date: date) -> str:
