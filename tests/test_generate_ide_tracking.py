@@ -15,6 +15,7 @@ from generate_ide_tracking import (
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
+    hidden_row_ranges_between_sections,
     identify_target_complete_pivots,
     is_missing,
     load_collabs_lookup,
@@ -24,7 +25,9 @@ from generate_ide_tracking import (
     reconcile_date_column,
     reconciled_date_value,
     resolve_financial_values,
+    target_period,
     target_value,
+    target_value_with_previous,
 )
 
 
@@ -65,6 +68,16 @@ class FakePivotWorksheet:
 
 
 class IdeDateParsingTests(unittest.TestCase):
+    def test_hidden_row_ranges_follow_dynamic_section_boundaries(self) -> None:
+        self.assertEqual(
+            hidden_row_ranges_between_sections(25, 113),
+            [(27, 110)],
+        )
+        self.assertEqual(
+            hidden_row_ranges_between_sections(137, 166, {144}),
+            [(139, 142), (145, 163)],
+        )
+
     def test_target_complete_pivots_allow_dynamic_start_rows(self) -> None:
         summary = FakePivot("summary", 7, 1, 45, 3)
         status = FakePivot("status", 6, 4, 46, 7)
@@ -234,6 +247,87 @@ class IdeDateParsingTests(unittest.TestCase):
         self.assertEqual(list(values), [datetime(2026, 12, 16)] * 2)
         self.assertEqual(fallback_count, 2)
 
+    def test_month_opening_carries_previous_rfs_dates(self) -> None:
+        current = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1"],
+                NEW_RFS_INITIAL_HEADER: [datetime(2026, 8, 9)],
+            }
+        )
+        previous = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1"],
+                NEW_RFS_INITIAL_HEADER: [datetime(2026, 9, 8)],
+            }
+        )
+
+        values, fallback_count = reconcile_date_column(
+            current,
+            previous,
+            NEW_RFS_INITIAL_HEADER,
+            date(2026, 9, 1),
+        )
+
+        self.assertEqual(list(values), [datetime(2026, 9, 8)])
+        self.assertEqual(fallback_count, 1)
+
+    def test_non_opening_day_keeps_current_rfs_date(self) -> None:
+        current = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1"],
+                NEW_RFS_INITIAL_HEADER: [datetime(2026, 8, 9)],
+            }
+        )
+        previous = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1"],
+                NEW_RFS_INITIAL_HEADER: [datetime(2026, 9, 8)],
+            }
+        )
+
+        values, fallback_count = reconcile_date_column(
+            current,
+            previous,
+            NEW_RFS_INITIAL_HEADER,
+            date(2026, 9, 2),
+        )
+
+        self.assertEqual(list(values), [datetime(2026, 8, 9)])
+        self.assertEqual(fallback_count, 0)
+
+    def test_month_opening_matches_duplicate_actual_rfs_by_occurrence(self) -> None:
+        current = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1", "Q-1"],
+                ACTUAL_RFS_DATE_HEADER: [
+                    datetime(2026, 4, 15),
+                    datetime(2026, 4, 15),
+                ],
+            }
+        )
+        previous = pd.DataFrame(
+            {
+                QUOTE_ID_HEADER: ["Q-1", "Q-1"],
+                ACTUAL_RFS_DATE_HEADER: [
+                    datetime(2026, 4, 15),
+                    datetime(2026, 4, 30),
+                ],
+            }
+        )
+
+        values, fallback_count = reconcile_date_column(
+            current,
+            previous,
+            ACTUAL_RFS_DATE_HEADER,
+            date(2026, 9, 1),
+        )
+
+        self.assertEqual(
+            list(values),
+            [datetime(2026, 4, 15), datetime(2026, 4, 30)],
+        )
+        self.assertEqual(fallback_count, 1)
+
     def test_previous_field_fallback_uses_first_quote_match_and_preserves_na_error(self) -> None:
         current = pd.DataFrame(
             {
@@ -262,6 +356,53 @@ class IdeDateParsingTests(unittest.TestCase):
         self.assertEqual(target_value("10/01/2026", report_date), "Before August")
         self.assertEqual(target_value("13/08/2026", report_date), "Target August")
         self.assertEqual(target_value("01/09/2026", report_date), "After August")
+
+    def test_first_calendar_day_closes_the_previous_target_month(self) -> None:
+        self.assertEqual(target_period(date(2026, 9, 1)), date(2026, 8, 31))
+        self.assertEqual(target_period(date(2026, 1, 1)), date(2025, 12, 31))
+
+    def test_later_report_days_use_the_current_target_month(self) -> None:
+        self.assertEqual(target_period(date(2026, 9, 2)), date(2026, 9, 2))
+
+    def test_missing_current_target_carries_the_previous_bucket_in_same_period(self) -> None:
+        self.assertEqual(
+            target_value_with_previous(
+                pd.NA,
+                "Target August",
+                date(2026, 8, 31),
+            ),
+            "Target August",
+        )
+
+    def test_current_target_date_takes_precedence_over_previous(self) -> None:
+        self.assertEqual(
+            target_value_with_previous(
+                datetime(2026, 9, 15),
+                "Target Not Yet Inputted",
+                date(2026, 8, 31),
+            ),
+            "After August",
+        )
+
+    def test_existing_target_is_carried_within_the_same_period(self) -> None:
+        self.assertEqual(
+            target_value_with_previous(
+                datetime(2026, 8, 9),
+                "After August",
+                date(2026, 8, 31),
+            ),
+            "After August",
+        )
+
+    def test_existing_target_is_reclassified_when_period_changes(self) -> None:
+        self.assertEqual(
+            target_value_with_previous(
+                pd.NA,
+                "Target August",
+                date(2026, 9, 2),
+            ),
+            "Target Not Yet Inputted",
+        )
 
     def test_missing_previous_financial_value_falls_back_to_zero(self) -> None:
         self.assertEqual(financial_value_or_zero("1,250,000"), 1_250_000)

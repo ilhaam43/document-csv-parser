@@ -21,6 +21,8 @@ from dateutil import parser as date_parser
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 
+from excel_pivot_layout import normalize_layout_text, resize_dynamic_pivot_section_banners
+
 
 DEFAULT_INPUT_DIR = "input-ide"
 DEFAULT_REFERENCE_DIR = "vlookup-ide"
@@ -79,6 +81,10 @@ MONTH_FIRST_TEXT_DATE_HEADERS = (
 FIRST_MATCH_CURRENT_DATE_HEADERS = (
     ACTUAL_RFS_DATE_HEADER,
 )
+MONTH_OPENING_CARRY_DATE_HEADERS = (
+    NEW_RFS_INITIAL_HEADER,
+    ACTUAL_RFS_DATE_HEADER,
+)
 RAW_SOURCE_QUOTE_ID_COLUMN = 4  # D
 RAW_SOURCE_NEW_RFS_COLUMN = 38  # AL
 
@@ -90,6 +96,16 @@ FONT_SIZE = 11
 MAX_COLUMN_WIDTH = 45
 MIN_COLUMN_WIDTH = 10
 PIVOT_PERCENTAGE_MIN_WIDTH = 24
+PIVOT_SECTION_TITLE_MARKERS = (
+    "target complete",
+    "order aging start from pre-installation status",
+    "ontime delivery",
+    "status order with aging from rfs commit date",
+    "delay completion",
+    "target after",
+    "target not inputted",
+)
+PIVOT_SECTION_SIDE_HEADER_MARKERS = ("percentage of completion",)
 UNKNOWN_YEAR = "1900"
 EXCEL_ZERO_DATE_SERIAL = 0
 EXCEL_NA_ERROR = "#N/A"
@@ -175,6 +191,14 @@ class PivotPercentageBlock:
     formula: str
     formula_row: int
     pivot_header_columns: dict[int, str]
+
+
+@dataclass(frozen=True)
+class TargetPivotPageFilter:
+    pivot_name: str
+    position: int
+    selection_kinds: tuple[str, ...]
+    show_all: bool
 
 
 @dataclass(frozen=True)
@@ -681,18 +705,75 @@ def normalize_date_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, li
     return result, invalid_dates
 
 
-def target_value(value: object, report_date: date) -> str:
+def target_period(report_date: date) -> date:
+    """Return the business month used by the target buckets.
+
+    The first calendar-day snapshot still closes the preceding month. From the
+    second day onward, the report uses the current month.
+    """
+    if report_date.day == 1:
+        return report_date - timedelta(days=1)
+    return report_date
+
+
+def target_value(value: object, period: date) -> str:
     parsed = parse_excel_datetime(value)
-    month_name = calendar.month_name[report_date.month]
+    month_name = calendar.month_name[period.month]
     if parsed is None:
         return "Target Not Yet Inputted"
     source_month = (parsed.year, parsed.month)
-    report_month = (report_date.year, report_date.month)
-    if source_month < report_month:
+    target_month = (period.year, period.month)
+    if source_month < target_month:
         return f"Before {month_name}"
-    if source_month > report_month:
+    if source_month > target_month:
         return f"After {month_name}"
     return f"Target {month_name}"
+
+
+def target_item_kind(value: object) -> str | None:
+    normalized = " ".join(str(value).strip().casefold().split())
+    if normalized in {"(all)", "all"}:
+        return "all"
+    if "not yet inputted" in normalized:
+        return "missing"
+    if normalized.startswith("before "):
+        return "before"
+    if normalized.startswith("after "):
+        return "after"
+    if normalized.startswith("target "):
+        return "target"
+    return None
+
+
+def target_item_label(kind: str, period: date) -> str:
+    month_name = calendar.month_name[period.month]
+    labels = {
+        "before": f"Before {month_name}",
+        "target": f"Target {month_name}",
+        "after": f"After {month_name}",
+        "missing": "Target Not Yet Inputted",
+    }
+    try:
+        return labels[kind]
+    except KeyError as exc:
+        raise ValueError(f"Unknown target item kind: {kind}") from exc
+
+
+def target_value_with_previous(
+    current_value: object,
+    previous_target_value: object,
+    period: date,
+) -> str:
+    """Match the manual carry-forward behavior within one target period."""
+    previous_kind = target_item_kind(previous_target_value)
+    period_month = calendar.month_name[period.month].casefold()
+    previous_target_text = str(previous_target_value).strip().casefold()
+    same_period = previous_kind == "missing" or previous_target_text.endswith(period_month)
+
+    if same_period and previous_kind not in {None, "missing", "all"}:
+        return target_item_label(previous_kind, period)
+
+    return target_value(current_value, period)
 
 
 def is_plausible_operational_date(value: datetime | None, report_date: date) -> bool:
@@ -717,15 +798,23 @@ def reconciled_date_value(
     current_value: object,
     previous_value: object,
     report_date: date,
+    *,
+    prefer_previous: bool = False,
 ) -> tuple[object, bool]:
     if is_excel_zero_date(current_value):
         return EXCEL_ZERO_DATE_SERIAL, False
 
-    if is_missing(current_value) or str(current_value).strip() == "-":
-        return current_value, False
-
     current_date = parse_excel_datetime(current_value)
     previous_date = parse_excel_datetime(previous_value)
+
+    if prefer_previous:
+        if is_excel_zero_date(previous_value):
+            return EXCEL_ZERO_DATE_SERIAL, not is_excel_zero_date(current_value)
+        if is_plausible_operational_date(previous_date, report_date):
+            return previous_date, current_date != previous_date
+
+    if is_missing(current_value) or str(current_value).strip() == "-":
+        return current_value, False
 
     if differs_only_by_year(current_date, previous_date) and is_plausible_operational_date(
         previous_date,
@@ -748,7 +837,8 @@ def reconcile_date_column(
     report_date: date,
 ) -> tuple[pd.Series, int]:
     """Reconcile one date column with the lookup semantics used by Excel."""
-    use_first_match = header in FIRST_MATCH_CURRENT_DATE_HEADERS
+    month_opening_carry = report_date.day == 1 and header in MONTH_OPENING_CARRY_DATE_HEADERS
+    use_first_match = header in FIRST_MATCH_CURRENT_DATE_HEADERS and not month_opening_carry
     previous_lookup = (
         first_quote_lookup(previous, header)
         if use_first_match
@@ -756,6 +846,7 @@ def reconcile_date_column(
     )
     reconciled_values: list[object] = []
     fallback_count = 0
+    prefer_previous = month_opening_carry
 
     for current_value, occurrence_key in zip(
         current[header],
@@ -767,6 +858,7 @@ def reconcile_date_column(
             current_value,
             previous_lookup.get(lookup_key),
             report_date,
+            prefer_previous=prefer_previous,
         )
         reconciled_values.append(reconciled_value)
         fallback_count += int(used_fallback)
@@ -920,9 +1012,32 @@ def build_all_order(
     insert_after(result, FAB_UPLOAD_HEADER, YEAR_FAB_UPLOAD_HEADER, year_values)
 
     dynamic_target_header = target_header(report_date)
-    target_values = result[NEW_RFS_INITIAL_HEADER].map(
-        lambda value: target_value(value, report_date)
+    target_bucket_period = target_period(report_date)
+    previous_target_header = next(
+        (
+            column
+            for column in previous.columns
+            if normalize_header(column).casefold().startswith("target ")
+        ),
+        None,
     )
+    previous_target_lookup = (
+        occurrence_lookup(previous, previous_target_header)
+        if previous_target_header is not None
+        else {}
+    )
+    target_values = [
+        target_value_with_previous(
+            current_value,
+            previous_target_lookup.get(occurrence_key),
+            target_bucket_period,
+        )
+        for current_value, occurrence_key in zip(
+            result[NEW_RFS_INITIAL_HEADER],
+            occurrence_keys(result),
+            strict=False,
+        )
+    ]
     insert_after(result, NEW_RFS_INITIAL_HEADER, dynamic_target_header, target_values)
 
     actual_rfs_dates = result[ACTUAL_RFS_DATE_HEADER].map(parse_excel_datetime)
@@ -1139,6 +1254,282 @@ def pivot_header_columns(worksheet, table_range, header_row: int) -> dict[int, s
         if normalized:
             headers[column_number] = normalized
     return headers
+
+
+def find_target_pivot_field(pivot_table, expected_header: str | None = None):
+    fields = pivot_table.PivotFields()
+    expected = normalize_header(expected_header).casefold() if expected_header else None
+    fallback = None
+    for field_index in range(1, fields.Count + 1):
+        field = fields(field_index)
+        name = normalize_header(field.Name)
+        if expected is not None and name.casefold() == expected:
+            return field
+        if fallback is None and name.casefold().startswith("target "):
+            fallback = field
+    return fallback
+
+
+def capture_target_pivot_filters(worksheet) -> list[TargetPivotPageFilter]:
+    """Capture target page filters before the monthly source header changes."""
+    states: list[TargetPivotPageFilter] = []
+    pivot_tables = worksheet.PivotTables()
+    for pivot_index in range(1, pivot_tables.Count + 1):
+        pivot_table = pivot_tables(pivot_index)
+        field = find_target_pivot_field(pivot_table)
+        if field is None or int(field.Orientation) != 3:  # xlPageField
+            continue
+
+        current_page = str(field.CurrentPage)
+        show_all = target_item_kind(current_page) == "all"
+        selection_kinds: list[str] = []
+        try:
+            multiple_items = bool(field.EnableMultiplePageItems)
+        except Exception:
+            multiple_items = False
+
+        if multiple_items and not show_all:
+            items = field.PivotItems()
+            for item_index in range(1, items.Count + 1):
+                item = items(item_index)
+                if not bool(item.Visible):
+                    continue
+                kind = target_item_kind(item.Name)
+                if kind is not None and kind != "all" and kind not in selection_kinds:
+                    selection_kinds.append(kind)
+        elif not show_all:
+            kind = target_item_kind(current_page)
+            if kind is None:
+                raise RuntimeError(
+                    f"Unsupported target filter item {current_page!r} in "
+                    f"PivotTable '{pivot_table.Name}'."
+                )
+            selection_kinds.append(kind)
+
+        states.append(
+            TargetPivotPageFilter(
+                pivot_name=str(pivot_table.Name),
+                position=int(field.Position),
+                selection_kinds=tuple(selection_kinds),
+                show_all=show_all,
+            )
+        )
+    return states
+
+
+def restore_target_pivot_filters(
+    worksheet,
+    states: list[TargetPivotPageFilter],
+    report_date: date,
+) -> None:
+    """Rebind monthly target filters after the PivotCache schema refresh."""
+    expected_header = target_header(report_date)
+    period = target_period(report_date)
+    for state in states:
+        pivot_table = worksheet.PivotTables(state.pivot_name)
+        field = find_target_pivot_field(pivot_table, expected_header)
+        if field is None:
+            raise RuntimeError(
+                f"PivotTable '{state.pivot_name}' is missing target field "
+                f"{expected_header!r} after refresh."
+            )
+
+        field.Orientation = 3  # xlPageField
+        field.Position = state.position
+        field.ClearAllFilters()
+        if state.show_all:
+            field.CurrentPage = "(All)"
+            pivot_table.RefreshTable()
+            continue
+
+        desired_labels = {
+            target_item_label(kind, period).casefold(): kind
+            for kind in state.selection_kinds
+        }
+        available_items: dict[str, object] = {}
+        items = field.PivotItems()
+        for item_index in range(1, items.Count + 1):
+            item = items(item_index)
+            available_items[str(item.Name).strip().casefold()] = item
+
+        missing_labels = sorted(set(desired_labels) - set(available_items))
+        if missing_labels:
+            raise RuntimeError(
+                f"PivotTable '{state.pivot_name}' cannot apply target filter; "
+                f"missing item(s): {', '.join(missing_labels)}."
+            )
+
+        if len(desired_labels) == 1:
+            selected_label = next(iter(desired_labels))
+            field.CurrentPage = str(available_items[selected_label].Name)
+        else:
+            field.EnableMultiplePageItems = True
+            for label in desired_labels:
+                available_items[label].Visible = True
+            for label, item in available_items.items():
+                item.Visible = label in desired_labels
+        pivot_table.RefreshTable()
+
+
+def update_pivot_period_titles(worksheet, report_date: date) -> None:
+    month_name = calendar.month_name[report_date.month].upper()
+    year = report_date.year
+    replacements = {
+        "target complete": (
+            f"TARGET COMPLETE {month_name} {year} "
+            f"(Based on Dashboard 1 {month_name} {year})"
+        ),
+        "order aging start from pre-installation status": (
+            f"ORDER AGING START FROM PRE-INSTALLATION STATUS {month_name} {year % 100:02d}"
+        ),
+        "status order with aging from rfs commit date": (
+            f"STATUS ORDER WITH AGING FROM RFS COMMIT DATE {month_name} {year % 100:02d}"
+        ),
+        "delay completion": (
+            "DELAY COMPLETION (SHOULD BE COMPLETE BEFORE "
+            f"{month_name} {year})"
+        ),
+        "target after": f"TARGET AFTER {month_name} {year}",
+    }
+
+    used_range = worksheet.UsedRange
+    used_values = used_range.Value2
+    if used_values is None:
+        return
+    for row_offset, row in enumerate(used_values):
+        for column_offset, value in enumerate(row):
+            if not isinstance(value, str):
+                continue
+            normalized = " ".join(value.strip().casefold().split())
+            for prefix, replacement in replacements.items():
+                if normalized.startswith(prefix):
+                    worksheet.Cells(
+                        used_range.Row + row_offset,
+                        used_range.Column + column_offset,
+                    ).Value = replacement
+                    break
+
+
+def hidden_row_ranges_between_sections(
+    section_bottom_row: int,
+    next_title_row: int,
+    content_rows: Iterable[int] = (),
+) -> list[tuple[int, int]]:
+    """Return blank row runs to hide while preserving useful section spacing."""
+    gap_start = section_bottom_row + 1
+    gap_end = next_title_row - 1
+    if gap_start > gap_end:
+        return []
+
+    protected_rows = {gap_start, gap_end, gap_end - 1}
+    for row_number in content_rows:
+        if gap_start <= row_number <= gap_end:
+            protected_rows.add(row_number)
+            protected_rows.add(max(gap_start, row_number - 1))
+
+    hidden_rows = [
+        row_number
+        for row_number in range(gap_start, gap_end + 1)
+        if row_number not in protected_rows
+    ]
+    if not hidden_rows:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    range_start = previous_row = hidden_rows[0]
+    for row_number in hidden_rows[1:]:
+        if row_number != previous_row + 1:
+            ranges.append((range_start, previous_row))
+            range_start = row_number
+        previous_row = row_number
+    ranges.append((range_start, previous_row))
+    return ranges
+
+
+def normalize_pivot_section_row_visibility(worksheet) -> None:
+    """Hide vacated Pivot rows using the refreshed section boundaries."""
+    used_range = worksheet.UsedRange
+    used_values = used_range.Value2
+    if used_values is None:
+        return
+    if not isinstance(used_values, tuple):
+        value_rows = ((used_values,),)
+    elif used_values and not isinstance(used_values[0], tuple):
+        value_rows = (used_values,)
+    else:
+        value_rows = used_values
+
+    title_markers = tuple(
+        normalize_layout_text(marker) for marker in PIVOT_SECTION_TITLE_MARKERS
+    )
+    title_rows: set[int] = set()
+    content_rows: set[int] = set()
+    for row_offset, row_values in enumerate(value_rows, start=int(used_range.Row)):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        nonblank_values = [value for value in row_values if value not in (None, "")]
+        if nonblank_values:
+            content_rows.add(row_offset)
+        if any(
+            marker in normalize_layout_text(value)
+            for value in nonblank_values
+            for marker in title_markers
+        ):
+            title_rows.add(row_offset)
+
+    sorted_title_rows = sorted(title_rows)
+    if len(sorted_title_rows) < 2:
+        return
+
+    pivot_ranges: list[tuple[int, int]] = []
+    pivot_tables = worksheet.PivotTables()
+    for pivot_index in range(1, int(pivot_tables.Count) + 1):
+        table_range = pivot_tables(pivot_index).TableRange2
+        pivot_start_row = int(table_range.Row)
+        pivot_ranges.append(
+            (
+                pivot_start_row,
+                pivot_start_row + int(table_range.Rows.Count) - 1,
+            )
+        )
+
+    for title_row, next_title_row in zip(
+        sorted_title_rows,
+        sorted_title_rows[1:],
+        strict=False,
+    ):
+        section_bottoms = [
+            bottom_row
+            for pivot_start_row, bottom_row in pivot_ranges
+            if title_row < pivot_start_row < next_title_row
+        ]
+        if not section_bottoms:
+            continue
+
+        section_bottom_row = max(section_bottoms)
+        gap_start = section_bottom_row + 1
+        gap_end = next_title_row - 1
+        if gap_start > gap_end:
+            continue
+
+        worksheet.Range(
+            worksheet.Cells(gap_start, 1),
+            worksheet.Cells(gap_end, 1),
+        ).EntireRow.Hidden = False
+        gap_content_rows = {
+            row_number
+            for row_number in content_rows
+            if gap_start <= row_number <= gap_end
+        }
+        for hidden_start, hidden_end in hidden_row_ranges_between_sections(
+            section_bottom_row,
+            next_title_row,
+            gap_content_rows,
+        ):
+            worksheet.Range(
+                worksheet.Cells(hidden_start, 1),
+                worksheet.Cells(hidden_end, 1),
+            ).EntireRow.Hidden = True
 
 
 def capture_pivot_percentage_blocks(workbook, worksheet):
@@ -1413,6 +1804,70 @@ def repair_pivot_percentage_ranges(worksheet) -> None:
         ).FormulaR1C1 = formula_r1c1
 
 
+def normalize_pivot_percentage_borders(
+    worksheet,
+    blocks: list[PivotPercentageBlock],
+) -> None:
+    """Keep red outlines on percentage blocks without boxing every data row."""
+    xl_edge_left = 7
+    xl_edge_top = 8
+    xl_edge_bottom = 9
+    xl_edge_right = 10
+    xl_inside_horizontal = 12
+    xl_continuous = 1
+    xl_line_style_none = -4142
+    xl_medium = -4138
+    xl_red = 255
+
+    def apply_red_outline(cell) -> None:
+        for border_index in (
+            xl_edge_left,
+            xl_edge_top,
+            xl_edge_bottom,
+            xl_edge_right,
+        ):
+            border = cell.Borders(border_index)
+            border.LineStyle = xl_continuous
+            border.Color = xl_red
+            border.Weight = xl_medium
+
+    for block in blocks:
+        pivot_table = worksheet.PivotTables(block.pivot_name)
+        table_range = pivot_table.TableRange2
+        header_row = int(table_range.Row) + block.header_row_offset
+        end_row = int(table_range.Row) + int(table_range.Rows.Count) - 1
+        percentage_column = int(table_range.Column) + int(table_range.Columns.Count)
+
+        first_body_row = header_row + 1
+        last_body_row = end_row - 1
+        if end_row <= header_row:
+            continue
+
+        if last_body_row >= first_body_row:
+            body_range = worksheet.Range(
+                worksheet.Cells(first_body_row, percentage_column),
+                worksheet.Cells(last_body_row, percentage_column),
+            )
+            for border_index in (xl_edge_left, xl_edge_right):
+                border = body_range.Borders(border_index)
+                border.LineStyle = xl_continuous
+                border.Color = xl_red
+                border.Weight = xl_medium
+            body_range.Borders(xl_inside_horizontal).LineStyle = xl_line_style_none
+            body_range.Borders(xl_edge_bottom).LineStyle = xl_line_style_none
+
+            first_body_cell = worksheet.Cells(first_body_row, percentage_column)
+            first_body_border = first_body_cell.Borders(xl_edge_top)
+            first_body_border.LineStyle = xl_continuous
+            first_body_border.Color = xl_red
+            first_body_border.Weight = xl_medium
+
+        # Apply section boundaries last because Excel treats adjacent cell
+        # borders as one shared edge when ranges are reformatted.
+        apply_red_outline(worksheet.Cells(header_row, percentage_column))
+        apply_red_outline(worksheet.Cells(end_row, percentage_column))
+
+
 def completion_thresholds(report_date: date) -> CompletionThresholds:
     """Return the capped weekly completion thresholds for a report date."""
     week = min(((report_date.day - 1) // 7) + 1, 4)
@@ -1614,6 +2069,9 @@ def update_workbook_via_com(
         pivot_sheet = find_sheet(workbook, PIVOT_SHEET_NAME)
         if all_order_sheet is None or pivot_sheet is None:
             raise RuntimeError("Previous workbook must contain ALL ORDER and PIVOT sheets.")
+        target_filter_states = capture_target_pivot_filters(pivot_sheet)
+        if not target_filter_states:
+            raise RuntimeError("Previous workbook has no target PivotTable page filters.")
 
         row_count = len(df) + 1
         column_count = len(df.columns)
@@ -1751,6 +2209,11 @@ def update_workbook_via_com(
                     f"Could not refresh PivotTable '{pivot_table.Name}': {exc}"
                 ) from exc
 
+        restore_target_pivot_filters(
+            pivot_sheet,
+            target_filter_states,
+            report_date,
+        )
         restore_pivot_percentage_blocks(
             pivot_sheet,
             percentage_scratch,
@@ -1765,6 +2228,17 @@ def update_workbook_via_com(
             percentage_blocks,
             report_date,
         )
+        normalize_pivot_percentage_borders(
+            pivot_sheet,
+            percentage_blocks,
+        )
+        update_pivot_period_titles(pivot_sheet, report_date)
+        resize_dynamic_pivot_section_banners(
+            pivot_sheet,
+            title_markers=PIVOT_SECTION_TITLE_MARKERS,
+            side_header_markers=PIVOT_SECTION_SIDE_HEADER_MARKERS,
+        )
+        normalize_pivot_section_row_visibility(pivot_sheet)
         adjust_pivot_column_widths(pivot_sheet)
         validate_target_complete_pivots(pivot_sheet, df)
 
