@@ -4,13 +4,103 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from datetime import date
 
 
 EXCEL_MAX_ROW = 1_048_576
+PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
 
 
 def normalize_layout_text(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def completion_legend_values(report_date: date, mode: str = "weekly") -> tuple[str, str, str]:
+    if mode == "target_after":
+        return "Green : >10%", "Yellow : >=10%", "Red : <5%"
+
+    report_week = min((report_date.day - 1) // 7 + 1, 4)
+    completion_threshold = 20 + report_week * 10
+    red_threshold = 10 + report_week * 10
+    return (
+        f"Green : >{completion_threshold}%",
+        f"Yellow : >={completion_threshold}%",
+        f"Red : <{red_threshold}%",
+    )
+
+
+def align_completion_threshold_legends(
+    pivot_sheet,
+    report_date: date,
+    layout_specs: Iterable[tuple[int, int, str]],
+) -> None:
+    """Move completion legends beside dynamic percentage blocks and reset weekly thresholds."""
+    try:
+        used_range = pivot_sheet.UsedRange
+        used_values = used_range.Value2
+    except Exception:
+        return
+    if not used_values:
+        return
+
+    if not isinstance(used_values, tuple):
+        value_rows = ((used_values,),)
+    elif used_values and not isinstance(used_values[0], tuple):
+        value_rows = (used_values,)
+    else:
+        value_rows = used_values
+
+    percentage_headers: list[tuple[int, int]] = []
+    legend_starts: list[tuple[int, int]] = []
+    percentage_key = normalize_layout_text(PERCENTAGE_COMPLETION_HEADER)
+    for row_index, row_values in enumerate(value_rows, start=used_range.Row):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        for column_index, value in enumerate(row_values, start=used_range.Column):
+            normalized = normalize_layout_text(value)
+            if normalized == percentage_key or normalized.startswith("percentageof"):
+                percentage_headers.append((row_index, column_index))
+            elif str(value or "").strip().lower().startswith("green :"):
+                legend_starts.append((row_index, column_index))
+
+    percentage_headers.sort()
+    legend_starts.sort()
+    specs = list(layout_specs)
+    for index, ((header_row, header_col), (minimum_col, row_offset, mode)) in enumerate(
+        zip(percentage_headers, specs)
+    ):
+        target_row = header_row + row_offset
+        target_col = max(minimum_col, header_col + 2)
+        target_range = pivot_sheet.Range(
+            pivot_sheet.Cells(target_row, target_col),
+            pivot_sheet.Cells(target_row + 2, target_col),
+        )
+
+        if index < len(legend_starts):
+            source_row, source_col = legend_starts[index]
+            source_range = pivot_sheet.Range(
+                pivot_sheet.Cells(source_row, source_col),
+                pivot_sheet.Cells(source_row + 2, source_col),
+            )
+            if (source_row, source_col) != (target_row, target_col):
+                try:
+                    source_range.Copy()
+                    target_range.PasteSpecial(Paste=-4104)  # xlPasteAll
+                    pivot_sheet.Application.CutCopyMode = False
+                    source_range.Clear()
+                except Exception:
+                    pass
+
+        target_range.Value = tuple((value,) for value in completion_legend_values(report_date, mode))
+
+    for row_index, column_index in legend_starts[len(specs) :]:
+        try:
+            pivot_sheet.Range(
+                pivot_sheet.Cells(row_index, column_index),
+                pivot_sheet.Cells(row_index + 2, column_index),
+            ).Clear()
+        except Exception:
+            pass
 
 
 def section_banner_end_columns(
@@ -57,6 +147,56 @@ def section_banner_end_columns(
             boundaries[(title_row, title_col)] = max(candidate_columns)
 
     return boundaries
+
+
+def update_dynamic_pivot_section_titles(
+    pivot_sheet,
+    replacements: dict[str, str],
+) -> int:
+    """Replace month-bearing section titles without relying on fixed rows."""
+    normalized_replacements = {
+        normalize_layout_text(marker): value
+        for marker, value in replacements.items()
+    }
+    try:
+        used_range = pivot_sheet.UsedRange
+        used_values = used_range.Value
+    except Exception:
+        return 0
+    if not used_values:
+        return 0
+
+    if not isinstance(used_values, tuple):
+        value_rows = ((used_values,),)
+    elif used_values and not isinstance(used_values[0], tuple):
+        value_rows = (used_values,)
+    else:
+        value_rows = used_values
+
+    updated = 0
+    for row_offset, row_values in enumerate(value_rows, start=used_range.Row):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        for column_offset, raw_value in enumerate(row_values, start=used_range.Column):
+            normalized_value = normalize_layout_text(raw_value)
+            if not normalized_value:
+                continue
+            replacement = next(
+                (
+                    value
+                    for marker, value in normalized_replacements.items()
+                    if marker in normalized_value
+                ),
+                None,
+            )
+            if replacement is None:
+                continue
+            try:
+                pivot_sheet.Cells(row_offset, column_offset).Value = replacement
+                updated += 1
+            except Exception:
+                pass
+    return updated
 
 
 def resize_dynamic_pivot_section_banners(

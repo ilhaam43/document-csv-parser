@@ -14,7 +14,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from excel_pivot_layout import resize_dynamic_pivot_section_banners
+from excel_pivot_filters import (
+    apply_month_target_filter,
+    configure_pivot_cache_for_current_source,
+    find_named_pivot_field,
+    set_visible_items_exact,
+)
+from excel_pivot_layout import (
+    align_completion_threshold_legends,
+    resize_dynamic_pivot_section_banners,
+    update_dynamic_pivot_section_titles,
+)
 
 
 ALL_ORDER_SHEET_NAME = "ALL ORDER"
@@ -25,6 +35,7 @@ ALL_ORDER_TABLE_NAME = "Table57"
 IPHONE_TABLE_NAME = "Table27"
 PRODUCT_CATEGORY_HEADER = "Product Category"
 QUO_HEADER = "quo"
+AGING_OF_RFS_HEADER = "Aging Of RFS"
 YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
 YEAR_FAB_UPLOAD_EXCLUDED_VALUES = {"", "1900", "nan", "none", "n/a", "(blank)", "null"}
 DEFAULT_INPUT_DIR = "input-iphone"
@@ -37,6 +48,9 @@ PREVIOUS_IPHONE_MAPPING_HEADERS = (
     "Service Delivery Div. ",
 )
 EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
+# Keep each COM SAFEARRAY comfortably below Excel's allocation limit on the
+# Windows server, where workbooks can already consume substantial memory.
+EXCEL_COM_ROW_BATCH_SIZE = 250
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
 PHASE_PIVOT_ORDER = (
     "00-New",
@@ -49,6 +63,29 @@ PHASE_PIVOT_ORDER = (
     "07-UAT On Hold",
     "Cancel",
     "SO Complete",
+)
+IPHONE_PIVOT_TARGET_FILTERS = {
+    "PivotTable1": "target",
+    "PivotTable2": "target",
+    "PivotTable3": "target",
+    "PivotTable4": "target",
+    "PivotTable8": "before",
+    "PivotTable9": "before",
+    "PivotTable12": "not_yet",
+    "PivotTable5": "all",
+    "PivotTable6": "all",
+}
+IPHONE_COMPLETE_PHASES = (
+    "04-Pre Installation",
+    "05-Customer Preparation",
+    "07-UAT On Hold",
+    "Cancel",
+    "SO Complete",
+)
+IPHONE_ACTIVE_PHASES = (
+    "04-Pre Installation",
+    "05-Customer Preparation",
+    "07-UAT On Hold",
 )
 
 
@@ -325,14 +362,16 @@ def apply_dated_phase_width_adjustments(
 
 def build_iphone_sheet(all_order_sheet, iphone_sheet, xl) -> tuple[int, int]:
     source_range = all_order_sheet.UsedRange
-    source_values = source_range.Value
-    if not isinstance(source_values, tuple) or not source_values:
+    source_row_count = source_range.Rows.Count
+    column_count = source_range.Columns.Count
+    header_values = all_order_sheet.Range(
+        all_order_sheet.Cells(1, 1),
+        all_order_sheet.Cells(1, column_count),
+    ).Value2
+    if not isinstance(header_values, tuple) or not header_values:
         raise ValueError(f"Sheet '{all_order_sheet.Name}' is empty")
 
-    if source_values and not isinstance(source_values[0], tuple):
-        source_values = (source_values,)
-
-    headers = tuple(source_values[0])
+    headers = tuple(header_values[0] if isinstance(header_values[0], tuple) else header_values)
     product_category_index = next(
         (
             index
@@ -345,25 +384,51 @@ def build_iphone_sheet(all_order_sheet, iphone_sheet, xl) -> tuple[int, int]:
         raise ValueError(f"Could not find header '{PRODUCT_CATEGORY_HEADER}' on sheet '{all_order_sheet.Name}'")
 
     iphone_rows = [headers]
-    for row in source_values[1:]:
-        product_category = str(row[product_category_index] or "").strip()
-        if re.search(r"iphone", product_category, flags=re.IGNORECASE):
-            iphone_rows.append(tuple(row))
+    for start_row in range(2, source_row_count + 1, EXCEL_COM_ROW_BATCH_SIZE):
+        end_row = min(source_row_count, start_row + EXCEL_COM_ROW_BATCH_SIZE - 1)
+        batch_values = all_order_sheet.Range(
+            all_order_sheet.Cells(start_row, 1),
+            all_order_sheet.Cells(end_row, column_count),
+        ).Value2
+        if not isinstance(batch_values, tuple):
+            continue
+        if batch_values and not isinstance(batch_values[0], tuple):
+            batch_values = (batch_values,)
+        for row in batch_values:
+            product_category = str(row[product_category_index] or "").strip()
+            if re.search(r"iphone", product_category, flags=re.IGNORECASE):
+                iphone_rows.append(tuple(row))
 
     row_count = len(iphone_rows)
     column_count = len(headers)
     column_model = capture_sheet_column_model(iphone_sheet, column_count)
     reset_sheet(iphone_sheet)
-    target_range = iphone_sheet.Range(
-        iphone_sheet.Cells(1, 1),
-        iphone_sheet.Cells(row_count, column_count),
-    )
-    target_range.Value = tuple(iphone_rows)
+    for start_index in range(0, row_count, EXCEL_COM_ROW_BATCH_SIZE):
+        row_batch = tuple(iphone_rows[start_index : start_index + EXCEL_COM_ROW_BATCH_SIZE])
+        first_target_row = start_index + 1
+        last_target_row = first_target_row + len(row_batch) - 1
+        iphone_sheet.Range(
+            iphone_sheet.Cells(first_target_row, 1),
+            iphone_sheet.Cells(last_target_row, column_count),
+        ).Value2 = row_batch
 
     apply_sheet_column_model(iphone_sheet, column_model, column_count, xl)
 
+    aging_column = next(
+        (
+            index
+            for index, header in enumerate(headers, start=1)
+            if normalize_header_key(header) == normalize_header_key(AGING_OF_RFS_HEADER)
+        ),
+        None,
+    )
     ensure_table(iphone_sheet, IPHONE_TABLE_NAME, row_count, column_count)
     apply_sheet_column_model(iphone_sheet, column_model, column_count, xl)
+    if aging_column is not None and row_count > 1:
+        iphone_sheet.Range(
+            iphone_sheet.Cells(2, aging_column),
+            iphone_sheet.Cells(row_count, aging_column),
+        ).NumberFormat = all_order_sheet.Cells(2, aging_column).NumberFormat
     delete_sheet_model(column_model)
     return row_count, column_count
 
@@ -502,7 +567,9 @@ def refresh_pivots(workbook) -> int:
             cache_index = int(pivot_table.CacheIndex)
             if cache_index in refreshed_cache_indexes:
                 continue
-            pivot_table.PivotCache().Refresh()
+            pivot_cache = pivot_table.PivotCache()
+            configure_pivot_cache_for_current_source(pivot_cache)
+            pivot_cache.Refresh()
             refreshed_cache_indexes.add(cache_index)
         except Exception:
             try:
@@ -526,6 +593,152 @@ def refresh_pivots(workbook) -> int:
             pass
 
     return len(pivot_tables_to_refresh)
+
+
+def apply_iphone_monthly_pivot_specs(workbook, report_date: date) -> None:
+    """Restore the target/process/phase filters that a cache refresh can discard."""
+    pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
+    if pivot_sheet is not None:
+        try:
+            pivot_tables = pivot_sheet.PivotTables()
+        except Exception:
+            pivot_tables = None
+        if pivot_tables is not None:
+            for pivot_name, filter_mode in IPHONE_PIVOT_TARGET_FILTERS.items():
+                try:
+                    pivot_table = pivot_tables(pivot_name)
+                except Exception:
+                    continue
+                try:
+                    pivot_table.ManualUpdate = False
+                except Exception:
+                    pass
+                apply_month_target_filter(
+                    pivot_table,
+                    report_date,
+                    filter_mode,
+                    orientation=3,
+                )
+                phase_field = find_named_pivot_field(pivot_table, {"Phase"})
+                allowed_phases = (
+                    IPHONE_ACTIVE_PHASES
+                    if pivot_name in {"PivotTable8", "PivotTable9", "PivotTable12"}
+                    else IPHONE_COMPLETE_PHASES
+                )
+                set_visible_items_exact(phase_field, allowed_phases)
+                try:
+                    pivot_table.RefreshTable()
+                except Exception:
+                    pass
+
+    progress_sheet = first_progress_sheet(workbook)
+    if progress_sheet is None:
+        return
+    try:
+        progress_pivots = progress_sheet.PivotTables()
+    except Exception:
+        return
+
+    progress_specs = {
+        "PivotTable9": ("target", IPHONE_COMPLETE_PHASES),
+        "PivotTable2": ("before_not_yet", IPHONE_ACTIVE_PHASES),
+    }
+    for pivot_name, (target_mode, allowed_phases) in progress_specs.items():
+        try:
+            pivot_table = progress_pivots(pivot_name)
+        except Exception:
+            continue
+        try:
+            pivot_table.ManualUpdate = False
+        except Exception:
+            pass
+        apply_month_target_filter(
+            pivot_table,
+            report_date,
+            target_mode,
+            orientation=1,
+            position=1,
+        )
+        process_field = find_named_pivot_field(pivot_table, {"Process Adjustment"})
+        set_visible_items_exact(process_field, {"New Reg", "Non New Reg"})
+        phase_field = find_named_pivot_field(pivot_table, {"Phase"})
+        set_visible_items_exact(phase_field, allowed_phases)
+        try:
+            pivot_table.RefreshTable()
+        except Exception:
+            pass
+
+    try:
+        left_pivot = progress_pivots("PivotTable9")
+        if int(left_pivot.TableRange2.Row) != 2:
+            left_pivot.TableRange2.Cut(progress_sheet.Range("A2"))
+    except Exception:
+        pass
+
+
+def pivot_group_max_height(pivot_sheet, pivot_names: tuple[str, ...]) -> int:
+    heights = []
+    for pivot_name in pivot_names:
+        try:
+            heights.append(int(pivot_sheet.PivotTables(pivot_name).TableRange2.Rows.Count))
+        except Exception:
+            pass
+    return max(heights, default=0)
+
+
+def find_pivot_title_row(pivot_sheet, marker: str) -> int | None:
+    marker_key = normalize_header_key(marker)
+    try:
+        used_range = pivot_sheet.UsedRange
+        values = used_range.Value
+    except Exception:
+        return None
+    if not values:
+        return None
+    if not isinstance(values, tuple):
+        value_rows = ((values,),)
+    elif values and not isinstance(values[0], tuple):
+        value_rows = (values,)
+    else:
+        value_rows = values
+    for row_offset, row_values in enumerate(value_rows, start=used_range.Row):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        for value in row_values:
+            if marker_key in normalize_header_key(value):
+                return row_offset
+    return None
+
+
+def shift_iphone_lower_sections_for_month_rollover(pivot_sheet, template_top_height: int) -> tuple[int, int | None]:
+    """Move lower sections when the refreshed top block grows at month rollover."""
+    current_top_height = pivot_group_max_height(
+        pivot_sheet,
+        ("PivotTable1", "PivotTable2", "PivotTable3", "PivotTable4"),
+    )
+    growth = current_top_height - template_top_height
+    if growth <= 0:
+        return 0, None
+
+    title_row = find_pivot_title_row(pivot_sheet, "delay completion")
+    if title_row is None:
+        return 0, None
+
+    row_shift = growth + 1
+    try:
+        pivot_sheet.Rows(f"{title_row}:{title_row + row_shift - 1}").Insert()
+    except Exception:
+        return 0, None
+    return row_shift, title_row
+
+
+def shifted_row_mapping(mapping: dict[int, object], start_row: int | None, row_shift: int) -> dict[int, object]:
+    if start_row is None or row_shift == 0:
+        return mapping
+    return {
+        (row + row_shift if row >= start_row else row): value
+        for row, value in mapping.items()
+    }
 
 
 def is_excluded_year_fab_upload_value(value: object) -> bool:
@@ -650,7 +863,7 @@ def capture_phase_pivot_formats(workbook, xl):
     return format_sheet, format_sources
 
 
-def repair_spilled_phase_pivot_blocks(workbook, xl=None, format_sources=None) -> None:
+def repair_spilled_phase_pivot_blocks(workbook, xl=None, format_sources=None, header_rows=None) -> None:
     """Rebuild only collapsed/#SPILL phase pivot blocks; leave normal pivots untouched."""
     pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
     iphone_sheet = sheet_by_name(workbook, IPHONE_SHEET_NAME)
@@ -717,7 +930,7 @@ def repair_spilled_phase_pivot_blocks(workbook, xl=None, format_sources=None) ->
                 counts[row["phase"]] += 1
         return counts
 
-    for header_row in (9, 56, 167):
+    for header_row in header_rows or (9, 56, 167):
         if not pivot_phase_block_needs_repair(pivot_sheet, header_row):
             continue
 
@@ -894,6 +1107,7 @@ def repair_percentage_completion_columns(
     column_widths=None,
     formula_offsets=None,
     grand_total_format_offsets=None,
+    header_rows=None,
 ) -> None:
     pivot_sheet = sheet_by_name(workbook, PIVOT_SHEET_NAME)
     if pivot_sheet is None:
@@ -904,23 +1118,31 @@ def repair_percentage_completion_columns(
     formula_offsets = formula_offsets or {}
     grand_total_format_offsets = grand_total_format_offsets or {}
 
-    for header_row in (9, 56, 167):
-        so_col = header_column(pivot_sheet, header_row, "SO Complete")
-        if so_col is None:
+    for header_row in header_rows or (9, 56, 167):
+        pivot_table = next(
+            (
+                pivot_sheet.PivotTables()(index)
+                for index in range(1, pivot_sheet.PivotTables().Count + 1)
+                if int(pivot_sheet.PivotTables()(index).TableRange1.Row) <= header_row
+                <= int(
+                    pivot_sheet.PivotTables()(index).TableRange1.Row
+                    + pivot_sheet.PivotTables()(index).TableRange1.Rows.Count
+                    - 1
+                )
+                and int(pivot_sheet.PivotTables()(index).TableRange1.Column) >= 5
+            ),
+            None,
+        )
+        if pivot_table is None:
             continue
 
-        formula_col = so_col + 1
+        table_start_col = int(pivot_table.TableRange1.Column)
+        table_end_col = table_start_col + int(pivot_table.TableRange1.Columns.Count) - 1
+        so_col = header_column(pivot_sheet, header_row, "SO Complete", table_start_col, table_end_col)
+        cancel_col = header_column(pivot_sheet, header_row, "Cancel", table_start_col, table_end_col)
+        formula_col = table_end_col + 1
         data_row_start = header_row + 1
-        data_row_end = data_row_start
-        for row_index in range(data_row_start, header_row + 80):
-            has_count = pivot_sheet.Cells(row_index, 3).Value is not None
-            has_so = pivot_sheet.Cells(row_index, so_col).Value is not None
-            has_change_target = pivot_sheet.Cells(row_index, formula_col + 1).Value is not None
-            if has_count or has_so or has_change_target:
-                data_row_end = row_index
-                continue
-            if row_index > data_row_start:
-                break
+        data_row_end = int(pivot_table.TableRange1.Row + pivot_table.TableRange1.Rows.Count - 1)
 
         for column_index in range(5, 20):
             if normalize_header_key(pivot_sheet.Cells(header_row, column_index).Value) == normalize_header_key(
@@ -941,14 +1163,16 @@ def repair_percentage_completion_columns(
 
         pivot_sheet.Cells(header_row, formula_col).Value = PERCENTAGE_COMPLETION_HEADER
         formula_letter = column_letter(formula_col)
-        source_offsets = formula_offsets.get(header_row) or [-1, 1]
-        if not source_offsets:
-            source_offsets = [-1]
-        numerator_terms = [f"{column_letter(formula_col + offset)}{{row}}" for offset in source_offsets]
+        numerator_columns = [column for column in (cancel_col, so_col) if column is not None]
 
         for row_index in range(data_row_start, data_row_end + 1):
-            numerator = "+".join(term.format(row=row_index) for term in numerator_terms)
-            formula = f"=({numerator})/C{row_index}"
+            if numerator_columns:
+                numerator = "+".join(
+                    f"{column_letter(column)}{row_index}" for column in numerator_columns
+                )
+                formula = f"=({numerator})/C{row_index}"
+            else:
+                formula = "=0"
             pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
             pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
@@ -1026,8 +1250,18 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         source_all_order = sheet_by_name(source_wb, ALL_ORDER_SHEET_NAME)
         target_all_order = sheet_by_name(target_wb, ALL_ORDER_SHEET_NAME)
         target_iphone = sheet_by_name(target_wb, IPHONE_SHEET_NAME)
-        if source_all_order is None or target_all_order is None or target_iphone is None:
+        target_pivot_sheet = sheet_by_name(target_wb, PIVOT_SHEET_NAME)
+        if source_all_order is None or target_all_order is None or target_iphone is None or target_pivot_sheet is None:
             raise ValueError("Input/reference workbook must contain ALL ORDER and ALL ORDER IPHONE sheets.")
+        template_top_height = pivot_group_max_height(
+            target_pivot_sheet,
+            ("PivotTable1", "PivotTable2", "PivotTable3", "PivotTable4"),
+        )
+        reference_report_date = reference_date_from_workbook_path(reference_workbook)
+        is_month_rollover = (
+            reference_report_date.year,
+            reference_report_date.month,
+        ) != (report_date.year, report_date.month)
 
         phase_start = time.perf_counter()
         (
@@ -1072,9 +1306,49 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         progress_name = rename_progress_sheet(target_wb, report_date)
         clear_stale_percentage_completion_columns(target_wb)
         refreshed_count = refresh_pivots(target_wb)
+        apply_iphone_monthly_pivot_specs(target_wb, report_date)
+        row_shift = 0
+        shift_start_row = None
+        if is_month_rollover:
+            row_shift, shift_start_row = shift_iphone_lower_sections_for_month_rollover(
+                target_pivot_sheet,
+                template_top_height,
+            )
+        if row_shift:
+            pct_format_sources = shifted_row_mapping(pct_format_sources, shift_start_row, row_shift)
+            pct_column_widths = shifted_row_mapping(pct_column_widths, shift_start_row, row_shift)
+            pct_formula_offsets = shifted_row_mapping(pct_formula_offsets, shift_start_row, row_shift)
+            pct_grand_total_format_offsets = shifted_row_mapping(
+                pct_grand_total_format_offsets,
+                shift_start_row,
+                row_shift,
+            )
+            phase_format_sources = shifted_row_mapping(phase_format_sources, shift_start_row, row_shift)
+        percentage_header_rows = tuple(sorted(pct_format_sources)) or (9, 56, 167 + row_shift)
+        phase_header_rows = tuple(sorted(phase_format_sources)) or percentage_header_rows
+        month_upper = report_date.strftime("%B").upper()
+        update_dynamic_pivot_section_titles(
+            target_wb.Worksheets(PIVOT_SHEET_NAME),
+            {
+                "target complete": (
+                    f" TARGET COMPLETE {month_upper} {report_date.year} "
+                    f"(Based on Dashboard {month_upper} {report_date.year})"
+                ),
+                "delay completion": (
+                    f"DELAY COMPLETION (SHOULD BE COMPLETE BEFORE "
+                    f"{month_upper} {report_date.year})"
+                ),
+                "all target": f"ALL TARGET {month_upper}",
+            },
+        )
         profile_log("refresh pivots", phase_start)
         phase_start = time.perf_counter()
-        repair_spilled_phase_pivot_blocks(target_wb, xl, phase_format_sources)
+        repair_spilled_phase_pivot_blocks(
+            target_wb,
+            xl,
+            phase_format_sources,
+            phase_header_rows,
+        )
         profile_log("repair spilled phase pivots", phase_start)
         phase_start = time.perf_counter()
         repair_percentage_completion_columns(
@@ -1084,6 +1358,16 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
             pct_column_widths,
             pct_formula_offsets,
             pct_grand_total_format_offsets,
+            percentage_header_rows,
+        )
+        align_completion_threshold_legends(
+            target_pivot_sheet,
+            report_date,
+            (
+                (13, 2, "weekly"),
+                (11, 3, "weekly"),
+                (22, 1, "weekly"),
+            ),
         )
         profile_log("repair percentage columns", phase_start)
         phase_start = time.perf_counter()
