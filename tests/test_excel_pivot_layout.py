@@ -5,26 +5,41 @@ from types import SimpleNamespace
 
 from excel_pivot_layout import (
     completion_legend_values,
+    completion_mode_for_row,
+    completion_section_modes,
     section_banner_end_columns,
     update_dynamic_pivot_section_titles,
 )
 
 
 class SectionBannerEndColumnsTests(unittest.TestCase):
-    def test_completion_legend_resets_each_month_and_caps_at_week_four(self):
+    def test_completion_legend_uses_the_week_one_threshold_band(self):
         self.assertEqual(
             completion_legend_values(date(2026, 9, 1)),
-            ("Green : >30%", "Yellow : >=30%", "Red : <20%"),
-        )
-        self.assertEqual(
-            completion_legend_values(date(2026, 9, 28)),
-            ("Green : >60%", "Yellow : >=60%", "Red : <50%"),
+            ("Green : >30%", "Yellow : >=20%", "Red : <20%"),
         )
 
-    def test_target_after_legend_uses_fixed_low_threshold(self):
+    def test_completion_legend_keeps_week_five_for_target_after(self):
         self.assertEqual(
-            completion_legend_values(date(2026, 9, 28), "target_after"),
-            ("Green : >10%", "Yellow : >=10%", "Red : <5%"),
+            completion_legend_values(date(2026, 9, 29), "target_after"),
+            ("Green : >50%", "Yellow : >=40%", "Red : <40%"),
+        )
+
+    def test_target_after_mode_is_detected_from_the_nearest_section(self):
+        values = (
+            ("TARGET COMPLETE SEPTEMBER 2026",),
+            (None,),
+            ("Percentage of Completion",),
+            ("TARGET AFTER SEPTEMBER 2026",),
+            (None,),
+            ("Percentage of Completion",),
+        )
+        section_modes = completion_section_modes(values, 10)
+
+        self.assertEqual(completion_mode_for_row(12, section_modes), "weekly")
+        self.assertEqual(
+            completion_mode_for_row(15, section_modes),
+            "target_after",
         )
 
     def test_updates_month_titles_without_fixed_cell_addresses(self):

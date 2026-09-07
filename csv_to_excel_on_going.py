@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 from charset_normalizer import from_path
+from completion_threshold_rules import ONGOING_PROFILE
 from excel_pivot_filters import (
     apply_month_target_filter,
     configure_pivot_cache_for_current_source,
@@ -1880,6 +1881,7 @@ def restore_ongoing_pivot_sheet_column_widths(pivot_sheet, reference_date: date 
                 (11, 1, "target_after"),
                 (13, 7, "weekly"),
             ),
+            profile=ONGOING_PROFILE,
         )
         profile_log("update pivot month titles", phase_start)
     phase_start = time.perf_counter()

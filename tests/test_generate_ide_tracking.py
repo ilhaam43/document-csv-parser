@@ -439,16 +439,18 @@ class IdeDateParsingTests(unittest.TestCase):
             (0, 0, False, True),
         )
 
-    def test_completion_thresholds_follow_report_week_and_cap_at_week_four(self) -> None:
+    def test_completion_thresholds_follow_the_five_business_week_buckets(self) -> None:
         expectations = {
-            1: (1, 30, 30, 20),
-            7: (1, 30, 30, 20),
-            8: (2, 40, 40, 30),
-            14: (2, 40, 40, 30),
-            15: (3, 50, 50, 40),
-            21: (3, 50, 50, 40),
-            22: (4, 60, 60, 50),
-            31: (4, 60, 60, 50),
+            1: (1, 30, 20, 20),
+            6: (1, 30, 20, 20),
+            7: (2, 40, 30, 30),
+            13: (2, 40, 30, 30),
+            14: (3, 50, 40, 40),
+            20: (3, 50, 40, 40),
+            21: (4, 60, 50, 50),
+            28: (4, 60, 50, 50),
+            29: (5, 60, 50, 50),
+            31: (5, 60, 50, 50),
         }
 
         for day, expected in expectations.items():

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from completion_threshold_rules import TARGET_AFTER_MODE, WEEKLY_MODE
 from excel_pivot_filters import (
     apply_month_target_filter,
     configure_pivot_cache_for_current_source,
@@ -52,6 +53,11 @@ EXCEL_TABLE_STYLE_NAME = "TableStyleMedium2"
 # Windows server, where workbooks can already consume substantial memory.
 EXCEL_COM_ROW_BATCH_SIZE = 250
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+IPHONE_COMPLETION_LAYOUT_SPECS = (
+    (13, 2, WEEKLY_MODE),
+    (11, 3, WEEKLY_MODE),
+    (22, 1, TARGET_AFTER_MODE),
+)
 PHASE_PIVOT_ORDER = (
     "00-New",
     "01-Presales",
@@ -1363,11 +1369,7 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         align_completion_threshold_legends(
             target_pivot_sheet,
             report_date,
-            (
-                (13, 2, "weekly"),
-                (11, 3, "weekly"),
-                (22, 1, "weekly"),
-            ),
+            IPHONE_COMPLETION_LAYOUT_SPECS,
         )
         profile_log("repair percentage columns", phase_start)
         phase_start = time.perf_counter()

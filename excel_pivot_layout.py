@@ -6,35 +6,143 @@ import re
 from collections.abc import Iterable
 from datetime import date
 
+from completion_threshold_rules import (
+    CompletionThresholds,
+    STANDARD_PROFILE,
+    TARGET_AFTER_MODE,
+    WEEKLY_MODE,
+    completion_legend_values_for,
+    completion_thresholds_for,
+)
+
 
 EXCEL_MAX_ROW = 1_048_576
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
+COMPLETION_SECTION_MARKERS = (
+    "target complete",
+    "new registration",
+    "non new registration",
+    "delay completion",
+    "target after",
+    "all target",
+    "target not inputted",
+    "target order on going process",
+    "all target order",
+)
 
 
 def normalize_layout_text(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def completion_legend_values(report_date: date, mode: str = "weekly") -> tuple[str, str, str]:
-    if mode == "target_after":
-        return "Green : >10%", "Yellow : >=10%", "Red : <5%"
-
-    report_week = min((report_date.day - 1) // 7 + 1, 4)
-    completion_threshold = 20 + report_week * 10
-    red_threshold = 10 + report_week * 10
-    return (
-        f"Green : >{completion_threshold}%",
-        f"Yellow : >={completion_threshold}%",
-        f"Red : <{red_threshold}%",
+def completion_legend_values(
+    report_date: date,
+    mode: str = WEEKLY_MODE,
+    profile: str = STANDARD_PROFILE,
+) -> tuple[str, str, str]:
+    return completion_legend_values_for(
+        report_date,
+        profile=profile,
+        mode=mode,
     )
+
+
+def completion_section_modes(
+    value_rows,
+    first_row: int,
+) -> list[tuple[int, str]]:
+    """Return dynamic normal/Target After section modes from visible labels."""
+    normalized_markers = tuple(
+        normalize_layout_text(marker) for marker in COMPLETION_SECTION_MARKERS
+    )
+    modes_by_row: dict[int, str] = {}
+    for row_index, row_values in enumerate(value_rows, start=first_row):
+        if not isinstance(row_values, tuple):
+            row_values = (row_values,)
+        for value in row_values:
+            normalized = normalize_layout_text(value)
+            if not normalized or not any(
+                marker in normalized for marker in normalized_markers
+            ):
+                continue
+            mode = (
+                TARGET_AFTER_MODE
+                if "targetafter" in normalized
+                else WEEKLY_MODE
+            )
+            if mode == TARGET_AFTER_MODE or row_index not in modes_by_row:
+                modes_by_row[row_index] = mode
+    return sorted(modes_by_row.items())
+
+
+def completion_mode_for_row(
+    row_number: int,
+    section_modes: Iterable[tuple[int, str]],
+    fallback: str = WEEKLY_MODE,
+) -> str:
+    if fallback == TARGET_AFTER_MODE:
+        return TARGET_AFTER_MODE
+    preceding_modes = [
+        (section_row, mode)
+        for section_row, mode in section_modes
+        if section_row <= row_number
+    ]
+    if not preceding_modes:
+        return fallback
+    return max(preceding_modes, key=lambda item: item[0])[1]
+
+
+def apply_completion_icon_thresholds(
+    target_range,
+    thresholds: CompletionThresholds,
+) -> int:
+    """Update every traffic-light icon rule applied to a percentage range."""
+    updated_rules = 0
+    format_conditions = target_range.FormatConditions
+    for condition_index in range(1, int(format_conditions.Count) + 1):
+        condition = format_conditions(condition_index)
+        try:
+            if int(condition.Type) != 6 or int(condition.IconSet.ID) != 4:
+                continue
+            criteria = condition.IconCriteria
+            criteria(2).Type = 0  # xlConditionValueNumber
+            criteria(2).Value = thresholds.yellow_percent / 100
+            criteria(2).Operator = 7  # xlGreaterEqual
+            criteria(3).Type = 0  # xlConditionValueNumber
+            criteria(3).Value = thresholds.green_percent / 100
+            criteria(3).Operator = 5  # xlGreater
+            updated_rules += 1
+        except Exception:
+            continue
+    return updated_rules
+
+
+def percentage_block_end_row(
+    pivot_sheet,
+    header_row: int,
+    header_col: int,
+    maximum_row: int,
+) -> int:
+    end_row = header_row
+    for row_number in range(header_row + 1, maximum_row + 1):
+        cell = pivot_sheet.Cells(row_number, header_col)
+        formula = str(cell.Formula or "")
+        value = cell.Value2
+        if formula.startswith("=") or value not in (None, ""):
+            end_row = row_number
+            continue
+        if end_row > header_row:
+            break
+    return end_row
 
 
 def align_completion_threshold_legends(
     pivot_sheet,
     report_date: date,
     layout_specs: Iterable[tuple[int, int, str]],
+    profile: str = STANDARD_PROFILE,
 ) -> None:
-    """Move completion legends beside dynamic percentage blocks and reset weekly thresholds."""
+    """Align legends and icon rules with the active weekly business thresholds."""
     try:
         used_range = pivot_sheet.UsedRange
         used_values = used_range.Value2
@@ -65,10 +173,22 @@ def align_completion_threshold_legends(
 
     percentage_headers.sort()
     legend_starts.sort()
+    section_modes = completion_section_modes(value_rows, int(used_range.Row))
+    maximum_row = int(used_range.Row + used_range.Rows.Count - 1)
     specs = list(layout_specs)
     for index, ((header_row, header_col), (minimum_col, row_offset, mode)) in enumerate(
         zip(percentage_headers, specs)
     ):
+        resolved_mode = completion_mode_for_row(
+            header_row,
+            section_modes,
+            mode,
+        )
+        thresholds = completion_thresholds_for(
+            report_date,
+            profile=profile,
+            mode=resolved_mode,
+        )
         target_row = header_row + row_offset
         target_col = max(minimum_col, header_col + 2)
         target_range = pivot_sheet.Range(
@@ -91,7 +211,32 @@ def align_completion_threshold_legends(
                 except Exception:
                     pass
 
-        target_range.Value = tuple((value,) for value in completion_legend_values(report_date, mode))
+        target_range.Value = tuple(
+            (value,)
+            for value in completion_legend_values(
+                report_date,
+                resolved_mode,
+                profile,
+            )
+        )
+
+        end_row = percentage_block_end_row(
+            pivot_sheet,
+            header_row,
+            header_col,
+            maximum_row,
+        )
+        if end_row <= header_row:
+            continue
+        percentage_range = pivot_sheet.Range(
+            pivot_sheet.Cells(header_row + 1, header_col),
+            pivot_sheet.Cells(end_row, header_col),
+        )
+        if apply_completion_icon_thresholds(percentage_range, thresholds) == 0:
+            raise RuntimeError(
+                "No traffic-light icon rule found for percentage block "
+                f"{pivot_sheet.Cells(header_row, header_col).Address}."
+            )
 
     for row_index, column_index in legend_starts[len(specs) :]:
         try:

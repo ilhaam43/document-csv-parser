@@ -21,7 +21,19 @@ from dateutil import parser as date_parser
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 
-from excel_pivot_layout import normalize_layout_text, resize_dynamic_pivot_section_banners
+from completion_threshold_rules import (
+    CompletionThresholds,
+    STANDARD_PROFILE,
+    WEEKLY_MODE,
+    completion_thresholds_for,
+)
+from excel_pivot_layout import (
+    apply_completion_icon_thresholds,
+    completion_mode_for_row,
+    completion_section_modes,
+    normalize_layout_text,
+    resize_dynamic_pivot_section_banners,
+)
 
 
 DEFAULT_INPUT_DIR = "input-ide"
@@ -199,14 +211,6 @@ class TargetPivotPageFilter:
     position: int
     selection_kinds: tuple[str, ...]
     show_all: bool
-
-
-@dataclass(frozen=True)
-class CompletionThresholds:
-    week: int
-    green_percent: int
-    yellow_percent: int
-    red_percent: int
 
 
 def is_missing(value: object) -> bool:
@@ -1868,15 +1872,15 @@ def normalize_pivot_percentage_borders(
         apply_red_outline(worksheet.Cells(end_row, percentage_column))
 
 
-def completion_thresholds(report_date: date) -> CompletionThresholds:
-    """Return the capped weekly completion thresholds for a report date."""
-    week = min(((report_date.day - 1) // 7) + 1, 4)
-    weekly_increment = (week - 1) * 10
-    return CompletionThresholds(
-        week=week,
-        green_percent=30 + weekly_increment,
-        yellow_percent=30 + weekly_increment,
-        red_percent=20 + weekly_increment,
+def completion_thresholds(
+    report_date: date,
+    mode: str = WEEKLY_MODE,
+) -> CompletionThresholds:
+    """Return the shared Report 4 completion thresholds."""
+    return completion_thresholds_for(
+        report_date,
+        profile=STANDARD_PROFILE,
+        mode=mode,
     )
 
 
@@ -1886,21 +1890,34 @@ def apply_weekly_completion_thresholds(
     report_date: date,
 ) -> None:
     """Update percentage legends and traffic-light rules for the report week."""
-    thresholds = completion_thresholds(report_date)
-    legend_values = {
-        "green": f"Green : >{thresholds.green_percent}%",
-        "yellow": f"Yellow : >={thresholds.yellow_percent}%",
-        "red": f"Red : <{thresholds.red_percent}%",
-    }
-
     used_range = worksheet.UsedRange
     used_values = used_range.Value2
+    value_rows = ()
     if used_values is not None:
-        for row_offset, row in enumerate(used_values):
+        if not isinstance(used_values, tuple):
+            value_rows = ((used_values,),)
+        elif used_values and not isinstance(used_values[0], tuple):
+            value_rows = (used_values,)
+        else:
+            value_rows = used_values
+
+    section_modes = completion_section_modes(value_rows, int(used_range.Row))
+    if value_rows:
+        for row_offset, row in enumerate(value_rows):
             for column_offset, value in enumerate(row):
                 if not isinstance(value, str):
                     continue
                 normalized = value.strip().casefold()
+                mode = completion_mode_for_row(
+                    int(used_range.Row) + row_offset,
+                    section_modes,
+                )
+                thresholds = completion_thresholds(report_date, mode)
+                legend_values = {
+                    "green": f"Green : >{thresholds.green_percent}%",
+                    "yellow": f"Yellow : >={thresholds.yellow_percent}%",
+                    "red": f"Red : <{thresholds.red_percent}%",
+                }
                 for prefix, replacement in legend_values.items():
                     if normalized.startswith(prefix):
                         worksheet.Cells(
@@ -1913,6 +1930,11 @@ def apply_weekly_completion_thresholds(
         pivot_table = worksheet.PivotTables(block.pivot_name)
         table_range = pivot_table.TableRange2
         header_row = int(table_range.Row) + block.header_row_offset
+        mode = completion_mode_for_row(
+            header_row,
+            section_modes,
+        )
+        thresholds = completion_thresholds(report_date, mode)
         formula_start_row = header_row + 1
         end_row = int(table_range.Row) + int(table_range.Rows.Count) - 1
         percentage_column = int(table_range.Column) + int(table_range.Columns.Count)
@@ -1923,27 +1945,7 @@ def apply_weekly_completion_thresholds(
             worksheet.Cells(formula_start_row, percentage_column),
             worksheet.Cells(end_row, percentage_column),
         )
-        updated_rules = 0
-        format_conditions = target_range.FormatConditions
-        for condition_index in range(1, int(format_conditions.Count) + 1):
-            condition = format_conditions(condition_index)
-            try:
-                if int(condition.Type) != 6 or int(condition.IconSet.ID) != 4:
-                    continue
-                criteria = condition.IconCriteria
-                criteria(2).Type = 0  # xlConditionValueNumber
-                criteria(2).Value = thresholds.red_percent / 100
-                criteria(2).Operator = 7  # xlGreaterEqual
-                criteria(3).Type = 0  # xlConditionValueNumber
-                criteria(3).Value = thresholds.green_percent / 100
-                criteria(3).Operator = 5  # xlGreater
-                updated_rules += 1
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Could not update percentage color rule for '{block.pivot_name}': {exc}"
-                ) from exc
-
-        if updated_rules == 0:
+        if apply_completion_icon_thresholds(target_range, thresholds) == 0:
             raise RuntimeError(
                 f"No traffic-light rule found for percentage block '{block.pivot_name}'."
             )

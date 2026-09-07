@@ -20,10 +20,19 @@ from csv_to_excel import (
     fill_missing_with_quo_lookup,
     target_header_month_name,
     target_header_period,
+    validated_pivot_report_date,
 )
 
 
 class ReportOneBusinessRuleTests(unittest.TestCase):
+    def test_weekly_pivot_rules_preserve_the_actual_report_day(self) -> None:
+        report_date = date(2026, 8, 28)
+
+        self.assertEqual(
+            validated_pivot_report_date(report_date, "TARGET  Detemined as 1 Aug 26"),
+            report_date,
+        )
+
     def test_cleaning_preserves_pm_display_key_whitespace(self) -> None:
         options = SimpleNamespace(
             normalize_headers=True,

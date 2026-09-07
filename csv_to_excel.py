@@ -320,6 +320,17 @@ def target_header_period(target_header: str) -> tuple[int, int] | None:
     return year, datetime.strptime(month_name, "%B").month
 
 
+def validated_pivot_report_date(report_date: date, target_header: str) -> date:
+    """Keep the report day for weekly rules while validating the target month."""
+    target_period = target_header_period(target_header)
+    if target_period != (report_date.year, report_date.month):
+        raise RuntimeError(
+            "Report date does not match the dynamic target header period: "
+            f"{report_date.isoformat()} vs {target_header!r}."
+        )
+    return report_date
+
+
 def add_target_header(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
     if TARGET_HEADER_INSERT_AFTER not in df.columns or TARGET_SOURCE_HEADER not in df.columns:
         return df
@@ -2260,6 +2271,7 @@ def update_template_workbook_via_com(
     progress_sheet_name: str,
     target_header: str,
     hidden_all_order_columns: set[str],
+    report_date: date,
 ) -> None:
     """Replace data sheets in a copied template workbook and refresh its existing pivots."""
     try:
@@ -3369,17 +3381,7 @@ def update_template_workbook_via_com(
 
         data_range = data_sheet.Range(data_sheet.Cells(1, 1), data_sheet.Cells(row_count, column_count))
         source_data = f"'{VLOOKUP_SHEET_NAME}'!{data_range.Address}"
-        report_month_name = target_header_month_name(target_header)
-        report_year_match = re.search(r"\b(\d{4}|\d{2})\s*$", target_header.strip())
-        report_year = int(report_year_match.group(1)) if report_year_match else datetime.now().year
-        if report_year < 100:
-            report_year += 2000
-        report_month = (
-            datetime.strptime(report_month_name, "%B").month
-            if report_month_name
-            else datetime.now().month
-        )
-        pivot_report_date = date(report_year, report_month, 1)
+        pivot_report_date = validated_pivot_report_date(report_date, target_header)
 
         def _apply_dashboard_pivot_spec(pivot_table) -> bool:
             pivot_name = str(pivot_table.Name).split("_", 1)[0]
@@ -3933,6 +3935,7 @@ def convert_one(csv_path: Path, output_path: Path, options: ConvertOptions) -> N
                 progress_sheet_name,
                 target_header,
                 hidden_columns,
+                reference_date_from_csv_path(csv_path),
             )
             _profile("update template workbook via Excel COM")
         else:
