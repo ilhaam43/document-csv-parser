@@ -78,7 +78,9 @@ async function fetchJson(url, options = {}) {
   });
   const payload = await readJsonResponse(response);
   if (!response.ok) {
-    throw new Error(payload.detail || payload.error || `Request failed: HTTP ${response.status}`);
+    const error = new Error(payload.detail || payload.error || `Request failed: HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -86,6 +88,7 @@ async function fetchJson(url, options = {}) {
 async function waitForJob(statusUrl) {
   const startedAt = Date.now();
   let transientFailures = 0;
+  const registrationGracePeriodMs = 10 * 60 * 1000;
 
   while (true) {
     let payload;
@@ -94,10 +97,13 @@ async function waitForJob(statusUrl) {
       transientFailures = 0;
     } catch (error) {
       const retryWindowMs = 60 * 60 * 1000;
+      const waitingForRegistration =
+        error.status === 404 && Date.now() - startedAt < registrationGracePeriodMs;
       const canRetry =
-        error instanceof TransientGatewayError &&
-        Date.now() - startedAt < retryWindowMs &&
-        transientFailures < 240;
+        waitingForRegistration ||
+        (error instanceof TransientGatewayError &&
+          Date.now() - startedAt < retryWindowMs &&
+          transientFailures < 240);
 
       if (!canRetry) {
         throw error;
@@ -143,10 +149,14 @@ fetch("/health")
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const started = jobMonitor.startSubmission();
+  const jobId = jobMonitor.createJobId();
+  const started = jobMonitor.startSubmission({
+    statusUrl: `/jobs/report-1/${jobId}`,
+  });
 
   try {
     const body = new FormData(form);
+    body.set("job_id", jobId);
     body.set("refresh_template", document.getElementById("refresh_template").checked ? "true" : "false");
 
     const queued = await fetchJson("/convert/upload/jobs", {

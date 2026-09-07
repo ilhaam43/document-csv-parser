@@ -297,6 +297,15 @@ def _now_seconds() -> float:
     return round(time.time(), 3)
 
 
+def _normalize_upload_job_id(job_id: str | None) -> str:
+    if not job_id:
+        return uuid.uuid4().hex
+    try:
+        return uuid.UUID(job_id).hex
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="job_id must be a valid UUID.") from exc
+
+
 def _set_report_1_job(job_id: str, **updates: object) -> None:
     with REPORT_1_JOBS_LOCK:
         job = REPORT_1_JOBS.get(job_id)
@@ -1293,6 +1302,7 @@ async def start_report_1_upload_job(
     request: Request,
     raw_data: UploadFile = File(...),
     yesterday_cleaned_data: UploadFile = File(...),
+    job_id: str | None = Form(default=None),
     delimiter: str | None = Form(default=None),
     encoding: str | None = Form(default=None),
     normalize_headers: bool = Form(default=True),
@@ -1307,7 +1317,16 @@ async def start_report_1_upload_job(
     if not yesterday_cleaned_data.filename or not yesterday_cleaned_data.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="yesterday_cleaned_data must be a .xlsx file.")
 
-    job_id = uuid.uuid4().hex
+    job_id = _normalize_upload_job_id(job_id)
+    with REPORT_1_JOBS_LOCK:
+        if job_id in REPORT_1_JOBS:
+            raise HTTPException(status_code=409, detail="Report 1 job already exists.")
+        REPORT_1_JOBS[job_id] = {
+            "status": "uploading",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+        }
+
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     input_path = _job_input_path(job_dir, "raw-data", raw_data.filename)
@@ -1320,6 +1339,12 @@ async def start_report_1_upload_job(
         await _save_upload_file(yesterday_cleaned_data, lookup_workbook_path)
     except Exception as exc:
         logger.exception("Report 1 upload save failed for job %s", job_id)
+        _set_report_1_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     conversion_request = ConvertPathRequest(
@@ -1336,15 +1361,14 @@ async def start_report_1_upload_job(
     )
 
     with REPORT_1_JOBS_LOCK:
-        REPORT_1_JOBS[job_id] = {
+        REPORT_1_JOBS[job_id].update({
             "status": "queued",
-            "created_at": _now_seconds(),
             "updated_at": _now_seconds(),
             "raw_data_filename": input_path.name,
             "yesterday_cleaned_data_filename": lookup_workbook_path.name,
             "filename": output_path.name,
             "refresh_template": refresh_template,
-        }
+        })
 
     REPORT_1_EXECUTOR.submit(
         _run_report_1_upload_job,
@@ -1451,6 +1475,7 @@ async def start_report_2_upload_job(
     tracking_workbook: UploadFile = File(...),
     log_update_status: UploadFile = File(...),
     previous_ongoing_workbook: UploadFile = File(...),
+    job_id: str | None = Form(default=None),
     with_pivot: bool = Form(default=False),
 ) -> dict[str, object]:
     if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
@@ -1460,7 +1485,16 @@ async def start_report_2_upload_job(
     if not previous_ongoing_workbook.filename or not previous_ongoing_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_ongoing_workbook must be a .xlsx file.")
 
-    job_id = uuid.uuid4().hex
+    job_id = _normalize_upload_job_id(job_id)
+    with REPORT_2_JOBS_LOCK:
+        if job_id in REPORT_2_JOBS:
+            raise HTTPException(status_code=409, detail="Report 2 job already exists.")
+        REPORT_2_JOBS[job_id] = {
+            "status": "uploading",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+        }
+
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
@@ -1475,19 +1509,24 @@ async def start_report_2_upload_job(
         await _save_upload_file(previous_ongoing_workbook, previous_ongoing_path)
     except Exception as exc:
         logger.exception("Report 2 upload save failed for job %s", job_id)
+        _set_report_2_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     with REPORT_2_JOBS_LOCK:
-        REPORT_2_JOBS[job_id] = {
+        REPORT_2_JOBS[job_id].update({
             "status": "queued",
-            "created_at": _now_seconds(),
             "updated_at": _now_seconds(),
             "tracking_workbook_filename": tracking_path.name,
             "log_update_status_filename": log_path.name,
             "previous_ongoing_workbook_filename": previous_ongoing_path.name,
             "filename": output_path.name,
             "with_pivot": with_pivot,
-        }
+        })
 
     REPORT_2_EXECUTOR.submit(
         _run_report_2_upload_job,
@@ -1579,13 +1618,23 @@ async def start_report_3_upload_job(
     request: Request,
     tracking_workbook: UploadFile = File(...),
     previous_iphone_workbook: UploadFile = File(...),
+    job_id: str | None = Form(default=None),
 ) -> dict[str, object]:
     if not tracking_workbook.filename or not tracking_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="tracking_workbook must be a .xlsx file.")
     if not previous_iphone_workbook.filename or not previous_iphone_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_iphone_workbook must be a .xlsx file.")
 
-    job_id = uuid.uuid4().hex
+    job_id = _normalize_upload_job_id(job_id)
+    with REPORT_3_JOBS_LOCK:
+        if job_id in REPORT_3_JOBS:
+            raise HTTPException(status_code=409, detail="Report 3 job already exists.")
+        REPORT_3_JOBS[job_id] = {
+            "status": "uploading",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+        }
+
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = _job_input_path(job_dir, "daily-tracking", tracking_workbook.filename)
@@ -1598,17 +1647,22 @@ async def start_report_3_upload_job(
         await _save_upload_file(previous_iphone_workbook, reference_path)
     except Exception as exc:
         logger.exception("Report 3 upload save failed for job %s", job_id)
+        _set_report_3_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     with REPORT_3_JOBS_LOCK:
-        REPORT_3_JOBS[job_id] = {
+        REPORT_3_JOBS[job_id].update({
             "status": "queued",
-            "created_at": _now_seconds(),
             "updated_at": _now_seconds(),
             "tracking_workbook_filename": tracking_path.name,
             "previous_iphone_workbook_filename": reference_path.name,
             "filename": output_path.name,
-        }
+        })
 
     REPORT_3_EXECUTOR.submit(
         _run_report_3_upload_job,
@@ -1683,6 +1737,7 @@ async def start_report_4_upload_job(
     raw_ide_workbook: UploadFile = File(...),
     previous_ide_workbook: UploadFile = File(...),
     collabs_csv: UploadFile = File(...),
+    job_id: str | None = Form(default=None),
 ) -> dict[str, object]:
     if not raw_ide_workbook.filename or not raw_ide_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="raw_ide_workbook must be a .xlsx file.")
@@ -1690,7 +1745,16 @@ async def start_report_4_upload_job(
         raise HTTPException(status_code=400, detail="previous_ide_workbook must be a .xlsx file.")
     if not collabs_csv.filename or not collabs_csv.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="collabs_csv must be a .csv file.")
-    job_id = uuid.uuid4().hex
+    job_id = _normalize_upload_job_id(job_id)
+    with REPORT_4_JOBS_LOCK:
+        if job_id in REPORT_4_JOBS:
+            raise HTTPException(status_code=409, detail="Report 4 job already exists.")
+        REPORT_4_JOBS[job_id] = {
+            "status": "uploading",
+            "created_at": _now_seconds(),
+            "updated_at": _now_seconds(),
+        }
+
     job_dir = (APP_ROOT / API_WORK_DIR / job_id).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     raw_path = _job_input_path(job_dir, "raw-ide", raw_ide_workbook.filename)
@@ -1704,21 +1768,26 @@ async def start_report_4_upload_job(
         resolved_report_date = determine_ide_report_date(None, raw_path)
     except Exception as exc:
         logger.exception("Report 4 upload save failed for job %s", job_id)
+        _set_report_4_job(
+            job_id,
+            status="failed",
+            completed_at=_now_seconds(),
+            error=str(exc),
+        )
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     output_path = (job_dir / ide_output_filename(resolved_report_date)).resolve()
     with REPORT_4_JOBS_LOCK:
-        REPORT_4_JOBS[job_id] = {
+        REPORT_4_JOBS[job_id].update({
             "status": "queued",
-            "created_at": _now_seconds(),
             "updated_at": _now_seconds(),
             "raw_ide_workbook_filename": raw_path.name,
             "previous_ide_workbook_filename": previous_path.name,
             "collabs_csv_filename": collabs_path.name,
             "report_date": resolved_report_date.isoformat(),
             "filename": output_path.name,
-        }
+        })
 
     REPORT_4_EXECUTOR.submit(
         _run_report_4_upload_job,
@@ -1767,13 +1836,7 @@ async def start_pipeline_upload_job(
     if not previous_iphone_workbook.filename or not previous_iphone_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_iphone_workbook must be a .xlsx file.")
 
-    if job_id:
-        try:
-            job_id = uuid.UUID(job_id).hex
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="job_id must be a valid UUID.") from exc
-    else:
-        job_id = uuid.uuid4().hex
+    job_id = _normalize_upload_job_id(job_id)
 
     with PIPELINE_JOBS_LOCK:
         if job_id in PIPELINE_JOBS:

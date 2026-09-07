@@ -61,6 +61,18 @@
       }
     }
 
+    function createJobId() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID().replaceAll("-", "");
+      }
+
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    }
+
     function stopProgress() {
       if (progressTimer !== null) {
         window.clearInterval(progressTimer);
@@ -84,6 +96,9 @@
     }
 
     function fail(error) {
+      if (pageIsUnloading) {
+        return;
+      }
       clearStoredJob();
       stopProgress();
       statusBox.className = "status-box bad";
@@ -116,12 +131,19 @@
       }
     }
 
-    function startSubmission() {
+    function startSubmission(pendingJob = null) {
       clearStoredJob();
       hideDownload();
       statusBox.className = "status-box";
       button.disabled = true;
       const startedAt = Date.now();
+      if (pendingJob) {
+        saveStoredJob({
+          statusUrl: pendingJob.statusUrl,
+          startedAt,
+          filename: pendingJob.filename || "",
+        });
+      }
       startProgress(startedAt);
       return startedAt;
     }
@@ -144,6 +166,7 @@
     }
 
     return {
+      createJobId,
       fail,
       startSubmission,
       trackQueuedJob,
