@@ -15,8 +15,6 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
-from urllib import request as url_request
-from urllib.error import HTTPError, URLError
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -44,10 +42,11 @@ from generate_ide_tracking import (
     determine_report_date as determine_ide_report_date,
     output_filename as ide_output_filename,
 )
-from send_report_1_email import excel_range_to_png, excel_pivot_regions_to_png, send_email, send_email_images
+from send_report_1_email import discover_pivot_ranges, excel_range_to_png, send_report_email
 from send_report_2_email import REPORT_2_IMAGE_IDS, report_2_ranges
 from send_report_3_email import report_3_target_complete_range
 from send_report_4_email import REPORT_4_IMAGE_IDS, report_4_ranges
+from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 from pipeline_stage_runner import run_daily_stage, run_ide_stage, run_iphone_stage, run_ongoing_stage
 
 
@@ -63,6 +62,7 @@ EMAIL_WORK_DIR = Path("output-today/email")
 EMAIL_2_WORK_DIR = Path("output-outgoing/email")
 EMAIL_3_WORK_DIR = Path("output-iphone/email")
 EMAIL_4_WORK_DIR = Path("output-ide/email")
+SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_ROOT", str(APP_ROOT / "screenshots"))).resolve()
 RUNTIME_DIRS = (
     Path("input-today"),
     CONVERSION_OUTPUT_DIR,
@@ -76,6 +76,7 @@ RUNTIME_DIRS = (
     EMAIL_2_WORK_DIR,
     EMAIL_3_WORK_DIR,
     EMAIL_4_WORK_DIR,
+    SCREENSHOT_DIR,
 )
 
 
@@ -113,6 +114,7 @@ app = FastAPI(
     version="1.0.0",
 )
 app.mount("/static", StaticFiles(directory=APP_ROOT / "static"), name="static")
+app.mount("/screenshots", StaticFiles(directory=SCREENSHOT_DIR), name="screenshots")
 
 
 @contextlib.contextmanager
@@ -165,40 +167,23 @@ def _download_url(request: Request, job_id: str, filename: str) -> str:
     return f"/outputs/{job_id}/{quote(filename)}"
 
 
-def _upload_image_to_onedrive(image_path: Path) -> dict[str, object]:
-    access_token = os.getenv("ONEDRIVE_ACCESS_TOKEN")
-    drive_id = os.getenv("ONEDRIVE_DRIVE_ID")
-    if not access_token or not drive_id:
-        raise RuntimeError("Set ONEDRIVE_ACCESS_TOKEN and ONEDRIVE_DRIVE_ID before sending an email.")
-
-    folder = os.getenv("ONEDRIVE_FOLDER", "Daily Reports").strip("/")
-    path_parts = [part for part in folder.split("/") if part] + [image_path.name]
-    encoded_path = "/".join(quote(part, safe="") for part in path_parts)
-    endpoint = f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/root:/{encoded_path}:/content"
-    upload_request = url_request.Request(
-        endpoint,
-        data=image_path.read_bytes(),
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "image/png",
-        },
+def _prepared_email_result(
+    result: dict[str, object],
+    message: str,
+    content_ids: tuple[str, ...],
+    recipient: str,
+    subject: str,
+) -> dict[str, object]:
+    public_images = [str(url) for url in result.get("public_images", [])]
+    result.update(
+        status="prepared",
+        message="Screenshots published. Run the local sender while connected to the VPN.",
+        email_message=replace_inline_image_sources(message, list(content_ids), public_images),
+        recipient=recipient,
+        subject=subject,
+        smtp_delivery_required=True,
     )
-    try:
-        with url_request.urlopen(upload_request, timeout=60) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-    except (HTTPError, URLError) as exc:
-        detail = exc.read().decode("utf-8", errors="replace") if isinstance(exc, HTTPError) else str(exc)
-        raise RuntimeError(f"OneDrive upload failed: {detail}") from exc
-
-    import json
-
-    result = json.loads(payload) if payload else {}
-    return {
-        "id": result.get("id"),
-        "name": result.get("name", image_path.name),
-        "web_url": result.get("webUrl"),
-    }
+    return result
 
 
 def _run_email_report(
@@ -210,25 +195,35 @@ def _run_email_report(
     dry_run: bool,
 ) -> dict[str, object]:
     started = time.perf_counter()
-    images = excel_pivot_regions_to_png(workbook_path, image_dir)
+    ranges = discover_pivot_ranges(workbook_path)
+    targets = report_screenshot_targets(APP_ROOT, 1, len(ranges))
+    images = []
+    for (cell_range, content_id), (public_path, public_url) in zip(ranges, targets):
+        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        images.append((public_path, content_id, cell_range, public_url))
     result: dict[str, object] = {
-        "image_filenames": [image_path.name for image_path, _, _ in images],
-        "ranges": [cell_range for _, _, cell_range in images],
+        "image_filenames": [image_path.name for image_path, _, _, _ in images],
+        "ranges": [cell_range for _, _, cell_range, _ in images],
+        "public_images": [public_url for _, _, _, public_url in images],
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     if dry_run:
         result["status"] = "preview_created"
-        result["message"] = "Screenshot created. OneDrive and SMTP were skipped because dry_run=true."
+        result["message"] = "Screenshots published. SMTP was skipped because dry_run=true."
         return result
 
-    result["onedrive"] = [_upload_image_to_onedrive(image_path) for image_path, _, _ in images]
+    public_message = replace_inline_image_sources(
+        message,
+        [content_id for _, content_id, _, _ in images],
+        [public_url for _, _, _, public_url in images],
+    )
     smtp_endpoint = os.getenv(
         "SMTP_API_URL",
         "http://10.34.144.197/secm-portal/smtp/api_send_email",
     )
-    send_email_images(smtp_endpoint, recipient, subject, message, [(image_path, content_id) for image_path, content_id, _ in images], timeout=60)
+    send_report_email(smtp_endpoint, recipient, subject, public_message, workbook_path, timeout=60)
     result["status"] = "sent"
-    result["message"] = "Screenshot uploaded to OneDrive and sent through the SMTP API."
+    result["message"] = "Screenshots published and sent through the SMTP API."
     result["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     return result
 
@@ -236,48 +231,51 @@ def _run_email_report(
 def _run_email_report_2(workbook_path: Path, image_path: Path, recipient: str, subject: str, message: str, dry_run: bool) -> dict[str, object]:
     started = time.perf_counter()
     images = []
-    for index, (cell_range, content_id) in enumerate(report_2_ranges(workbook_path), start=1):
-        output_path = image_path.parent / f"{workbook_path.stem} - report-2-pivot-{index}.png"
+    ranges = report_2_ranges(workbook_path)
+    targets = report_screenshot_targets(APP_ROOT, 2, len(ranges))
+    for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
         excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
-        images.append((output_path, content_id, cell_range))
-    result: dict[str, object] = {"image_filenames": [path.name for path, _, _ in images], "ranges": [cell_range for _, _, cell_range in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
+        images.append((output_path, content_id, cell_range, public_url))
+    result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
-        result.update(status="preview_created", message="Report 2 screenshot created. OneDrive and SMTP were skipped because dry_run=true.")
+        result.update(status="preview_created", message="Report 2 screenshots published. SMTP was skipped because dry_run=true.")
         return result
-    result["onedrive"] = [_upload_image_to_onedrive(path) for path, _, _ in images]
-    send_email_images(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, message, [(path, content_id) for path, content_id, _ in images], timeout=60)
-    result.update(status="sent", message="Report 2 screenshot uploaded to OneDrive and sent through the SMTP API.")
+    public_message = replace_inline_image_sources(message, [content_id for _, content_id, _, _ in images], [url for _, _, _, url in images])
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    result.update(status="sent", message="Report 2 screenshots published and sent through the SMTP API.")
     return result
 
 
 def _run_email_report_3(workbook_path: Path, image_path: Path, recipient: str, subject: str, message: str, dry_run: bool) -> dict[str, object]:
     started = time.perf_counter()
     cell_range = report_3_target_complete_range(workbook_path)
-    excel_range_to_png(workbook_path, image_path, "PIVOT", cell_range)
-    result: dict[str, object] = {"image_filename": image_path.name, "range": cell_range, "elapsed_seconds": round(time.perf_counter() - started, 3)}
+    public_path, public_url = report_screenshot_targets(APP_ROOT, 3, 1)[0]
+    excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range)
+    result: dict[str, object] = {"image_filename": public_path.name, "range": cell_range, "public_images": [public_url], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
-        result.update(status="preview_created", message="Report 3 screenshot created. OneDrive and SMTP were skipped because dry_run=true.")
+        result.update(status="preview_created", message="Report 3 screenshot published. SMTP was skipped because dry_run=true.")
         return result
-    result["onedrive"] = _upload_image_to_onedrive(image_path)
-    send_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, message, image_path, timeout=60, content_id="report-3-pivot")
-    result.update(status="sent", message="Report 3 screenshot uploaded to OneDrive and sent through the SMTP API.")
+    public_message = replace_inline_image_sources(message, ["report-3-pivot"], [public_url])
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    result.update(status="sent", message="Report 3 screenshot published and sent through the SMTP API.")
     return result
 
 
 def _run_email_report_4(workbook_path: Path, image_path: Path, recipient: str, subject: str, message: str, dry_run: bool) -> dict[str, object]:
     started = time.perf_counter()
     images = []
-    for index, (cell_range, content_id) in enumerate(report_4_ranges(workbook_path), start=1):
-        output_path = image_path.parent / f"{workbook_path.stem} - report-4-pivot-{index}.png"
+    ranges = report_4_ranges(workbook_path)
+    targets = report_screenshot_targets(APP_ROOT, 4, len(ranges))
+    for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
         excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
-        images.append((output_path, content_id, cell_range))
-    result: dict[str, object] = {"image_filenames": [path.name for path, _, _ in images], "ranges": [cell_range for _, _, cell_range in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
+        images.append((output_path, content_id, cell_range, public_url))
+    result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
-        result.update(status="preview_created", message="Report 4 screenshot created. OneDrive and SMTP were skipped because dry_run=true.")
+        result.update(status="preview_created", message="Report 4 screenshots published. SMTP was skipped because dry_run=true.")
         return result
-    result["onedrive"] = [_upload_image_to_onedrive(path) for path, _, _ in images]
-    send_email_images(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, message, [(path, content_id) for path, content_id, _ in images], timeout=60)
-    result.update(status="sent", message="Report 4 screenshot uploaded to OneDrive and sent through the SMTP API.")
+    public_message = replace_inline_image_sources(message, [content_id for _, content_id, _, _ in images], [url for _, _, _, url in images])
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    result.update(status="sent", message="Report 4 screenshots published and sent through the SMTP API.")
     return result
 
 
@@ -957,6 +955,12 @@ def email_report_4_page() -> FileResponse:
     return frontend_page("email-report-4.html")
 
 
+@app.get("/tools/local_send_report_email.py")
+def download_local_email_sender() -> FileResponse:
+    script_path = APP_ROOT / "local_send_report_email.py"
+    return FileResponse(script_path, media_type="text/x-python", filename=script_path.name)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -992,10 +996,10 @@ async def send_email_report(
             recipient.strip(),
             subject.strip(),
             message,
-            dry_run,
+            True,
         )
         result["image_dir"] = str(image_dir)
-        return result
+        return _prepared_email_result(result, message, required_content_ids, recipient.strip(), subject.strip())
     except Exception as exc:
         logger.exception("Email report failed for %s", workbook_path)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1022,9 +1026,9 @@ async def send_email_report_2(
     image_path = job_dir / f"{workbook_path.stem} - report-2-pivot.png"
     try:
         await _save_upload_file(workbook, workbook_path)
-        result = await run_in_threadpool(_run_email_report_2, workbook_path, image_path, recipient.strip(), subject.strip(), message, dry_run)
+        result = await run_in_threadpool(_run_email_report_2, workbook_path, image_path, recipient.strip(), subject.strip(), message, True)
         result["image_path"] = str(image_path)
-        return result
+        return _prepared_email_result(result, message, REPORT_2_IMAGE_IDS, recipient.strip(), subject.strip())
     except Exception as exc:
         logger.exception("Report 2 email failed for %s", workbook_path)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1050,9 +1054,9 @@ async def send_email_report_3(
     image_path = job_dir / f"{workbook_path.stem} - report-3-pivot.png"
     try:
         await _save_upload_file(workbook, workbook_path)
-        result = await run_in_threadpool(_run_email_report_3, workbook_path, image_path, recipient.strip(), subject.strip(), message, dry_run)
+        result = await run_in_threadpool(_run_email_report_3, workbook_path, image_path, recipient.strip(), subject.strip(), message, True)
         result["image_path"] = str(image_path)
-        return result
+        return _prepared_email_result(result, message, ("report-3-pivot",), recipient.strip(), subject.strip())
     except Exception as exc:
         logger.exception("Report 3 email failed for %s", workbook_path)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1078,12 +1082,38 @@ async def send_email_report_4(
     image_path = job_dir / f"{workbook_path.stem} - report-4-pivot.png"
     try:
         await _save_upload_file(workbook, workbook_path)
-        result = await run_in_threadpool(_run_email_report_4, workbook_path, image_path, recipient.strip(), subject.strip(), message, dry_run)
+        result = await run_in_threadpool(_run_email_report_4, workbook_path, image_path, recipient.strip(), subject.strip(), message, True)
         result["image_path"] = str(image_path)
-        return result
+        return _prepared_email_result(result, message, REPORT_4_IMAGE_IDS, recipient.strip(), subject.strip())
     except Exception as exc:
         logger.exception("Report 4 email failed for %s", workbook_path)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/email-report/prepare")
+async def prepare_email_report(
+    report_number: int = Form(...),
+    workbook: UploadFile = File(...),
+    recipient: str = Form(...),
+    subject: str = Form(...),
+    message: str = Form(...),
+) -> dict[str, object]:
+    handlers = {
+        1: send_email_report,
+        2: send_email_report_2,
+        3: send_email_report_3,
+        4: send_email_report_4,
+    }
+    handler = handlers.get(report_number)
+    if handler is None:
+        raise HTTPException(status_code=400, detail="report_number must be 1, 2, 3, or 4.")
+    return await handler(
+        workbook=workbook,
+        recipient=recipient,
+        subject=subject,
+        message=message,
+        dry_run=True,
+    )
 
 
 @app.get("/jobs/report-1/{job_id}")

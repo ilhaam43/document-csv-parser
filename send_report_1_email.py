@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from urllib import request
 
+from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
+
 
 DEFAULT_ENDPOINT = "http://10.34.144.197/secm-portal/smtp/api_send_email"
 DEFAULT_RECIPIENT = "ilhaam.akmal@lintasarta.co.id"
@@ -89,7 +91,8 @@ def excel_range_to_png(
                     raise
                 time.sleep(0.75)
         image_path.parent.mkdir(parents=True, exist_ok=True)
-        chart.Chart.Export(str(image_path.resolve()), "PNG")
+        image_format = "JPG" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
+        chart.Chart.Export(str(image_path.resolve()), image_format)
     finally:
         if chart is not None:
             try:
@@ -220,7 +223,7 @@ def multipart_form_images(fields: dict[str, str], images: list[tuple[Path, str]]
             (
                 'Content-Disposition: form-data; name="attachment[]"; '
                 f'filename="{image_path.name}"\r\n'
-                "Content-Type: image/png\r\n"
+                f"Content-Type: {mimetypes.guess_type(image_path.name)[0] or 'application/octet-stream'}\r\n"
                 f"Content-ID: <{content_id}>\r\n\r\n"
             ).encode(),
             image_path.read_bytes(),
@@ -228,6 +231,53 @@ def multipart_form_images(fields: dict[str, str], images: list[tuple[Path, str]]
         ])
     chunks.append(f"--{boundary}--\r\n".encode())
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def multipart_form_attachment(fields: dict[str, str], attachment_path: Path) -> tuple[bytes, str]:
+    boundary = f"----ReportEmailBoundary{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            value.encode("utf-8"),
+            b"\r\n",
+        ])
+
+    content_type = mimetypes.guess_type(attachment_path.name)[0] or "application/octet-stream"
+    chunks.extend([
+        f"--{boundary}\r\n".encode(),
+        (
+            'Content-Disposition: form-data; name="attachment[]"; '
+            f'filename="{attachment_path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode(),
+        attachment_path.read_bytes(),
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def send_report_email(
+    endpoint: str,
+    recipient: str,
+    subject: str,
+    message: str,
+    workbook_path: Path,
+    timeout: int = 60,
+) -> None:
+    body, content_type = multipart_form_attachment(
+        {"to": recipient, "subject": subject, "message": message},
+        workbook_path,
+    )
+    headers = {"Content-Type": content_type}
+    if cookie := os.getenv("SMTP_API_COOKIE"):
+        headers["Cookie"] = cookie
+    req = request.Request(endpoint, data=body, method="POST", headers=headers)
+    with request.urlopen(req, timeout=timeout) as response:
+        response_body = response.read().decode("utf-8", errors="replace")
+        print(f"SMTP API responded {response.status}: {response_body}")
 
 
 def send_email(endpoint: str, recipient: str, subject: str, message: str, image_path: Path, timeout: int, content_id: str = "daily-tracking-image") -> None:
@@ -269,7 +319,8 @@ def main() -> int:
         print(f"Workbook not found: {workbook}", file=sys.stderr)
         return 2
 
-    image_path = (args.image or workbook.with_suffix(".png")).resolve()
+    default_image_path, public_url = report_screenshot_targets(Path(__file__).resolve().parent, 1, 1)[0]
+    image_path = (args.image or default_image_path).resolve()
     message = args.message_file.read_text(encoding="utf-8") if args.message_file else args.message
     if "cid:daily-tracking-image" not in message:
         print("Warning: HTML message does not reference cid:daily-tracking-image", file=sys.stderr)
@@ -284,7 +335,8 @@ def main() -> int:
         return 0
 
     try:
-        send_email(args.endpoint, args.to, args.subject, message, image_path, args.timeout)
+        public_message = replace_inline_image_sources(message, ["daily-tracking-image"], [public_url])
+        send_report_email(args.endpoint, args.to, args.subject, public_message, workbook, args.timeout)
     except Exception as exc:
         print(f"SMTP API request failed: {exc}", file=sys.stderr)
         return 1

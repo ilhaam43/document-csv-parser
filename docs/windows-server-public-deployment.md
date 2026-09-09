@@ -117,6 +117,7 @@ The report generators automate the desktop Microsoft Excel application. Keep the
 
 - Run the app from a stable local directory such as `C:\Apps\document-csv-parser`, not a network share or synced folder.
 - Run the service under one dedicated Windows user that has Excel installed, activated, and permission to modify the application directory.
+- If the service still runs as `LocalSystem`, ensure both Excel service-profile desktop folders exist: `C:\Windows\System32\config\systemprofile\Desktop` and `C:\Windows\SysWOW64\config\systemprofile\Desktop`.
 - Keep Uvicorn at `--workers 1`. The app already queues Excel work and also uses a cross-process lock.
 - Do not open generated workbooks manually from the server's runtime directories while a report is running.
 - Ensure the service user has modify access to `output-today`, `output-outgoing`, `output-iphone`, `output-ide`, and the Windows temporary directory.
@@ -249,3 +250,27 @@ Recommended later upgrade:
 - Put IIS or another reverse proxy in front of Uvicorn.
 - Add HTTPS with a real domain name.
 - Add authentication before sharing the URL broadly.
+
+## Public Email Screenshots
+
+Email Reports 1-4 publish JPG captures under
+`screenshots/YYYY-MM-DD/HHMMSSffffff` and serve them from
+`https://auto-report-secm.lintasarta.dev/screenshots/YYYY-MM-DD/HHMMSSffffff/fileN.jpg`.
+The default local directory is `<application-root>\\screenshots`. Override it with
+`SCREENSHOT_ROOT` when the reverse proxy maps `/screenshots` to another directory,
+or override the public prefix with `SCREENSHOT_BASE_URL`.
+Override the timestamp directory format with `SCREENSHOT_TIMESTAMP_FORMAT`.
+
+The server does not call the VPN-only SMTP API. Download
+`/tools/local_send_report_email.py` to a VPN-connected local computer and run:
+
+```powershell
+python .\local_send_report_email.py `
+  --report 1 `
+  --workbook "C:\Reports\Daily Tracking.xlsx" `
+  --to "recipient@example.com"
+```
+
+Use `--smtp-cookie "ci_session=..."` only when the SMTP endpoint requires the
+session cookie. Use `--prepare-only` to publish and verify screenshots without
+sending an email.

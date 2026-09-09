@@ -33,9 +33,9 @@
 
     <header class="app-header">
       <div>
-        <p class="eyebrow">OneDrive and Outlook delivery</p>
+        <p class="eyebrow">Server image and Outlook delivery</p>
         <h1>Report 1 Email</h1>
-        <code>Report 1 workbook &rarr; PNG &rarr; OneDrive &rarr; inline SMTP email</code>
+        <code>Report 1 workbook &rarr; JPG &rarr; public screenshot URL &rarr; SMTP email</code>
       </div>
       <div class="health" id="health">API status: checking</div>
     </header>
@@ -77,7 +77,7 @@
 
           <label class="option">
             <input id="dry_run" name="dry_run" type="checkbox" checked>
-            <span>Create screenshot only (skip OneDrive and SMTP)</span>
+            <span>Create and publish screenshots only (skip SMTP)</span>
           </label>
 
           <button id="submit-button" type="submit">Create Report 1 Email</button>
@@ -87,13 +87,13 @@
       <aside class="status">
         <div class="panel-heading">
           <h2>Status</h2>
-          <p>Processing result and OneDrive destination.</p>
+          <p>Processing result and public screenshot destination.</p>
         </div>
         <div id="status-box" class="status-box" role="status" aria-live="polite">Ready.</div>
-        <a id="onedrive-link" class="download" href="#" target="_blank" rel="noreferrer">Open OneDrive Image</a>
+        <a id="image-link" class="download" href="#" target="_blank" rel="noreferrer">Open Published Image</a>
       </aside>
     </div>
   </main>
-  <script src="/static/email-report.js?v=20260826-email"></script>
+  <script src="/static/email-report.js?v=20260901-public-images"></script>
 </body>
 </html>

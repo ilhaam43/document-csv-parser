@@ -54,6 +54,20 @@ function ConvertFrom-SecureStringToPlainText {
     }
 }
 
+function Initialize-ExcelServiceProfile {
+    $desktopPaths = @(
+        (Join-Path $env:WINDIR "System32\config\systemprofile\Desktop"),
+        (Join-Path $env:WINDIR "SysWOW64\config\systemprofile\Desktop")
+    )
+
+    foreach ($desktopPath in $desktopPaths) {
+        if (-not (Test-Path -LiteralPath $desktopPath -PathType Container)) {
+            Write-Host "Creating Excel service profile desktop directory: $desktopPath"
+            New-Item -ItemType Directory -Force -Path $desktopPath | Out-Null
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $AppPath -PathType Container)) {
     throw "Application path does not exist: $AppPath"
 }
@@ -73,6 +87,7 @@ $runtimeDirs = @(
     "output-today\api",
     "output-outgoing",
     "output-iphone",
+    "output-ide",
     "vlookup-yesterday",
     "logs"
 )
@@ -80,6 +95,8 @@ $runtimeDirs = @(
 foreach ($relative in $runtimeDirs) {
     New-Item -ItemType Directory -Force -Path (Join-Path $AppPath $relative) | Out-Null
 }
+
+Initialize-ExcelServiceProfile
 
 $venvPython = Join-Path $AppPath ".venv\Scripts\python.exe"
 

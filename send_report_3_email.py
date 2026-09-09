@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from send_report_1_email import excel_range_to_png, send_email
+from send_report_1_email import excel_range_to_png, send_report_email
+from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 
 
 def report_3_target_complete_range(workbook_path: Path) -> str:
@@ -49,14 +50,16 @@ def main() -> int:
     workbook = args.workbook.resolve()
     if not workbook.exists():
         parser.error(f"Workbook not found: {workbook}")
-    image = (args.image or workbook.with_name(f"{workbook.stem} - report-3-pivot.png")).resolve()
+    default_image, public_url = report_screenshot_targets(Path(__file__).resolve().parent, 3, 1)[0]
+    image = (args.image or default_image).resolve()
     cell_range = report_3_target_complete_range(workbook)
     excel_range_to_png(workbook, image, "PIVOT", cell_range)
     print(f"Created image: {image} ({cell_range})")
     if args.dry_run:
         print("Dry run: SMTP request skipped.")
         return 0
-    send_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, args.message, image, timeout=60, content_id="report-3-pivot")
+    message = replace_inline_image_sources(args.message, ["report-3-pivot"], [public_url])
+    send_report_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, message, workbook, timeout=60)
     return 0
 
 

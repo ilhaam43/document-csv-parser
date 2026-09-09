@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from send_report_1_email import excel_range_to_png, send_email_images
+from send_report_1_email import excel_range_to_png, send_report_email
+from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 
 REPORT_2_IMAGE_IDS = (
     "report-2-ongoing-table",
@@ -74,21 +75,22 @@ def main() -> int:
     workbook = args.workbook.resolve()
     if not workbook.exists():
         parser.error(f"Workbook not found: {workbook}")
-    image = (args.image or workbook.with_name(f"{workbook.stem} - report-2-pivot.png")).resolve()
     ranges = report_2_ranges(workbook)
-    output_dir = image.parent
+    targets = report_screenshot_targets(Path(__file__).resolve().parent, 2, len(ranges))
     images = []
-    for index, (cell_range, content_id) in enumerate(ranges, start=1):
-        image_path = output_dir / f"{workbook.stem} - report-2-pivot-{index}.png"
+    public_urls = []
+    for (cell_range, content_id), (image_path, public_url) in zip(ranges, targets):
         excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
         images.append((image_path, content_id))
+        public_urls.append(public_url)
         print(f"Created image: {image_path} ({cell_range})")
     if args.dry_run:
         print("Dry run: SMTP request skipped.")
         return 0
 
     endpoint = args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email"
-    send_email_images(endpoint, args.to, args.subject, args.message, images, timeout=60)
+    message = replace_inline_image_sources(args.message, list(REPORT_2_IMAGE_IDS), public_urls)
+    send_report_email(endpoint, args.to, args.subject, message, workbook, timeout=60)
     return 0
 
 

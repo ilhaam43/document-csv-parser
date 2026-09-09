@@ -123,6 +123,14 @@ function isTransientGatewayStatus(status) {
   return [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524].includes(status);
 }
 
+function isTransientFetchError(error) {
+  return (
+    error instanceof TransientGatewayError ||
+    error instanceof TypeError ||
+    /failed to fetch|networkerror|load failed/i.test(error?.message || "")
+  );
+}
+
 async function readJsonResponse(response) {
   const contentType = response.headers.get("content-type") || "";
   const text = await response.text();
@@ -163,8 +171,9 @@ async function fetchJson(url, options = {}) {
   return payload;
 }
 
-async function waitForJob(statusUrl) {
-  const startedAt = Date.now();
+async function waitForJob(statusUrl, jobStartedAt = Date.now()) {
+  const startedAt = Number.isFinite(jobStartedAt) ? jobStartedAt : Date.now();
+  const monitorStartedAt = Date.now();
   let transientFailures = 0;
   const registrationGracePeriodMs = 10 * 60 * 1000;
 
@@ -179,8 +188,8 @@ async function waitForJob(statusUrl) {
         error.status === 404 && Date.now() - startedAt < registrationGracePeriodMs;
       const canRetry =
         waitingForRegistration ||
-        (error instanceof TransientGatewayError &&
-          Date.now() - startedAt < retryWindowMs &&
+        (isTransientFetchError(error) &&
+          Date.now() - monitorStartedAt < retryWindowMs &&
           transientFailures < 240);
 
       if (!canRetry) {
@@ -211,7 +220,7 @@ async function monitorActiveJob(job) {
   startProgressTimer(job.startedAt);
 
   try {
-    const payload = await waitForJob(job.statusUrl);
+    const payload = await waitForJob(job.statusUrl, job.startedAt);
     stopProgressTimer();
     statusBox.className = "status-box ok";
     statusBox.textContent = `Generated ${payload.output_files.join(", ")} in ${formatDuration(payload.elapsed_seconds)}.`;
@@ -272,6 +281,13 @@ form.addEventListener("submit", async (event) => {
     saveActiveJob(activeJob);
     await monitorActiveJob(activeJob);
   } catch (error) {
+    if (isTransientFetchError(error) && !pageIsUnloading) {
+      statusBox.className = "status-box";
+      statusBox.textContent = "Connection interrupted. Checking pipeline job status...";
+      await monitorActiveJob(activeJob);
+      return;
+    }
+
     if (!pageIsUnloading) {
       clearActiveJob();
       stopProgressTimer();
