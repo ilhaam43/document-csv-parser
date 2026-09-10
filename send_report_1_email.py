@@ -27,6 +27,7 @@ INLINE_IMAGE_IDS = (
     "target-after-table",
     "target-after-legend",
 )
+LEGEND_CAPTURE_SCALE = 6.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -171,7 +172,7 @@ def excel_pivot_regions_to_png(workbook_path: Path, image_dir: Path) -> list[tup
     outputs: list[tuple[Path, str, str]] = []
     for index, (cell_range, content_id) in enumerate(ranges, start=1):
         image_path = image_dir / f"report-1-pivot-{index}.png"
-        scale = 3.0 if "legend" in content_id else 1.0
+        scale = LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0
         excel_range_to_png(workbook_path, image_path, "PIVOT", cell_range, scale=scale)
         outputs.append((image_path, content_id, cell_range))
     return outputs
@@ -233,7 +234,7 @@ def multipart_form_images(fields: dict[str, str], images: list[tuple[Path, str]]
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def multipart_form_attachment(fields: dict[str, str], attachment_path: Path) -> tuple[bytes, str]:
+def multipart_form_attachments(fields: dict[str, str], attachment_paths: list[Path]) -> tuple[bytes, str]:
     boundary = f"----ReportEmailBoundary{uuid.uuid4().hex}"
     chunks: list[bytes] = []
     for name, value in fields.items():
@@ -244,19 +245,24 @@ def multipart_form_attachment(fields: dict[str, str], attachment_path: Path) -> 
             b"\r\n",
         ])
 
-    content_type = mimetypes.guess_type(attachment_path.name)[0] or "application/octet-stream"
-    chunks.extend([
-        f"--{boundary}\r\n".encode(),
-        (
-            'Content-Disposition: form-data; name="attachment[]"; '
-            f'filename="{attachment_path.name}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
-        ).encode(),
-        attachment_path.read_bytes(),
-        b"\r\n",
-        f"--{boundary}--\r\n".encode(),
-    ])
+    for attachment_path in attachment_paths:
+        content_type = mimetypes.guess_type(attachment_path.name)[0] or "application/octet-stream"
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            (
+                'Content-Disposition: form-data; name="attachment[]"; '
+                f'filename="{attachment_path.name}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode(),
+            attachment_path.read_bytes(),
+            b"\r\n",
+        ])
+    chunks.append(f"--{boundary}--\r\n".encode())
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def multipart_form_attachment(fields: dict[str, str], attachment_path: Path) -> tuple[bytes, str]:
+    return multipart_form_attachments(fields, [attachment_path])
 
 
 def send_report_email(
@@ -266,10 +272,18 @@ def send_report_email(
     message: str,
     workbook_path: Path,
     timeout: int = 60,
+    image_paths: list[Path] | None = None,
 ) -> None:
-    body, content_type = multipart_form_attachment(
-        {"to": recipient, "subject": subject, "message": message},
-        workbook_path,
+    attachments = [workbook_path, *(image_paths or [])]
+    body, content_type = multipart_form_attachments(
+        {
+            "to": recipient,
+            "subject": subject,
+            "message": message,
+            # Tell the SMTP gateway to send `message` as text/html.
+            "is_html": "true",
+        },
+        attachments,
     )
     headers = {"Content-Type": content_type}
     if cookie := os.getenv("SMTP_API_COOKIE"):
@@ -336,7 +350,7 @@ def main() -> int:
 
     try:
         public_message = replace_inline_image_sources(message, ["daily-tracking-image"], [public_url])
-        send_report_email(args.endpoint, args.to, args.subject, public_message, workbook, args.timeout)
+        send_report_email(args.endpoint, args.to, args.subject, public_message, workbook, args.timeout, image_paths=[image_path])
     except Exception as exc:
         print(f"SMTP API request failed: {exc}", file=sys.stderr)
         return 1

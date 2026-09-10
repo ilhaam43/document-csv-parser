@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from send_report_1_email import excel_range_to_png, send_report_email
+from send_report_1_email import LEGEND_CAPTURE_SCALE, excel_range_to_png, send_report_email
 from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 
 REPORT_4_IMAGE_IDS = (
@@ -60,7 +60,7 @@ def main() -> int:
     images = []
     public_urls = []
     for (cell_range, content_id), (image_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
         images.append((image_path, content_id))
         public_urls.append(public_url)
         print(f"Created image: {image_path} ({cell_range})")
@@ -68,7 +68,7 @@ def main() -> int:
         print("Dry run: SMTP request skipped.")
         return 0
     message = replace_inline_image_sources(args.message, list(REPORT_4_IMAGE_IDS), public_urls)
-    send_report_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, message, workbook, timeout=60)
+    send_report_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, message, workbook, timeout=60, image_paths=[path for path, _ in images])
     return 0
 
 

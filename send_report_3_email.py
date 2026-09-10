@@ -59,7 +59,7 @@ def main() -> int:
         print("Dry run: SMTP request skipped.")
         return 0
     message = replace_inline_image_sources(args.message, ["report-3-pivot"], [public_url])
-    send_report_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, message, workbook, timeout=60)
+    send_report_email(args.endpoint or "http://10.34.144.197/secm-portal/smtp/api_send_email", args.to, args.subject, message, workbook, timeout=60, image_paths=[image])
     return 0
 
 

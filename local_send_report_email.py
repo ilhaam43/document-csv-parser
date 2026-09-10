@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from urllib import request
@@ -77,6 +78,32 @@ def encode_multipart(fields: dict[str, str], attachment: Path, file_field: str) 
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+def encode_multipart_attachments(fields: dict[str, str], attachments: list[Path]) -> tuple[bytes, str]:
+    boundary = f"----LocalReportEmail{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            value.encode("utf-8"),
+            b"\r\n",
+        ])
+    for attachment in attachments:
+        content_type = mimetypes.guess_type(attachment.name)[0] or "application/octet-stream"
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            (
+                'Content-Disposition: form-data; name="attachment[]"; '
+                f'filename="{attachment.name.replace(chr(34), "")}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode(),
+            attachment.read_bytes(),
+            b"\r\n",
+        ])
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
 def post_multipart(
     url: str,
     fields: dict[str, str],
@@ -84,8 +111,12 @@ def post_multipart(
     timeout: int,
     cookie: str | None = None,
     file_field: str = "attachment[]",
+    attachments: list[Path] | None = None,
 ) -> tuple[int, str]:
-    body, content_type = encode_multipart(fields, attachment, file_field)
+    if attachments:
+        body, content_type = encode_multipart_attachments(fields, [attachment, *attachments])
+    else:
+        body, content_type = encode_multipart(fields, attachment, file_field)
     headers = {"Content-Type": content_type}
     if cookie:
         headers["Cookie"] = cookie
@@ -152,13 +183,27 @@ def main() -> int:
             return 0
 
         print(f"Sending email through VPN SMTP API to {args.to} ...")
-        status, smtp_body = post_multipart(
-            args.smtp_url,
-            {"to": args.to, "subject": subject, "message": email_message},
-            workbook,
-            timeout=5 * 60,
-            cookie=args.smtp_cookie,
-        )
+        image_paths: list[Path] = []
+        with tempfile.TemporaryDirectory(prefix="report-email-images-") as temp_dir:
+            for index, public_image in enumerate(public_images, start=1):
+                image_path = Path(temp_dir) / f"report-{args.report}-image-{index}.jpg"
+                with request.urlopen(str(public_image), timeout=60) as image_response:
+                    image_path.write_bytes(image_response.read())
+                image_paths.append(image_path)
+            status, smtp_body = post_multipart(
+                args.smtp_url,
+                {
+                    "to": args.to,
+                    "subject": subject,
+                    "message": email_message,
+                    # The SMTP gateway must render this field as HTML.
+                    "is_html": "true",
+                },
+                workbook,
+                timeout=5 * 60,
+                cookie=args.smtp_cookie,
+                attachments=image_paths,
+            )
         print(f"SMTP API responded {status}: {smtp_body}")
         return 0
     except (KeyError, ValueError, RuntimeError, json.JSONDecodeError) as exc:

@@ -42,7 +42,7 @@ from generate_ide_tracking import (
     determine_report_date as determine_ide_report_date,
     output_filename as ide_output_filename,
 )
-from send_report_1_email import discover_pivot_ranges, excel_range_to_png, send_report_email
+from send_report_1_email import LEGEND_CAPTURE_SCALE, discover_pivot_ranges, excel_range_to_png, send_report_email
 from send_report_2_email import REPORT_2_IMAGE_IDS, report_2_ranges
 from send_report_3_email import report_3_target_complete_range
 from send_report_4_email import REPORT_4_IMAGE_IDS, report_4_ranges
@@ -199,7 +199,7 @@ def _run_email_report(
     targets = report_screenshot_targets(APP_ROOT, 1, len(ranges))
     images = []
     for (cell_range, content_id), (public_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
         images.append((public_path, content_id, cell_range, public_url))
     result: dict[str, object] = {
         "image_filenames": [image_path.name for image_path, _, _, _ in images],
@@ -221,7 +221,7 @@ def _run_email_report(
         "SMTP_API_URL",
         "http://10.34.144.197/secm-portal/smtp/api_send_email",
     )
-    send_report_email(smtp_endpoint, recipient, subject, public_message, workbook_path, timeout=60)
+    send_report_email(smtp_endpoint, recipient, subject, public_message, workbook_path, timeout=60, image_paths=[path for path, _, _, _ in images])
     result["status"] = "sent"
     result["message"] = "Screenshots published and sent through the SMTP API."
     result["elapsed_seconds"] = round(time.perf_counter() - started, 3)
@@ -234,14 +234,14 @@ def _run_email_report_2(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_2_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 2, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
         result.update(status="preview_created", message="Report 2 screenshots published. SMTP was skipped because dry_run=true.")
         return result
     public_message = replace_inline_image_sources(message, [content_id for _, content_id, _, _ in images], [url for _, _, _, url in images])
-    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60, image_paths=[path for path, _, _, _ in images])
     result.update(status="sent", message="Report 2 screenshots published and sent through the SMTP API.")
     return result
 
@@ -256,7 +256,7 @@ def _run_email_report_3(workbook_path: Path, image_path: Path, recipient: str, s
         result.update(status="preview_created", message="Report 3 screenshot published. SMTP was skipped because dry_run=true.")
         return result
     public_message = replace_inline_image_sources(message, ["report-3-pivot"], [public_url])
-    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60, image_paths=[public_path])
     result.update(status="sent", message="Report 3 screenshot published and sent through the SMTP API.")
     return result
 
@@ -267,14 +267,14 @@ def _run_email_report_4(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_4_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 4, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=3.0 if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
         result.update(status="preview_created", message="Report 4 screenshots published. SMTP was skipped because dry_run=true.")
         return result
     public_message = replace_inline_image_sources(message, [content_id for _, content_id, _, _ in images], [url for _, _, _, url in images])
-    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60)
+    send_report_email(os.getenv("SMTP_API_URL", "http://10.34.144.197/secm-portal/smtp/api_send_email"), recipient, subject, public_message, workbook_path, timeout=60, image_paths=[path for path, _, _, _ in images])
     result.update(status="sent", message="Report 4 screenshots published and sent through the SMTP API.")
     return result
 
