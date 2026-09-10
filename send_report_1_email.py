@@ -52,6 +52,7 @@ def excel_range_to_png(
     sheet_name: str | None,
     cell_range: str | None,
     scale: float = 1.0,
+    trim_whitespace: bool = False,
 ) -> None:
     try:
         import pythoncom  # type: ignore
@@ -105,6 +106,27 @@ def excel_range_to_png(
         if excel is not None:
             excel.Quit()
         pythoncom.CoUninitialize()
+
+    if trim_whitespace:
+        try:
+            from PIL import Image, ImageChops
+            with Image.open(image_path) as image:
+                rgb = image.convert("RGB")
+                background = Image.new("RGB", rgb.size, "white")
+                diff = ImageChops.difference(rgb, background)
+                diff = diff.point(lambda value: 255 if value > 12 else 0)
+                bbox = diff.getbbox()
+                if bbox:
+                    margin = 12
+                    crop_box = (
+                        max(0, bbox[0] - margin),
+                        max(0, bbox[1] - margin),
+                        min(rgb.width, bbox[2] + margin),
+                        min(rgb.height, bbox[3] + margin),
+                    )
+                    rgb.crop(crop_box).save(image_path, format="JPEG", quality=95)
+        except ImportError as exc:
+            raise RuntimeError("Install Pillow to trim legend whitespace: pip install Pillow") from exc
 
     if not image_path.exists() or image_path.stat().st_size == 0:
         raise RuntimeError(f"Excel did not create an image at {image_path}")
@@ -173,7 +195,7 @@ def excel_pivot_regions_to_png(workbook_path: Path, image_dir: Path) -> list[tup
     for index, (cell_range, content_id) in enumerate(ranges, start=1):
         image_path = image_dir / f"report-1-pivot-{index}.png"
         scale = LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0
-        excel_range_to_png(workbook_path, image_path, "PIVOT", cell_range, scale=scale)
+        excel_range_to_png(workbook_path, image_path, "PIVOT", cell_range, scale=scale, trim_whitespace="legend" in content_id)
         outputs.append((image_path, content_id, cell_range))
     return outputs
 

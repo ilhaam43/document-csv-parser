@@ -199,7 +199,7 @@ def _run_email_report(
     targets = report_screenshot_targets(APP_ROOT, 1, len(ranges))
     images = []
     for (cell_range, content_id), (public_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
         images.append((public_path, content_id, cell_range, public_url))
     result: dict[str, object] = {
         "image_filenames": [image_path.name for image_path, _, _, _ in images],
@@ -234,7 +234,7 @@ def _run_email_report_2(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_2_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 2, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
@@ -267,7 +267,7 @@ def _run_email_report_4(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_4_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 4, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:

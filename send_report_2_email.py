@@ -80,7 +80,7 @@ def main() -> int:
     images = []
     public_urls = []
     for (cell_range, content_id), (image_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0)
+        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
         images.append((image_path, content_id))
         public_urls.append(public_url)
         print(f"Created image: {image_path} ({cell_range})")
