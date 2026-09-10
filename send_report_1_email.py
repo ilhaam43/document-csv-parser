@@ -27,8 +27,8 @@ INLINE_IMAGE_IDS = (
     "target-after-table",
     "target-after-legend",
 )
-LEGEND_CAPTURE_SCALE = 12.0
-TABLE_CAPTURE_SCALE = 2.0
+LEGEND_CAPTURE_SCALE = 8.0
+TABLE_CAPTURE_SCALE = 1.0
 
 
 def parse_args() -> argparse.Namespace:
