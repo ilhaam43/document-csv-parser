@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from send_report_1_email import excel_range_to_png, send_report_email
+from send_report_1_email import TABLE_CAPTURE_SCALE, excel_range_to_png, send_report_email
 from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 
 
@@ -53,7 +53,7 @@ def main() -> int:
     default_image, public_url = report_screenshot_targets(Path(__file__).resolve().parent, 3, 1)[0]
     image = (args.image or default_image).resolve()
     cell_range = report_3_target_complete_range(workbook)
-    excel_range_to_png(workbook, image, "PIVOT", cell_range)
+    excel_range_to_png(workbook, image, "PIVOT", cell_range, scale=TABLE_CAPTURE_SCALE)
     print(f"Created image: {image} ({cell_range})")
     if args.dry_run:
         print("Dry run: SMTP request skipped.")

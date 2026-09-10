@@ -28,6 +28,7 @@ INLINE_IMAGE_IDS = (
     "target-after-legend",
 )
 LEGEND_CAPTURE_SCALE = 12.0
+TABLE_CAPTURE_SCALE = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,7 +201,7 @@ def excel_pivot_regions_to_png(workbook_path: Path, image_dir: Path) -> list[tup
     outputs: list[tuple[Path, str, str]] = []
     for index, (cell_range, content_id) in enumerate(ranges, start=1):
         image_path = image_dir / f"report-1-pivot-{index}.png"
-        scale = LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0
+        scale = LEGEND_CAPTURE_SCALE if "legend" in content_id else TABLE_CAPTURE_SCALE
         excel_range_to_png(workbook_path, image_path, "PIVOT", cell_range, scale=scale, trim_whitespace="legend" in content_id)
         outputs.append((image_path, content_id, cell_range))
     return outputs
@@ -367,7 +368,7 @@ def main() -> int:
     if "cid:daily-tracking-image" not in message:
         print("Warning: HTML message does not reference cid:daily-tracking-image", file=sys.stderr)
 
-    excel_range_to_png(workbook, image_path, args.sheet, args.cell_range)
+    excel_range_to_png(workbook, image_path, args.sheet, args.cell_range, scale=TABLE_CAPTURE_SCALE)
     print(f"Created image: {image_path}")
 
     if args.dry_run:

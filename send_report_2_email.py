@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from send_report_1_email import LEGEND_CAPTURE_SCALE, excel_range_to_png, send_report_email
+from send_report_1_email import LEGEND_CAPTURE_SCALE, TABLE_CAPTURE_SCALE, excel_range_to_png, send_report_email
 from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 
 REPORT_2_IMAGE_IDS = (
@@ -80,7 +80,7 @@ def main() -> int:
     images = []
     public_urls = []
     for (cell_range, content_id), (image_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
+        excel_range_to_png(workbook, image_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else TABLE_CAPTURE_SCALE, trim_whitespace="legend" in content_id)
         images.append((image_path, content_id))
         public_urls.append(public_url)
         print(f"Created image: {image_path} ({cell_range})")

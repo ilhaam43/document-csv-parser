@@ -42,7 +42,7 @@ from generate_ide_tracking import (
     determine_report_date as determine_ide_report_date,
     output_filename as ide_output_filename,
 )
-from send_report_1_email import LEGEND_CAPTURE_SCALE, discover_pivot_ranges, excel_range_to_png, send_report_email
+from send_report_1_email import LEGEND_CAPTURE_SCALE, TABLE_CAPTURE_SCALE, discover_pivot_ranges, excel_range_to_png, send_report_email
 from send_report_2_email import REPORT_2_IMAGE_IDS, report_2_ranges
 from send_report_3_email import report_3_target_complete_range
 from send_report_4_email import REPORT_4_IMAGE_IDS, report_4_ranges
@@ -199,7 +199,7 @@ def _run_email_report(
     targets = report_screenshot_targets(APP_ROOT, 1, len(ranges))
     images = []
     for (cell_range, content_id), (public_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
+        excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else TABLE_CAPTURE_SCALE, trim_whitespace="legend" in content_id)
         images.append((public_path, content_id, cell_range, public_url))
     result: dict[str, object] = {
         "image_filenames": [image_path.name for image_path, _, _, _ in images],
@@ -234,7 +234,7 @@ def _run_email_report_2(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_2_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 2, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else TABLE_CAPTURE_SCALE, trim_whitespace="legend" in content_id)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
@@ -250,7 +250,7 @@ def _run_email_report_3(workbook_path: Path, image_path: Path, recipient: str, s
     started = time.perf_counter()
     cell_range = report_3_target_complete_range(workbook_path)
     public_path, public_url = report_screenshot_targets(APP_ROOT, 3, 1)[0]
-    excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range)
+    excel_range_to_png(workbook_path, public_path, "PIVOT", cell_range, scale=TABLE_CAPTURE_SCALE)
     result: dict[str, object] = {"image_filename": public_path.name, "range": cell_range, "public_images": [public_url], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
         result.update(status="preview_created", message="Report 3 screenshot published. SMTP was skipped because dry_run=true.")
@@ -267,7 +267,7 @@ def _run_email_report_4(workbook_path: Path, image_path: Path, recipient: str, s
     ranges = report_4_ranges(workbook_path)
     targets = report_screenshot_targets(APP_ROOT, 4, len(ranges))
     for (cell_range, content_id), (output_path, public_url) in zip(ranges, targets):
-        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else 1.0, trim_whitespace="legend" in content_id)
+        excel_range_to_png(workbook_path, output_path, "PIVOT", cell_range, scale=LEGEND_CAPTURE_SCALE if "legend" in content_id else TABLE_CAPTURE_SCALE, trim_whitespace="legend" in content_id)
         images.append((output_path, content_id, cell_range, public_url))
     result: dict[str, object] = {"image_filenames": [path.name for path, _, _, _ in images], "ranges": [cell_range for _, _, cell_range, _ in images], "public_images": [url for _, _, _, url in images], "elapsed_seconds": round(time.perf_counter() - started, 3)}
     if dry_run:
