@@ -40,8 +40,8 @@ def report_screenshot_targets(
     first_file = REPORT_FILE_OFFSETS[report_number]
     return [
         (
-            output_dir / f"file{first_file + index}.jpg",
-            f"{base_url}/{date_folder}/{timestamp_folder}/file{first_file + index}.jpg",
+            output_dir / f"file{first_file + index}.png",
+            f"{base_url}/{date_folder}/{timestamp_folder}/file{first_file + index}.png",
         )
         for index in range(image_count)
     ]

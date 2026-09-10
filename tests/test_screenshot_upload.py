@@ -15,10 +15,10 @@ class ScreenshotUploadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {"SCREENSHOT_ROOT": temp_dir}, clear=False):
                 expected = {
-                    1: ["file1.jpg", "file2.jpg", "file3.jpg", "file4.jpg"],
-                    2: ["file5.jpg", "file6.jpg", "file7.jpg", "file8.jpg", "file9.jpg"],
-                    3: ["file10.jpg"],
-                    4: ["file11.jpg", "file12.jpg", "file13.jpg", "file14.jpg"],
+                    1: ["file1.png", "file2.png", "file3.png", "file4.png"],
+                    2: ["file5.png", "file6.png", "file7.png", "file8.png", "file9.png"],
+                    3: ["file10.png"],
+                    4: ["file11.png", "file12.png", "file13.png", "file14.png"],
                 }
                 generated_at = datetime(2026, 9, 1, 15, 8, 38, 123456)
                 for report_number, filenames in expected.items():

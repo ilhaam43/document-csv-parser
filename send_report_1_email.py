@@ -77,7 +77,9 @@ def excel_range_to_png(
         workbook.Activate()
         worksheet.Activate()
         selected_range.Select()
-        selected_range.CopyPicture(Appearance=1, Format=2)
+        # Printer-quality vector clipboard capture avoids enlarging a blurry
+        # screen bitmap when the report is published.
+        selected_range.CopyPicture(Appearance=2, Format=-4147)
         time.sleep(0.75)
 
         width = max(1, int(selected_range.Width * scale))
@@ -128,7 +130,7 @@ def excel_range_to_png(
                         min(rgb.width, bbox[2] + margin),
                         min(rgb.height, bbox[3] + margin),
                     )
-                    rgb.crop(crop_box).save(image_path, format="JPEG", quality=95)
+                    rgb.crop(crop_box).save(image_path, format="PNG")
         except ImportError as exc:
             raise RuntimeError("Install Pillow to trim legend whitespace: pip install Pillow") from exc
 

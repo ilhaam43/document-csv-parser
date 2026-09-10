@@ -186,7 +186,7 @@ def main() -> int:
         image_paths: list[Path] = []
         with tempfile.TemporaryDirectory(prefix="report-email-images-") as temp_dir:
             for index, public_image in enumerate(public_images, start=1):
-                image_path = Path(temp_dir) / f"report-{args.report}-image-{index}.jpg"
+                image_path = Path(temp_dir) / f"report-{args.report}-image-{index}.png"
                 with request.urlopen(str(public_image), timeout=60) as image_response:
                     image_path.write_bytes(image_response.read())
                 image_paths.append(image_path)
