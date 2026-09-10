@@ -27,7 +27,7 @@ INLINE_IMAGE_IDS = (
     "target-after-table",
     "target-after-legend",
 )
-LEGEND_CAPTURE_SCALE = 6.0
+LEGEND_CAPTURE_SCALE = 12.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,10 +114,14 @@ def excel_range_to_png(
                 rgb = image.convert("RGB")
                 background = Image.new("RGB", rgb.size, "white")
                 diff = ImageChops.difference(rgb, background)
-                diff = diff.point(lambda value: 255 if value > 12 else 0)
+                # Excel's exported chart canvas can have a light gray/colored
+                # edge. Ignore that canvas and keep the darker legend content.
+                # Keep only strong foreground pixels. This removes the white
+                # cell gaps and pale Excel canvas artifacts around legends.
+                diff = diff.point(lambda value: 255 if value > 210 else 0)
                 bbox = diff.getbbox()
                 if bbox:
-                    margin = 12
+                    margin = 4
                     crop_box = (
                         max(0, bbox[0] - margin),
                         max(0, bbox[1] - margin),
