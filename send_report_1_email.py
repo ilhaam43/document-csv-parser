@@ -78,9 +78,12 @@ def excel_range_to_png(
         workbook.Activate()
         worksheet.Activate()
         selected_range.Select()
-        # Printer-quality vector clipboard capture avoids enlarging a blurry
-        # screen bitmap when the report is published.
-        selected_range.CopyPicture(Appearance=2, Format=-4147)
+        if trim_whitespace:
+            # Legends use printer-quality vector capture before cropping.
+            selected_range.CopyPicture(Appearance=2, Format=-4147)
+        else:
+            # Preserve the original table capture behavior.
+            selected_range.CopyPicture(Appearance=1, Format=2)
         time.sleep(0.75)
 
         width = max(1, int(selected_range.Width * scale))

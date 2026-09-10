@@ -9,6 +9,7 @@ from pathlib import Path
 
 DEFAULT_SCREENSHOT_BASE_URL = "https://auto-report-secm.lintasarta.dev/screenshots"
 REPORT_FILE_OFFSETS = {1: 1, 2: 5, 3: 10, 4: 11}
+REPORT_LEGEND_INDEXES = {1: {1, 3}, 2: {1, 3}, 3: set(), 4: {1, 3}}
 
 
 def screenshot_date_folder(report_date: date | None = None) -> str:
@@ -38,10 +39,11 @@ def report_screenshot_targets(
 
     base_url = os.getenv("SCREENSHOT_BASE_URL", DEFAULT_SCREENSHOT_BASE_URL).rstrip("/")
     first_file = REPORT_FILE_OFFSETS[report_number]
+    legend_indexes = REPORT_LEGEND_INDEXES[report_number]
     return [
         (
-            output_dir / f"file{first_file + index}.png",
-            f"{base_url}/{date_folder}/{timestamp_folder}/file{first_file + index}.png",
+            output_dir / f"file{first_file + index}{'.png' if index in legend_indexes else '.jpg'}",
+            f"{base_url}/{date_folder}/{timestamp_folder}/file{first_file + index}{'.png' if index in legend_indexes else '.jpg'}",
         )
         for index in range(image_count)
     ]
