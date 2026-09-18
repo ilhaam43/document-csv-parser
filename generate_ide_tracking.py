@@ -1486,9 +1486,11 @@ def normalize_pivot_section_row_visibility(worksheet) -> None:
         return
 
     pivot_ranges: list[tuple[int, int]] = []
+    pivot_row_ranges: list[tuple[int, int]] = []
     pivot_tables = worksheet.PivotTables()
     for pivot_index in range(1, int(pivot_tables.Count) + 1):
-        table_range = pivot_tables(pivot_index).TableRange2
+        pivot_table = pivot_tables(pivot_index)
+        table_range = pivot_table.TableRange2
         pivot_start_row = int(table_range.Row)
         pivot_ranges.append(
             (
@@ -1496,6 +1498,20 @@ def normalize_pivot_section_row_visibility(worksheet) -> None:
                 pivot_start_row + int(table_range.Rows.Count) - 1,
             )
         )
+        row_range = pivot_table.RowRange
+        if row_range is not None:
+            row_start = int(row_range.Row)
+            pivot_row_ranges.append(
+                (row_start, row_start + int(row_range.Rows.Count) - 1)
+            )
+
+    for pivot_start_row, pivot_bottom_row in pivot_row_ranges:
+        worksheet.Range(
+            worksheet.Cells(pivot_start_row, 1),
+            worksheet.Cells(pivot_bottom_row, 1),
+        ).EntireRow.Hidden = False
+    for title_row in sorted_title_rows:
+        worksheet.Rows(title_row).Hidden = False
 
     for title_row, next_title_row in zip(
         sorted_title_rows,
@@ -2186,6 +2202,8 @@ def update_workbook_via_com(
         excel.ActiveWindow.SplitColumn = 2
         excel.ActiveWindow.SplitRow = 0
         excel.ActiveWindow.FreezePanes = True
+        excel.ActiveWindow.ScrollColumn = 3
+        excel.ActiveWindow.ScrollRow = 1
 
         percentage_scratch, percentage_blocks = capture_pivot_percentage_blocks(
             workbook,
@@ -2281,6 +2299,20 @@ def update_workbook_via_com(
         pythoncom.CoUninitialize()
 
 
+def has_expected_all_order_freeze_panes(worksheet) -> bool:
+    pane = worksheet.sheet_view.pane
+    if pane is None or pane.state not in {"frozen", "frozenSplit"}:
+        return False
+
+    try:
+        split_columns = float(pane.xSplit or 0)
+        split_rows = float(pane.ySplit or 0)
+    except (TypeError, ValueError):
+        return False
+
+    return split_columns == 2.0 and split_rows == 0.0
+
+
 def validate_output(
     output_path: Path,
     expected_quote_ids: list[str],
@@ -2302,8 +2334,15 @@ def validate_output(
         expected_rows = len(expected_quote_ids)
         if actual_rows != expected_rows:
             raise ValueError(f"Output has {actual_rows} data rows, expected {expected_rows}.")
-        if worksheet.freeze_panes != "C1":
-            raise ValueError(f"Output freeze pane is {worksheet.freeze_panes}, expected C1.")
+        if not has_expected_all_order_freeze_panes(worksheet):
+            pane = worksheet.sheet_view.pane
+            split_columns = pane.xSplit if pane is not None else None
+            split_rows = pane.ySplit if pane is not None else None
+            raise ValueError(
+                "Output ALL ORDER must freeze columns A:B "
+                f"(xSplit=2, ySplit=0); found xSplit={split_columns}, "
+                f"ySplit={split_rows}."
+            )
         if TABLE_NAME not in worksheet.tables:
             raise ValueError(f"Output is missing Excel table: {TABLE_NAME}")
         expected_ref = f"A1:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"

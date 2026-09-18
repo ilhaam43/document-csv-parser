@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
+from openpyxl import Workbook
 
 from generate_ide_tracking import (
     ACTUAL_RFS_DATE_HEADER,
@@ -15,12 +16,14 @@ from generate_ide_tracking import (
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
+    has_expected_all_order_freeze_panes,
     hidden_row_ranges_between_sections,
     identify_target_complete_pivots,
     is_missing,
     load_collabs_lookup,
     load_source_new_rfs_lookup,
     normalize_month_first_dashboard_dates,
+    normalize_pivot_section_row_visibility,
     parse_excel_datetime,
     reconcile_date_column,
     reconciled_date_value,
@@ -45,9 +48,11 @@ class FakeTableRange:
 
 
 class FakePivot:
-    def __init__(self, name, row, column, rows, columns):
+    def __init__(self, name, row, column, rows, columns, row_range=None):
         self.Name = name
         self.TableRange2 = FakeTableRange(row, column, rows, columns)
+        start, count = row_range if row_range is not None else (row, rows)
+        self.RowRange = FakeTableRange(start, column, count, 1)
 
 
 class FakePivotCollection:
@@ -67,7 +72,145 @@ class FakePivotWorksheet:
         return self._pivots
 
 
+class FakeUsedRange:
+    def __init__(self, values, row=1):
+        self.Value2 = values
+        self.Row = row
+
+
+class FakeHiddenRows:
+    def __init__(self, worksheet, start_row, end_row):
+        self.worksheet = worksheet
+        self.start_row = start_row
+        self.end_row = end_row
+
+    @property
+    def EntireRow(self):
+        return self
+
+    @property
+    def Hidden(self):
+        return None
+
+    @Hidden.setter
+    def Hidden(self, value):
+        self.worksheet.visibility_changes.append(
+            (self.start_row, self.end_row, bool(value))
+        )
+
+
+class FakeVisibilityWorksheet(FakePivotWorksheet):
+    def __init__(self, pivots, values):
+        super().__init__(pivots)
+        self.UsedRange = FakeUsedRange(values)
+        self.visibility_changes = []
+
+    def Cells(self, row, column):
+        return row, column
+
+    def Range(self, start_cell, end_cell):
+        return FakeHiddenRows(self, start_cell[0], end_cell[0])
+
+    def Rows(self, row):
+        return FakeHiddenRows(self, row, row)
+
+
 class IdeDateParsingTests(unittest.TestCase):
+    def test_refreshed_pivot_rows_are_unhidden_before_gap_rows(self) -> None:
+        values = tuple(
+            (value,)
+            for value in [
+                "TARGET COMPLETE",
+                None,
+                "header",
+                "row 1",
+                "row 2",
+                "row 3",
+                "row 4",
+                "Grand Total",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ORDER AGING START FROM PRE-INSTALLATION STATUS",
+            ]
+        )
+        worksheet = FakeVisibilityWorksheet(
+            [FakePivot("target-complete", 3, 1, 6, 4)],
+            values,
+        )
+
+        normalize_pivot_section_row_visibility(worksheet)
+
+        self.assertIn((3, 8, False), worksheet.visibility_changes)
+        self.assertIn((1, 1, False), worksheet.visibility_changes)
+        self.assertIn((20, 20, False), worksheet.visibility_changes)
+        self.assertIn((10, 17, True), worksheet.visibility_changes)
+
+    def test_pivot_filter_rows_remain_hidden(self) -> None:
+        values = tuple(
+            (value,)
+            for value in [
+                "TARGET COMPLETE",
+                None,
+                "New Registration",
+                None,
+                "TARGET  Detemined as 1 Sep 26",
+                "YEAR FAB UPLOAD",
+                "YEAR FAB UPLOAD",
+                "Count of QUOTE ID",
+                "Div./Dept.",
+                "Order",
+                "Grand Total",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ORDER AGING START FROM PRE-INSTALLATION STATUS",
+            ]
+        )
+        worksheet = FakeVisibilityWorksheet(
+            [FakePivot("target-complete", 5, 4, 7, 7, row_range=(9, 3))],
+            values,
+        )
+
+        normalize_pivot_section_row_visibility(worksheet)
+
+        self.assertIn((9, 11, False), worksheet.visibility_changes)
+        self.assertFalse(
+            any(
+                start <= row <= end and not hidden
+                for start, end, hidden in worksheet.visibility_changes
+                for row in range(5, 9)
+            )
+        )
+
+    def test_freeze_pane_validation_ignores_horizontal_scroll_position(self) -> None:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.freeze_panes = "C1"
+        worksheet.sheet_view.pane.topLeftCell = "N1"
+        worksheet.sheet_view.pane.state = "frozenSplit"
+
+        self.assertTrue(has_expected_all_order_freeze_panes(worksheet))
+
+        worksheet.sheet_view.pane.xSplit = 2.5
+        self.assertFalse(has_expected_all_order_freeze_panes(worksheet))
+
+        worksheet.freeze_panes = "N1"
+        self.assertFalse(has_expected_all_order_freeze_panes(worksheet))
+
     def test_hidden_row_ranges_follow_dynamic_section_boundaries(self) -> None:
         self.assertEqual(
             hidden_row_ranges_between_sections(25, 113),
