@@ -101,6 +101,8 @@ python .\generate_ide_tracking.py .\input-ide `
 
 Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and writes zero when the previous workbook has no valid OTC/MRC value. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
 
+IDE output columns follow the raw dashboard, including additional fields such as `MONTH COMPLETE`, alongside the generator's calculated fields. Validation checks required input headers, output header order, the Excel table range, and refreshed pivot cache fields rather than requiring a fixed 61-column output.
+
 ## Run Full Daily Pipeline
 
 Use this when you want one command to generate all three reports:

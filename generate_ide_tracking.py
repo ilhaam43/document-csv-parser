@@ -68,6 +68,17 @@ DEPT_HEADER = "DEPT."
 PM_HEADER = "PM"
 APM_HEADER = "APM"
 
+REQUIRED_RAW_HEADERS = (
+    QUOTE_ID_HEADER,
+    "QUOTE NAME",
+    "PARTNERS",
+    FAB_UPLOAD_HEADER,
+    NEW_RFS_INITIAL_HEADER,
+    ACTUAL_RFS_DATE_HEADER,
+    AOS_SENT_DATE_HEADER,
+    STATUS_DELIVERY_HEADER,
+)
+
 DATE_HEADERS = (
     "QUOTE DATE",
     "FAB SIGN DATE",
@@ -246,6 +257,16 @@ def normalize_header(value: object) -> str:
     return re.sub(r"\s+", " ", str(value).replace("\ufeff", "").strip())
 
 
+def validate_raw_headers(headers: Iterable[object]) -> None:
+    names = pd.Index([normalize_header(header) for header in headers])
+    duplicates = sorted(set(names[names.duplicated()]))
+    if duplicates:
+        raise ValueError("Raw sheet contains duplicate columns: " + ", ".join(duplicates))
+    missing = sorted(set(REQUIRED_RAW_HEADERS).difference(names))
+    if missing:
+        raise ValueError("Raw sheet is missing required columns: " + ", ".join(missing))
+
+
 def normalize_status(value: object) -> object:
     if is_missing(value):
         return pd.NA
@@ -377,8 +398,7 @@ def read_raw_dataframe(raw_path: Path) -> pd.DataFrame:
         dtype=object,
     )
     raw.columns = [normalize_header(column) for column in raw.columns]
-    if QUOTE_ID_HEADER not in raw.columns:
-        raise ValueError(f"Raw sheet is missing required column: {QUOTE_ID_HEADER}")
+    validate_raw_headers(raw.columns)
 
     raw_workbook = load_workbook(raw_path, read_only=True, data_only=True, keep_links=False)
     try:
@@ -915,6 +935,7 @@ def build_all_order(
     report_date: date,
     previous_path: Path,
 ) -> BuildResult:
+    validate_raw_headers(raw.columns)
     result = raw.copy().reset_index(drop=True)
     previous = previous.copy().reset_index(drop=True)
     normalize_month_first_dashboard_dates(result)
@@ -1094,12 +1115,6 @@ def build_all_order(
     result, invalid_dates = normalize_date_columns(result)
     result = result.reset_index(drop=True)
 
-    if len(result.columns) != 61:
-        raise ValueError(
-            f"ALL ORDER must contain 61 columns, found {len(result.columns)}. "
-            "The raw workbook structure may have changed."
-        )
-
     return BuildResult(
         dataframe=result,
         invalid_dates=invalid_dates,
@@ -1144,27 +1159,37 @@ def find_sheet(workbook, sheet_name: str):
     return None
 
 
-def apply_date_formats(worksheet, df: pd.DataFrame) -> None:
-    def contiguous_ranges(rows: list[int]) -> Iterable[tuple[int, int]]:
-        if not rows:
-            return
-        start = previous = rows[0]
-        for row_number in rows[1:]:
-            if row_number != previous + 1:
-                yield start, previous
-                start = row_number
-            previous = row_number
-        yield start, previous
+def contiguous_row_ranges(rows: list[int]) -> Iterable[tuple[int, int]]:
+    if not rows:
+        return
+    start = previous = rows[0]
+    for row_number in rows[1:]:
+        if row_number != previous + 1:
+            yield start, previous
+            start = row_number
+        previous = row_number
+    yield start, previous
 
-    for header in DATE_HEADERS:
-        if header not in df.columns:
-            continue
+
+def apply_text_formats(worksheet, df: pd.DataFrame) -> None:
+    for column_number, header in enumerate(df.columns, start=1):
+        text_rows = [
+            row_number for row_number, value in enumerate(df[header], start=2)
+            if isinstance(value, str)
+        ]
+        column_letter = get_column_letter(column_number)
+        for start_row, end_row in contiguous_row_ranges(text_rows):
+            worksheet.Range(f"{column_letter}{start_row}:{column_letter}{end_row}").NumberFormat = "@"
+
+
+def apply_date_formats(worksheet, df: pd.DataFrame) -> None:
+    for header in df.columns:
         column_number = df.columns.get_loc(header) + 1
         column_letter = get_column_letter(column_number)
         date_only_rows: list[int] = []
         date_time_rows: list[int] = []
         for row_number, value in enumerate(df[header], start=2):
-            if is_excel_zero_date(value):
+            if header in DATE_HEADERS and is_excel_zero_date(value):
                 date_time_rows.append(row_number)
                 continue
             if not isinstance(value, datetime):
@@ -1178,7 +1203,7 @@ def apply_date_formats(worksheet, df: pd.DataFrame) -> None:
             (date_only_rows, DATE_ONLY_FORMAT),
             (date_time_rows, DATE_TIME_FORMAT),
         ):
-            for start_row, end_row in contiguous_ranges(rows):
+            for start_row, end_row in contiguous_row_ranges(rows):
                 worksheet.Range(
                     f"{column_letter}{start_row}:{column_letter}{end_row}"
                 ).NumberFormat = number_format
@@ -2094,6 +2119,7 @@ def update_workbook_via_com(
         row_count = len(df) + 1
         column_count = len(df.columns)
         table = all_order_sheet.ListObjects(TABLE_NAME)
+        old_column_count = int(table.Range.Columns.Count)
         old_last_row = max(
             int(all_order_sheet.UsedRange.Rows.Count),
             int(table.Range.Rows.Count),
@@ -2101,7 +2127,7 @@ def update_workbook_via_com(
         clear_last_row = max(old_last_row, row_count)
         all_order_sheet.Range(
             all_order_sheet.Cells(2, 1),
-            all_order_sheet.Cells(clear_last_row, column_count),
+            all_order_sheet.Cells(clear_last_row, max(old_column_count, column_count)),
         ).ClearContents()
 
         target_range = all_order_sheet.Range(
@@ -2109,20 +2135,28 @@ def update_workbook_via_com(
             all_order_sheet.Cells(row_count, column_count),
         )
         table.Resize(target_range)
+        if old_column_count > column_count:
+            all_order_sheet.Range(
+                all_order_sheet.Cells(1, column_count + 1),
+                all_order_sheet.Cells(clear_last_row, old_column_count),
+            ).Clear()
         table.TableStyle = TABLE_STYLE_NAME
         year_fab_upload_column = df.columns.get_loc(YEAR_FAB_UPLOAD_HEADER) + 1
         all_order_sheet.Range(
             all_order_sheet.Cells(2, year_fab_upload_column),
             all_order_sheet.Cells(row_count, year_fab_upload_column),
         ).NumberFormat = YEAR_TEXT_FORMAT
+        body_range = all_order_sheet.Range(
+            all_order_sheet.Cells(2, 1),
+            all_order_sheet.Cells(row_count, column_count),
+        )
+        body_range.NumberFormat = "General"
+        apply_text_formats(all_order_sheet, df)
         body_values = tuple(
             tuple(com_value(value) for value in row)
             for row in df.itertuples(index=False, name=None)
         )
-        all_order_sheet.Range(
-            all_order_sheet.Cells(2, 1),
-            all_order_sheet.Cells(row_count, column_count),
-        ).Value = body_values
+        body_range.Value = body_values
         for column_number, header in enumerate(df.columns, start=1):
             all_order_sheet.Cells(1, column_number).Value = str(header)
         apply_na_errors(excel, all_order_sheet, df)
@@ -2317,6 +2351,8 @@ def validate_output(
     output_path: Path,
     expected_quote_ids: list[str],
     expected_pivot_count: int,
+    *,
+    expected_headers: list[str],
 ) -> dict[str, object]:
     workbook = load_workbook(output_path, read_only=False, data_only=False, keep_links=False)
     try:
@@ -2328,8 +2364,14 @@ def validate_output(
             raise ValueError(f"Output is missing sheets: {', '.join(sorted(missing_sheets))}")
 
         worksheet = workbook[ALL_ORDER_SHEET_NAME]
-        if worksheet.max_column != 61:
-            raise ValueError(f"Output ALL ORDER has {worksheet.max_column} columns, expected 61.")
+        column_count = len(expected_headers)
+        normalized_expected_headers = [normalize_header(header) for header in expected_headers]
+        actual_headers = [
+            normalize_header(worksheet.cell(1, column).value)
+            for column in range(1, column_count + 1)
+        ]
+        if actual_headers != normalized_expected_headers:
+            raise ValueError("Output ALL ORDER column names or order do not match the generated data.")
         actual_rows = worksheet.max_row - 1
         expected_rows = len(expected_quote_ids)
         if actual_rows != expected_rows:
@@ -2345,13 +2387,13 @@ def validate_output(
             )
         if TABLE_NAME not in worksheet.tables:
             raise ValueError(f"Output is missing Excel table: {TABLE_NAME}")
-        expected_ref = f"A1:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
+        expected_ref = f"A1:{get_column_letter(column_count)}{worksheet.max_row}"
         if worksheet.tables[TABLE_NAME].ref != expected_ref:
             raise ValueError(
                 f"{TABLE_NAME} range is {worksheet.tables[TABLE_NAME].ref}, expected {expected_ref}."
             )
 
-        headers = {worksheet.cell(1, column).value: column for column in range(1, 62)}
+        headers = {header: column for column, header in enumerate(actual_headers, start=1)}
         quote_column = headers[QUOTE_ID_HEADER]
         otc_column = headers[OTC_HEADER]
         mrc_column = headers[MRC_HEADER]
@@ -2405,9 +2447,15 @@ def validate_output(
             raise ValueError(
                 f"Output contains {pivot_count} PivotTables, expected {expected_pivot_count}."
             )
+        for pivot in workbook[PIVOT_SHEET_NAME]._pivots:
+            cached_headers = [normalize_header(field.name) for field in pivot.cache.cacheFields]
+            if cached_headers[:column_count] != normalized_expected_headers:
+                raise ValueError(
+                    f"PivotTable '{pivot.name}' source columns do not match the generated ALL ORDER."
+                )
         return {
             "rows": actual_rows,
-            "columns": worksheet.max_column,
+            "columns": column_count,
             "pivot_tables": pivot_count,
             "table_ref": expected_ref,
         }
@@ -2440,6 +2488,7 @@ def generate_ide_tracking(
             temp_path,
             build.dataframe[QUOTE_ID_HEADER].map(normalize_quote_id).tolist(),
             refreshed_count,
+            expected_headers=build.dataframe.columns.tolist(),
         )
         try:
             os.replace(temp_path, output_path)

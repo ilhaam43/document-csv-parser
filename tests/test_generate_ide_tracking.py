@@ -2,17 +2,24 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.worksheet.table import Table
+from openpyxl.utils import get_column_letter
 
 from generate_ide_tracking import (
     ACTUAL_RFS_DATE_HEADER,
     DEPT_HEADER,
     NEW_RFS_INITIAL_HEADER,
     QUOTE_ID_HEADER,
+    build_all_order,
     apply_current_date_first_match,
+    apply_date_formats,
     apply_previous_field_fallbacks,
+    apply_text_formats,
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
@@ -31,7 +38,149 @@ from generate_ide_tracking import (
     target_period,
     target_value,
     target_value_with_previous,
+    validate_output,
+    validate_raw_headers,
 )
+
+
+class IdeDynamicColumnsTests(unittest.TestCase):
+    RAW_HEADERS = (
+        "NO", "QUOTE ID", "PROJECT NAME", "QUOTE NAME", "QUOTE NAME 2",
+        "CUSTOMER NAME", "PROJECT TYPE", "BRAND", "PARTNERS",
+        "STATUS Catalog / non Catalog", "NOMOR PO", "SO", "CID", "QUOTE DATE",
+        "FAB SIGN DATE", "FAB UPLOAD DATE", "NEW RFS INITIAL", "CASH DATE",
+        "SO DATE", "SERVICE READY", "ACTUAL RFS DATE", "AOS SENT DATE",
+        "AOS SIGN DATE", "SO COMPLETION DATE", "STATUS DELIVERY", "SD Note",
+        "SALES", "SEGMENT SALES", "PRODUCT2", "ADMIN", "APM", "PM", "DEPT.",
+        "PIC CUSTOMER", "CUSTOMER ADDRESS", "Project Category", "REVENUE",
+        "REVENUE UPSIDE", "PENALTY BC", "CoS BC", "RISK BC", "PENALTY ACTUAL",
+        "COS ACTUAL (PO)", "RISK ACTUAL", "COST PLANNED", "ACTUAL COST",
+        "COST EFFICIENCY INDEX (CEI)", "STATUS HOTO D2", "OTD",
+    )
+
+    def setUp(self) -> None:
+        raw_row = dict.fromkeys(self.RAW_HEADERS)
+        raw_row.update({
+            "NO": 1, "QUOTE ID": "Q-1", "QUOTE NAME": "Example",
+            "FAB UPLOAD DATE": datetime(2026, 10, 1),
+            "NEW RFS INITIAL": datetime(2026, 10, 12),
+            "ACTUAL RFS DATE": datetime(2026, 10, 12),
+            "STATUS DELIVERY": "SO Complete",
+        })
+        self.raw = pd.DataFrame([raw_row])
+        self.previous = pd.DataFrame([{
+            "QUOTE ID": "Q-1", "ORDER TYPE": "New Registration",
+            "OTC": 100, "MRC": 200, "STATUS DELIVERY": "SO Complete",
+            "Pre-Installation Start Date": datetime(2026, 10, 1),
+        }])
+
+    def _build(self, raw):
+        with patch("generate_ide_tracking.load_collabs_lookup", return_value={}):
+            return build_all_order(
+                raw, self.previous, Path("collabs.csv"), date(2026, 10, 12),
+                Path("Daily Tracking IDE 9 October 2026.xlsx"),
+            ).dataframe
+
+    def test_raw_additions_keep_their_values_and_existing_business_columns(self) -> None:
+        baseline = self._build(self.raw)
+        self.assertEqual(len(baseline.columns), 61)
+        for position in (6, len(self.raw.columns)):
+            with self.subTest(position=position):
+                extended = self.raw.copy()
+                extended.insert(position, "MONTH COMPLETE", ["Okt"])
+                extended["SOURCE NOTES"] = ["Confirmed"]
+                result = self._build(extended)
+                self.assertEqual(len(result.columns), 63)
+                self.assertEqual(result["MONTH COMPLETE"].tolist(), ["Okt"])
+                self.assertEqual(result["SOURCE NOTES"].tolist(), ["Confirmed"])
+                pd.testing.assert_frame_equal(
+                    result.drop(columns=["MONTH COMPLETE", "SOURCE NOTES"]), baseline
+                )
+
+    def test_missing_required_column_has_a_specific_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "missing required columns: PARTNERS"):
+            self._build(self.raw.drop(columns=["PARTNERS"]))
+
+    def test_duplicate_normalized_headers_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate columns: QUOTE ID"):
+            validate_raw_headers([*self.RAW_HEADERS, "  QUOTE   ID  "])
+
+    def test_extra_column_preserves_date_like_text_and_formats_typed_dates(self) -> None:
+        ranges = {}
+
+        class Worksheet:
+            def Range(self, address):
+                return ranges.setdefault(address, SimpleNamespace(NumberFormat="General"))
+
+        dataframe = pd.DataFrame({
+            "MONTH COMPLETE": ["4/30/2026", datetime(2026, 4, 30), None, 7],
+            "SOURCE NOTES": ["A", "B", None, "3/4/2026"],
+            "COUNT": [0, 1, None, 2],
+        }, dtype=object)
+        worksheet = Worksheet()
+        apply_text_formats(worksheet, dataframe)
+        apply_date_formats(worksheet, dataframe)
+        self.assertEqual(ranges["A2:A2"].NumberFormat, "@")
+        self.assertEqual(ranges["A3:A3"].NumberFormat, "mm/dd/yy")
+        self.assertEqual(ranges["B2:B3"].NumberFormat, "@")
+        self.assertEqual(ranges["B5:B5"].NumberFormat, "@")
+        self.assertFalse(any(address.startswith("C") for address in ranges))
+
+    def _output_workbook(self, directory):
+        headers = ["QUOTE ID", "OTC", "MRC", "YEAR FAB UPLOAD"]
+        headers.extend(f"Source field {index}" for index in range(1, 58))
+        headers.append("MONTH COMPLETE")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "ALL ORDER"
+        sheet.append(headers)
+        sheet.append(["Q-1", 100, 200, "2026", *([None] * 57), "Okt"])
+        sheet.cell(2, 4).number_format = "@"
+        sheet.freeze_panes = "C1"
+        sheet.add_table(Table(displayName="Table47", ref=f"A1:{get_column_letter(len(headers))}2"))
+        workbook.create_sheet("PIVOT")
+        return workbook, Path(directory) / "output.xlsx", headers
+
+    def test_output_accepts_source_column_growth_and_ignores_unused_cell_formatting(self) -> None:
+        with TemporaryDirectory() as directory:
+            workbook, path, headers = self._output_workbook(directory)
+            workbook["ALL ORDER"].cell(2, 70).number_format = "#,##0"
+            workbook.save(path)
+            workbook.close()
+            result = validate_output(path, ["Q-1"], 0, expected_headers=headers)
+            self.assertEqual(result["columns"], 62)
+            self.assertEqual(result["table_ref"], "A1:BJ2")
+
+    def test_output_rejects_changed_header_even_when_column_count_matches(self) -> None:
+        with TemporaryDirectory() as directory:
+            workbook, path, headers = self._output_workbook(directory)
+            workbook["ALL ORDER"].cell(1, len(headers)).value = "OTHER FIELD"
+            workbook.save(path)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "column names or order"):
+                validate_output(path, ["Q-1"], 0, expected_headers=headers)
+
+    def test_output_table_must_include_the_added_source_column(self) -> None:
+        with TemporaryDirectory() as directory:
+            workbook, path, headers = self._output_workbook(directory)
+            workbook["ALL ORDER"].tables["Table47"].ref = "A1:BI2"
+            workbook.save(path)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "Table47 range"):
+                validate_output(path, ["Q-1"], 0, expected_headers=headers)
+
+    def test_output_rejects_a_pivot_cache_that_did_not_pick_up_new_columns(self) -> None:
+        with TemporaryDirectory() as directory:
+            workbook, path, headers = self._output_workbook(directory)
+            workbook["PIVOT"]._pivots = [SimpleNamespace(
+                name="StalePivot",
+                cache=SimpleNamespace(cacheFields=[
+                    SimpleNamespace(name=header) for header in headers[:-1]
+                ]),
+            )]
+            with patch("generate_ide_tracking.load_workbook", return_value=workbook):
+                with self.assertRaisesRegex(ValueError, "StalePivot.*source columns"):
+                    validate_output(path, ["Q-1"], 1, expected_headers=headers)
 
 
 class FakeRangeDimension:
