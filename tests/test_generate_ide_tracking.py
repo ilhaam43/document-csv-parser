@@ -18,11 +18,13 @@ from generate_ide_tracking import (
     build_all_order,
     apply_current_date_first_match,
     apply_date_formats,
+    apply_month_complete_formula,
     apply_previous_field_fallbacks,
     apply_text_formats,
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
+    filter_ontime_delivery_completion_month,
     has_expected_all_order_freeze_panes,
     hidden_row_ranges_between_sections,
     identify_target_complete_pivots,
@@ -83,7 +85,8 @@ class IdeDynamicColumnsTests(unittest.TestCase):
 
     def test_raw_additions_keep_their_values_and_existing_business_columns(self) -> None:
         baseline = self._build(self.raw)
-        self.assertEqual(len(baseline.columns), 61)
+        self.assertEqual(len(baseline.columns), 62)
+        self.assertEqual(baseline.columns.get_loc("MONTH COMPLETE"), 32)
         for position in (6, len(self.raw.columns)):
             with self.subTest(position=position):
                 extended = self.raw.copy()
@@ -91,11 +94,67 @@ class IdeDynamicColumnsTests(unittest.TestCase):
                 extended["SOURCE NOTES"] = ["Confirmed"]
                 result = self._build(extended)
                 self.assertEqual(len(result.columns), 63)
-                self.assertEqual(result["MONTH COMPLETE"].tolist(), ["Okt"])
+                self.assertTrue(result["MONTH COMPLETE"].isna().all())
                 self.assertEqual(result["SOURCE NOTES"].tolist(), ["Confirmed"])
+                self.assertEqual(result.columns.get_loc("MONTH COMPLETE"), 32)
                 pd.testing.assert_frame_equal(
-                    result.drop(columns=["MONTH COMPLETE", "SOURCE NOTES"]), baseline
+                    result.drop(columns=["MONTH COMPLETE", "SOURCE NOTES"]),
+                    baseline.drop(columns=["MONTH COMPLETE"]),
                 )
+
+    def test_missing_month_has_one_calculated_column_after_completion_date(self) -> None:
+        with patch("generate_ide_tracking.load_collabs_lookup", return_value={}):
+            build = build_all_order(
+                self.raw, self.previous, Path("collabs.csv"), date(2026, 10, 13),
+                Path("Daily Tracking IDE 9 October 2026.xlsx"),
+            )
+        self.assertEqual(build.dataframe.columns.tolist().count("MONTH COMPLETE"), 1)
+        self.assertEqual(build.dataframe.columns.get_loc("MONTH COMPLETE"), 32)
+        self.assertTrue(build.dataframe["MONTH COMPLETE"].isna().all())
+
+    def test_source_month_is_discarded_and_both_dashboard_formats_build_the_same_data(self) -> None:
+        raw = self.raw.copy()
+        raw["MONTH COMPLETE"] = ["Okt"]
+        result = self._build(raw)
+        pd.testing.assert_frame_equal(result, self._build(self.raw))
+        self.assertEqual(result.columns.tolist().count("MONTH COMPLETE"), 1)
+
+    def test_month_formula_uses_named_column_positions_and_calculates_before_pivot_refresh(self) -> None:
+        from unittest.mock import Mock
+        worksheet = Mock()
+        dataframe = pd.DataFrame({
+            "SO COMPLETION DATE": [datetime(2026, 10, 13), None],
+            "MONTH COMPLETE": [None, None],
+        })
+        apply_month_complete_formula(worksheet, dataframe)
+        worksheet.Cells.assert_any_call(2, 2)
+        worksheet.Cells.assert_any_call(3, 2)
+        month_range = worksheet.Range.return_value
+        self.assertEqual(month_range.NumberFormat, "General")
+        self.assertEqual(month_range.FormulaR1C1, '=TEXT(RC[-1],"[$-409]mmmm")')
+        month_range.Calculate.assert_called_once()
+
+    def test_ontime_pivot_month_filter_follows_report_month_and_accepts_source_abbreviations(self) -> None:
+        from unittest.mock import Mock
+        for month_name, month_number in (("October", 10), ("Okt", 10), ("November", 11)):
+            with self.subTest(month=month_name):
+                field = Mock()
+                field.Name = "MONTH  COMPLETE"
+                field.PivotItems.return_value = [SimpleNamespace(Name="January"), SimpleNamespace(Name=month_name)]
+                pivot = Mock()
+                pivot.ColumnFields = [SimpleNamespace(Name="ON TIME DELIVERY")]
+                pivot.PivotFields.return_value = [field]
+                pivot.PageFields.Count = 4
+                unrelated = Mock()
+                unrelated.ColumnFields = [SimpleNamespace(Name="STATUS DELIVERY")]
+                worksheet = FakePivotWorksheet([unrelated, pivot])
+                filter_ontime_delivery_completion_month(worksheet, date(2026, month_number, 13))
+                self.assertEqual(field.Orientation, 3)
+                self.assertEqual(field.Position, 3)
+                self.assertEqual(field.CurrentPage, month_name)
+                field.ClearAllFilters.assert_called_once()
+                pivot.RefreshTable.assert_called_once()
+                unrelated.PivotFields.assert_not_called()
 
     def test_missing_required_column_has_a_specific_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required columns: PARTNERS"):

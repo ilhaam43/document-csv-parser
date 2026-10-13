@@ -61,6 +61,8 @@ STATUS_ORDER_HEADER = "STATUS ORDER"
 AOS_SENT_DATE_HEADER = "AOS SENT DATE"
 ON_TIME_DELIVERY_HEADER = "ON TIME DELIVERY"
 STATUS_DELIVERY_HEADER = "STATUS DELIVERY"
+SO_COMPLETION_DATE_HEADER = "SO COMPLETION DATE"
+MONTH_COMPLETE_HEADER = "MONTH COMPLETE"
 PRE_INSTALLATION_START_HEADER = "Pre-Installation Start Date"
 PRE_INSTALLATION_AGING_HEADER = "Pre-Installation Aging"
 PRE_INSTALLATION_RANGE_HEADER = "Range Aging On Pre-Installation"
@@ -77,6 +79,7 @@ REQUIRED_RAW_HEADERS = (
     ACTUAL_RFS_DATE_HEADER,
     AOS_SENT_DATE_HEADER,
     STATUS_DELIVERY_HEADER,
+    SO_COMPLETION_DATE_HEADER,
 )
 
 DATE_HEADERS = (
@@ -1114,6 +1117,9 @@ def build_all_order(
     result[STATUS_DELIVERY_HEADER] = result[STATUS_DELIVERY_HEADER].map(normalize_status)
     result, invalid_dates = normalize_date_columns(result)
     result = result.reset_index(drop=True)
+    if MONTH_COMPLETE_HEADER in result.columns:
+        result.pop(MONTH_COMPLETE_HEADER)
+    insert_after(result, SO_COMPLETION_DATE_HEADER, MONTH_COMPLETE_HEADER, [pd.NA] * len(result))
 
     return BuildResult(
         dataframe=result,
@@ -1180,6 +1186,53 @@ def apply_text_formats(worksheet, df: pd.DataFrame) -> None:
         column_letter = get_column_letter(column_number)
         for start_row, end_row in contiguous_row_ranges(text_rows):
             worksheet.Range(f"{column_letter}{start_row}:{column_letter}{end_row}").NumberFormat = "@"
+
+
+def apply_month_complete_formula(worksheet, df: pd.DataFrame) -> None:
+    month_column = df.columns.get_loc(MONTH_COMPLETE_HEADER) + 1
+    completion_column = df.columns.get_loc(SO_COMPLETION_DATE_HEADER) + 1
+    month_range = worksheet.Range(
+        worksheet.Cells(2, month_column), worksheet.Cells(len(df) + 1, month_column)
+    )
+    month_range.NumberFormat = "General"
+    # Match the manual TEXT formula, including January for an empty date.
+    month_range.FormulaR1C1 = f'=TEXT(RC[{completion_column - month_column}],"[$-409]mmmm")'
+    month_range.Calculate()
+
+
+def filter_ontime_delivery_completion_month(worksheet, report_date: date) -> None:
+    pivots = worksheet.PivotTables()
+    for index in range(1, pivots.Count + 1):
+        pivot = pivots(index)
+        if not any(
+            normalize_header(field.Name) == ON_TIME_DELIVERY_HEADER
+            for field in pivot.ColumnFields
+        ):
+            continue
+        month_field = next(
+            (field for field in pivot.PivotFields()
+             if normalize_header(field.Name) == MONTH_COMPLETE_HEADER),
+            None,
+        )
+        if month_field is None:
+            raise RuntimeError(f"PivotTable '{pivot.Name}' is missing {MONTH_COMPLETE_HEADER}.")
+        month_field.Orientation = 3  # xlPageField
+        # Excel lays these page filters out in reverse Position order.
+        month_field.Position = max(1, int(pivot.PageFields.Count) - 1)
+        month_field.ClearAllFilters()
+        month_field.EnableMultiplePageItems = False
+        matching_item = next(
+            (str(item.Name) for item in month_field.PivotItems()
+             if REPORT_MONTH_NUMBERS.get(str(item.Name).strip().casefold()) == report_date.month),
+            None,
+        )
+        if matching_item is None:
+            raise RuntimeError(
+                f"PivotTable '{pivot.Name}' has no completion month for "
+                f"{calendar.month_name[report_date.month]}."
+            )
+        month_field.CurrentPage = matching_item
+        pivot.RefreshTable()
 
 
 def apply_date_formats(worksheet, df: pd.DataFrame) -> None:
@@ -2230,6 +2283,8 @@ def update_workbook_via_com(
                     start_row = row_number
                 previous_row = row_number
 
+        apply_month_complete_formula(all_order_sheet, df)
+
         autofit_with_limits(all_order_sheet, column_count)
         all_order_sheet.Activate()
         excel.ActiveWindow.FreezePanes = False
@@ -2268,6 +2323,7 @@ def update_workbook_via_com(
             target_filter_states,
             report_date,
         )
+        filter_ontime_delivery_completion_month(pivot_sheet, report_date)
         restore_pivot_percentage_blocks(
             pivot_sheet,
             percentage_scratch,

@@ -101,7 +101,9 @@ python .\generate_ide_tracking.py .\input-ide `
 
 Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and writes zero when the previous workbook has no valid OTC/MRC value. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
 
-IDE output columns follow the raw dashboard, including additional fields such as `MONTH COMPLETE`, alongside the generator's calculated fields. Validation checks required input headers, output header order, the Excel table range, and refreshed pivot cache fields rather than requiring a fixed 61-column output.
+IDE output columns follow the raw dashboard alongside the generator's calculated fields. Validation checks required input headers, output header order, the Excel table range, and refreshed pivot cache fields rather than requiring a fixed 61-column output.
+`MONTH COMPLETE` is always calculated from `SO COMPLETION DATE` and placed immediately after it (AG in the standard layout). A dashboard column with that name is discarded and replaced by the same English month formula used when the column is absent. The formula follows the manual report's `TEXT` behavior, including January for empty completion dates.
+The On Time Delivery pivot is filtered to the report's completion month, matching the 13 October manual reference; unrelated pivots keep their template filters.
 
 ## Run Full Daily Pipeline
 
