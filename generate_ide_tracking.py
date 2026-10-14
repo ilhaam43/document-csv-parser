@@ -1200,6 +1200,22 @@ def apply_month_complete_formula(worksheet, df: pd.DataFrame) -> None:
     month_range.Calculate()
 
 
+def set_pivot_page_field_position(pivot_table, field, position: int) -> None:
+    page_count = int(pivot_table.PageFields.Count)
+    if page_count < 1:
+        raise RuntimeError(f"PivotTable '{pivot_table.Name}' has no page filters.")
+    # A source-header rename can remove a page field during cache refresh.
+    valid_position = min(max(1, position), page_count)
+    try:
+        if int(field.Position) != valid_position:
+            field.Position = valid_position
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not position page filter '{field.Name}' in PivotTable "
+            f"'{pivot_table.Name}' at {valid_position} of {page_count}: {exc}"
+        ) from exc
+
+
 def filter_ontime_delivery_completion_month(worksheet, report_date: date) -> None:
     pivots = worksheet.PivotTables()
     for index in range(1, pivots.Count + 1):
@@ -1218,7 +1234,7 @@ def filter_ontime_delivery_completion_month(worksheet, report_date: date) -> Non
             raise RuntimeError(f"PivotTable '{pivot.Name}' is missing {MONTH_COMPLETE_HEADER}.")
         month_field.Orientation = 3  # xlPageField
         # Excel lays these page filters out in reverse Position order.
-        month_field.Position = max(1, int(pivot.PageFields.Count) - 1)
+        set_pivot_page_field_position(pivot, month_field, int(pivot.PageFields.Count) - 1)
         month_field.ClearAllFilters()
         month_field.EnableMultiplePageItems = False
         matching_item = next(
@@ -1417,7 +1433,7 @@ def restore_target_pivot_filters(
             )
 
         field.Orientation = 3  # xlPageField
-        field.Position = state.position
+        set_pivot_page_field_position(pivot_table, field, state.position)
         field.ClearAllFilters()
         if state.show_all:
             field.CurrentPage = "(All)"

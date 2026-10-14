@@ -15,6 +15,7 @@ from generate_ide_tracking import (
     DEPT_HEADER,
     NEW_RFS_INITIAL_HEADER,
     QUOTE_ID_HEADER,
+    TargetPivotPageFilter,
     build_all_order,
     apply_current_date_first_match,
     apply_date_formats,
@@ -37,6 +38,8 @@ from generate_ide_tracking import (
     reconcile_date_column,
     reconciled_date_value,
     resolve_financial_values,
+    restore_target_pivot_filters,
+    set_pivot_page_field_position,
     target_period,
     target_value,
     target_value_with_previous,
@@ -140,6 +143,7 @@ class IdeDynamicColumnsTests(unittest.TestCase):
             with self.subTest(month=month_name):
                 field = Mock()
                 field.Name = "MONTH  COMPLETE"
+                field.Position = 1
                 field.PivotItems.return_value = [SimpleNamespace(Name="January"), SimpleNamespace(Name=month_name)]
                 pivot = Mock()
                 pivot.ColumnFields = [SimpleNamespace(Name="ON TIME DELIVERY")]
@@ -253,6 +257,88 @@ class FakeTableRange:
         self.Column = column
         self.Rows = FakeRangeDimension(rows)
         self.Columns = FakeRangeDimension(columns)
+
+
+class FakePageField:
+    def __init__(self, pivot, name, position):
+        self.pivot = pivot
+        self.Name = name
+        self.Orientation = 3
+        self._position = position
+        self.position_changes = []
+        self.filters_cleared = False
+
+    @property
+    def Position(self):
+        return self._position
+
+    @Position.setter
+    def Position(self, value):
+        if not 1 <= value <= self.pivot.PageFields.Count:
+            raise ValueError("Unable to set the Position property of the PivotField class")
+        self.position_changes.append(value)
+        self._position = value
+
+    def ClearAllFilters(self):
+        self.filters_cleared = True
+
+
+class IdePivotPagePositionTests(unittest.TestCase):
+    def test_saved_position_is_bounded_by_the_refreshed_page_field_count(self) -> None:
+        pivot = SimpleNamespace(Name="PivotTable2", PageFields=SimpleNamespace(Count=3))
+        field = FakePageField(pivot, "TARGET", 1)
+        set_pivot_page_field_position(pivot, field, 4)
+        self.assertEqual(field.Position, 3)
+        self.assertEqual(field.position_changes, [3])
+
+    def test_already_valid_position_does_not_write_to_excel_again(self) -> None:
+        pivot = SimpleNamespace(Name="PivotTable2", PageFields=SimpleNamespace(Count=3))
+        field = FakePageField(pivot, "TARGET", 3)
+        set_pivot_page_field_position(pivot, field, 4)
+        self.assertEqual(field.position_changes, [])
+
+    def test_existing_position_is_preserved_when_all_filters_survive_refresh(self) -> None:
+        pivot = SimpleNamespace(Name="PivotTable2", PageFields=SimpleNamespace(Count=4))
+        field = FakePageField(pivot, "TARGET", 2)
+        set_pivot_page_field_position(pivot, field, 4)
+        self.assertEqual(field.Position, 4)
+
+    def test_target_selection_is_restored_after_month_header_normalization_removes_a_filter(self) -> None:
+        from unittest.mock import Mock
+        pivot = Mock()
+        pivot.Name = "PivotTable2"
+        pivot.PageFields.Count = 3
+        field = FakePageField(pivot, "TARGET  Detemined as 1 Oct 26", 3)
+        pivot.PivotFields.return_value = FakePivotCollection([field])
+        field.PivotItems = lambda: FakePivotCollection([SimpleNamespace(Name="Target October")])
+        worksheet = Mock()
+        worksheet.PivotTables.return_value = pivot
+        state = TargetPivotPageFilter("PivotTable2", 4, ("target",), False)
+
+        restore_target_pivot_filters(worksheet, [state], date(2026, 10, 14))
+
+        self.assertEqual(field.Position, 3)
+        self.assertEqual(field.position_changes, [])
+        self.assertTrue(field.filters_cleared)
+        self.assertEqual(field.CurrentPage, "Target October")
+        pivot.RefreshTable.assert_called_once()
+
+    def test_empty_page_field_collection_is_reported(self) -> None:
+        pivot = SimpleNamespace(Name="PivotTable2", PageFields=SimpleNamespace(Count=0))
+        field = FakePageField(pivot, "TARGET", 1)
+        with self.assertRaisesRegex(RuntimeError, "PivotTable2.*no page filters"):
+            set_pivot_page_field_position(pivot, field, 4)
+
+    def test_position_failure_keeps_pivot_and_field_context(self) -> None:
+        class FailingField(FakePageField):
+            @FakePageField.Position.setter
+            def Position(self, value):
+                raise ValueError("Excel rejected the change")
+
+        pivot = SimpleNamespace(Name="PivotTable2", PageFields=SimpleNamespace(Count=4))
+        field = FailingField(pivot, "MONTH COMPLETE", 4)
+        with self.assertRaisesRegex(RuntimeError, "MONTH COMPLETE.*PivotTable2.*3 of 4"):
+            set_pivot_page_field_position(pivot, field, 3)
 
 
 class FakePivot:
