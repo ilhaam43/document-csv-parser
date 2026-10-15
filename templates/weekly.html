@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weekly Mobile Report</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261007-source-review">
+</head>
+<body>
+  <main>
+    <nav class="app-nav" aria-label="Report navigation">
+      <a class="nav-brand" href="/report-1" aria-label="Daily Report Generator home">
+        <span class="brand-mark">DT</span>
+        <span class="brand-copy"><strong>SECM Report</strong><small>Workbook Generator</small></span>
+      </a>
+      <div class="nav-links">
+        <a class="nav-link" href="/report-1">Report 1</a>
+        <a class="nav-link" href="/report-2">Report 2</a>
+        <a class="nav-link" href="/report-3">Report 3</a>
+        <a class="nav-link" href="/report-4">Report 4</a>
+        <a class="nav-link" href="/pipeline">Daily Pipeline</a>
+        <a class="nav-link active" href="/weekly" aria-current="page">Weekly</a>
+        <details class="nav-menu">
+          <summary class="nav-menu-trigger">Email tools</summary>
+          <div class="nav-menu-popover">
+            <a class="nav-link" href="/email-report-1">Email Report 1</a>
+            <a class="nav-link" href="/email-report-2">Email Report 2</a>
+            <a class="nav-link" href="/email-report-3">Email Report 3</a>
+            <a class="nav-link" href="/email-report-4">Email Report 4</a>
+          </div>
+        </details>
+      </div>
+    </nav>
+
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Weekly Mobile Service</p>
+        <h1>Weekly Report</h1>
+      </div>
+      <div class="health" id="health">API status: checking</div>
+    </header>
+
+    <div class="workspace">
+      <div class="weekly-steps">
+        <section class="upload-panel" id="prepare-panel">
+          <div class="panel-heading">
+            <h2>Prepare Master Data</h2>
+          </div>
+          <form id="prepare-form">
+            <div class="field">
+              <label for="report_date">Report date / BQ cutoff</label>
+              <input id="report_date" name="report_date" type="date" required>
+            </div>
+            <div class="field">
+              <label for="report_month">FAB reporting month</label>
+              <input id="report_month" name="report_month" type="month" required>
+            </div>
+            <div class="field">
+              <label for="report_week">Report week</label>
+              <input id="report_week" name="report_week" type="number" min="1" max="53" required>
+            </div>
+            <div class="field">
+              <label for="bq_csv">GCP BQ export CSV</label>
+              <input id="bq_csv" name="bq_csv" type="file" accept=".csv,text/csv" required>
+            </div>
+            <div class="field">
+              <label for="previous_master">Previous Master old format</label>
+              <input id="previous_master" name="previous_master" type="file" accept=".xlsx" required>
+            </div>
+            <div class="field">
+              <label for="previous_mobile">Previous Mobile workbook</label>
+              <input id="previous_mobile" name="previous_mobile" type="file" accept=".xlsx" required>
+            </div>
+            <div class="field">
+              <label for="previous_ppt">Previous Mobile weekly PPT</label>
+              <input id="previous_ppt" name="previous_ppt" type="file" accept=".pptx" required>
+            </div>
+            <div class="field">
+              <label for="holiday_workbook">National holiday workbook</label>
+              <input id="holiday_workbook" name="holiday_workbook" type="file" accept=".xlsx" required>
+            </div>
+            <button id="prepare-button" type="submit">Prepare Catalyst Review</button>
+          </form>
+        </section>
+
+        <section class="upload-panel" id="review-panel" hidden>
+          <div class="panel-heading">
+            <h2>Catalyst Review</h2>
+          </div>
+          <button id="refresh-review-button" class="weekly-secondary-button weekly-refresh-button" type="button" hidden>Refresh Catalyst Review</button>
+          <a class="weekly-review-csv-link" id="draft-link" href="#">Download Master Draft CSV</a>
+          <form id="review-form">
+            <div id="review-direct">
+              <div class="weekly-review-toolbar">
+                <strong id="review-count">Loading Catalyst rows...</strong>
+                <label class="weekly-review-filter"><input id="review-unchecked" type="checkbox"> Unreviewed only</label>
+              </div>
+              <div class="field weekly-review-search">
+                <label for="review-search">Find quote or customer</label>
+                <input id="review-search" type="search" placeholder="Search review list">
+              </div>
+              <div class="weekly-review-table-wrap">
+                <table class="weekly-review-table">
+                  <thead><tr><th>Quote / order</th><th>Customer</th><th>Service</th><th>Catalyst status</th></tr></thead>
+                  <tbody id="review-rows"></tbody>
+                </table>
+              </div>
+              <p id="review-empty" class="weekly-review-empty" hidden>No matching quotes.</p>
+            </div>
+            <details class="weekly-review-options">
+              <summary>File upload and optional corrections</summary>
+              <a class="weekly-review-csv-link" id="review-link" href="#">Download Review CSV</a>
+              <div class="field">
+                <label for="catalyst_review">Reviewed CSV or Catalyst workbook (instead of the list above)</label>
+                <input id="catalyst_review" name="catalyst_review" type="file" accept=".csv,.xlsx">
+              </div>
+              <a class="weekly-review-csv-link" id="source-review-link" href="#" hidden>Download BQ Status Differences CSV</a>
+              <div class="field" id="source-review-file-field" hidden>
+                <label for="source_review">Approved BQ status overrides CSV (optional; exact order used by default)</label>
+                <input id="source_review" name="source_review" type="file" accept=".csv">
+              </div>
+              <div class="field">
+                <label for="slide_review">Slide summary review CSV (optional)</label>
+                <input id="slide_review" name="slide_review" type="file" accept=".csv">
+              </div>
+              <div class="field">
+                <label for="pivot_review">Pivot filter review CSV (optional)</label>
+                <input id="pivot_review" name="pivot_review" type="file" accept=".csv">
+              </div>
+              <div class="field">
+                <label for="presentation_review">Presentation chart review CSV (optional)</label>
+                <input id="presentation_review" name="presentation_review" type="file" accept=".csv">
+              </div>
+            </details>
+            <button id="review-button" type="submit">Generate Weekly Reports</button>
+          </form>
+        </section>
+      </div>
+
+      <aside class="status">
+        <div class="panel-heading"><h2>Status</h2></div>
+        <div id="status-box" class="status-box" role="status" aria-live="polite">Ready.</div>
+        <a id="exceptions-link" class="download weekly-secondary-link" href="#">Download Exceptions CSV</a>
+        <a id="download-link" class="download" href="#">Download Weekly ZIP</a>
+        <button id="new-job-button" class="weekly-secondary-button" type="button" hidden>Start New Weekly Job</button>
+      </aside>
+    </div>
+  </main>
+  <script src="/static/weekly.js?v=20261007-order-status"></script>
+</body>
+</html>

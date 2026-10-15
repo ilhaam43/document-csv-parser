@@ -235,4 +235,6 @@ output-ide/*
 IDE/
 vlookup-yesterday/
 logs/
+generated/weekly/
+.tmp/
 ~$*.xlsx

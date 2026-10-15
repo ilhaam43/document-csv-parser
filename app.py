@@ -48,6 +48,7 @@ from send_report_3_email import report_3_target_complete_range
 from send_report_4_email import REPORT_4_IMAGE_IDS, report_4_ranges
 from screenshot_upload import report_screenshot_targets, replace_inline_image_sources
 from pipeline_stage_runner import run_daily_stage, run_ide_stage, run_iphone_stage, run_ongoing_stage
+from weekly.api import router as weekly_router
 
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ app = FastAPI(
 )
 app.mount("/static", StaticFiles(directory=APP_ROOT / "static"), name="static")
 app.mount("/screenshots", StaticFiles(directory=SCREENSHOT_DIR), name="screenshots")
+app.include_router(weekly_router)
 
 
 @contextlib.contextmanager
@@ -928,6 +930,11 @@ def report_4_page() -> FileResponse:
 @app.get("/pipeline")
 def pipeline_page() -> FileResponse:
     return frontend_page("pipeline.html")
+
+
+@app.get("/weekly")
+def weekly_page() -> FileResponse:
+    return frontend_page("weekly.html")
 
 
 @app.get("/email-report-1")
