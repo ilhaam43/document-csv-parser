@@ -1,13 +1,32 @@
 import unittest
 from datetime import date, datetime
+from decimal import Decimal
 
 from weekly.catalyst import CatalystOverride
 from weekly.matching import record_key
 from weekly.models import ReviewDecision
 from weekly.refresh import ExistingSourceIndex, refresh_existing_record
+from weekly.rules import build_master_record
 
 
 class WeeklyRefreshTests(unittest.TestCase):
+    def test_missing_historical_results_use_the_same_formula_as_new_rows(self) -> None:
+        holidays = {date(2031, 12, 25)}
+        new = build_master_record({
+            "quote_num": "Q-NEXT", "order_number": "O-NEXT",
+            "FAB_Upload": "2031-12-24 09:15:00", "cash_date": "2031-12-26",
+            "order_completion_date": "2031-12-29", "order_status": "Complete",
+            "service_group": "Mobile", "otc": "1000.25", "mrc": "0.75",
+        }, row_number=1, holidays=holidays)
+        inherited = dict(new)
+        inherited.update({"Count Cash": None, "LEADTIME FAB-CASH": None,
+                          "OTC+MRC": None, "OTC+MRC (inMio)": None})
+        refreshed = refresh_existing_record(
+            inherited, source=None, catalyst_override=None, holidays=holidays
+        )
+        for field in ("Count Cash", "LEADTIME FAB-CASH", "OTC+MRC", "OTC+MRC (inMio)"):
+            self.assertEqual(new[field], refreshed[field], field)
+
     def test_missing_cash_clears_sla_but_retains_valid_completion_period(self) -> None:
         master = self.master(status="Complete", normalized="COMPLETE")
         master.update({"order_completion_date": datetime(2026, 9, 21),
@@ -44,7 +63,7 @@ class WeeklyRefreshTests(unittest.TestCase):
         ):
             self.assertIsNone(result[field], field)
 
-    def test_valid_historical_reviewed_values_survive_unchanged_dates(self) -> None:
+    def test_published_leadtimes_and_achievement_are_preserved_for_unchanged_dates(self) -> None:
         master = self.master(status="Complete", normalized="COMPLETE")
         master.update({
             "cash_dt": datetime(2026, 9, 18),
@@ -58,6 +77,142 @@ class WeeklyRefreshTests(unittest.TestCase):
         self.assertEqual(result["LEADTIME FAB-CASH"], 0)
         self.assertEqual(result["LEADTIME CASH-COMPLETE"], 6)
         self.assertEqual(result["ACHIEVEMENT"], "ACHIEVED")
+
+    def test_revenue_is_recalculated_without_overwriting_published_leadtime(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({
+            "cash_dt": datetime(2026, 9, 18),
+            "otc": 1_000_000, "mrc": 25_000,
+        })
+        for prior_leadtime in (None, 0, 1, 999):
+            with self.subTest(prior_leadtime=prior_leadtime):
+                master.update({
+                    "Count Cash": None, "LEADTIME FAB-CASH": prior_leadtime,
+                    "OTC+MRC": None, "OTC+MRC (inMio)": 999,
+                })
+                before = dict(master)
+                result = refresh_existing_record(
+                    master, source=None, catalyst_override=None, holidays=set()
+                )
+                self.assertEqual(master, before)
+                self.assertEqual(result["Count Cash"], 1)
+                self.assertEqual(result["LEADTIME FAB-CASH"], 2 if prior_leadtime is None else prior_leadtime)
+                self.assertEqual(result["OTC+MRC"], Decimal("1025000"))
+                self.assertEqual(result["OTC+MRC (inMio)"], Decimal("1.025"))
+
+    def test_holiday_updates_do_not_silently_rewrite_published_history(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master["cash_dt"] = datetime(2026, 9, 18)
+        first = refresh_existing_record(
+            master, source=None, catalyst_override=None, holidays=set()
+        )
+        second = refresh_existing_record(
+            first, source=None, catalyst_override=None, holidays={date(2026, 9, 18)}
+        )
+        self.assertEqual(first["LEADTIME FAB-CASH"], 2)
+        self.assertEqual(second["LEADTIME FAB-CASH"], 2)
+
+    def test_published_weekend_normalization_is_preserved(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({
+            "fab_upload": datetime(2026, 9, 20, 9),
+            "cash_dt": datetime(2026, 9, 20), "LEADTIME FAB-CASH": 1,
+        })
+        result = refresh_existing_record(
+            master, source=None, catalyst_override=None, holidays=set()
+        )
+        self.assertEqual(result["LEADTIME FAB-CASH"], 1)
+
+    def test_missing_weekend_leadtime_is_calculated_as_zero(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"fab_upload": datetime(2031, 12, 28, 9),
+                       "cash_dt": datetime(2031, 12, 28)})
+        result = refresh_existing_record(master, source=None, catalyst_override=None, holidays=set())
+        self.assertEqual(result["LEADTIME FAB-CASH"], 0)
+
+    def test_invalid_published_values_are_repaired_not_preserved(self) -> None:
+        for invalid in (True, "#VALUE!", "NaN", "Infinity", 2.5, ""):
+            with self.subTest(value=invalid):
+                master = self.master(status="Complete", normalized="COMPLETE")
+                master.update({"cash_dt": datetime(2026, 9, 18),
+                               "order_completion_date": datetime(2026, 9, 21),
+                               "LEADTIME FAB-CASH": invalid, "LEADTIME CASH-COMPLETE": invalid})
+                result = refresh_existing_record(master, source=None, catalyst_override=None, holidays=set())
+                self.assertEqual(result["LEADTIME FAB-CASH"], 2)
+                self.assertEqual(result["LEADTIME CASH-COMPLETE"], 2)
+
+    def test_new_cash_date_recalculates_affected_history_and_achievement(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"order_completion_date": datetime(2026, 9, 21),
+                       "LEADTIME FAB-CASH": 99, "LEADTIME CASH-COMPLETE": 99,
+                       "ACHIEVEMENT": "NOT ACHIEVED"})
+        result = refresh_existing_record(master, source=self.source(order="O-1", status="Complete"),
+                                         catalyst_override=None, holidays=set())
+        self.assertEqual(result["LEADTIME FAB-CASH"], 2)
+        self.assertEqual(result["LEADTIME CASH-COMPLETE"], 2)
+        self.assertEqual(result["ACHIEVEMENT"], "ACHIEVED")
+
+    def test_changed_dates_invalidate_inherited_achievement_without_new_pm_approval(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"order_completion_date": datetime(2026, 9, 25),
+                       "LEADTIME CASH-COMPLETE": 1, "ACHIEVEMENT": "ACHIEVED",
+                       "ADJUSTMENT": "Published adjustment"})
+        result = refresh_existing_record(master, source=self.source(order="O-1", status="Complete"),
+                                         catalyst_override=None, holidays=set())
+        self.assertEqual(result["LEADTIME CASH-COMPLETE"], 6)
+        self.assertEqual(result["ACHIEVEMENT"], "NOT ACHIEVED")
+
+    def test_missing_cash_complete_is_calculated_even_when_dates_have_not_changed(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"cash_dt": datetime(2026, 9, 18),
+                       "order_completion_date": datetime(2026, 9, 25),
+                       "LEADTIME CASH-COMPLETE": None, "ACHIEVEMENT": "ACHIEVED"})
+        result = refresh_existing_record(master, source=None, catalyst_override=None, holidays=set())
+        self.assertEqual(result["LEADTIME CASH-COMPLETE"], 6)
+        self.assertEqual(result["ACHIEVEMENT"], "NOT ACHIEVED")
+
+    def test_missing_achievement_uses_published_cash_complete_without_implying_pm_approval(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"cash_dt": datetime(2026, 9, 18),
+                       "order_completion_date": datetime(2026, 9, 21),
+                       "LEADTIME CASH-COMPLETE": 6, "ADJUSTMENT": "Needs PM confirmation"})
+        result = refresh_existing_record(master, source=None, catalyst_override=None, holidays=set())
+        self.assertEqual(result["LEADTIME CASH-COMPLETE"], 6)
+        self.assertEqual(result["ACHIEVEMENT"], "NOT ACHIEVED")
+
+    def test_metric_audit_distinguishes_calculated_published_and_approved_values(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"cash_dt": datetime(2026, 9, 18),
+                       "order_completion_date": datetime(2026, 9, 21),
+                       "LEADTIME FAB-CASH": 1, "LEADTIME CASH-COMPLETE": 6,
+                       "ACHIEVEMENT": "NOT ACHIEVED"})
+        audit = []
+        result = refresh_existing_record(master, source=None, catalyst_override=None,
+            review_decision=ReviewDecision(pm_approved=True), holidays=set(), metric_decisions=audit)
+        metrics = {item["metric"]: item for item in audit}
+        self.assertEqual(metrics["LEADTIME FAB-CASH"], {
+            "metric": "LEADTIME FAB-CASH", "previous_value": 1,
+            "calculated_value": 2, "final_value": 1, "decision_method": "published_history"})
+        self.assertEqual(metrics["ACHIEVEMENT"]["decision_method"], "explicit_pm_approval")
+        self.assertEqual(result["ACHIEVEMENT"], "ACHIEVED")
+
+    def test_explicit_leadtime_correction_overrides_published_history(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({"cash_dt": datetime(2026, 9, 18), "LEADTIME FAB-CASH": 1})
+        result = refresh_existing_record(master, source=None, catalyst_override=None,
+            review_decision=ReviewDecision(leadtime_fab_cash=2), holidays=set())
+        self.assertEqual(result["LEADTIME FAB-CASH"], 2)
+
+    def test_repeated_refresh_does_not_change_a_completed_record(self) -> None:
+        master = self.master(status="Complete", normalized="COMPLETE")
+        master.update({
+            "cash_dt": datetime(2026, 9, 18),
+            "order_completion_date": datetime(2026, 9, 21),
+        })
+        source = self.source(order="O-1", status="Complete")
+        once = refresh_existing_record(master, source=source, catalyst_override=None, holidays=set())
+        twice = refresh_existing_record(once, source=source, catalyst_override=None, holidays=set())
+        self.assertEqual(once, twice)
 
     def test_existing_approved_adjustment_is_preserved_without_completion_date(self) -> None:
         master = self.master(status="In Progress", normalized="In Progress")

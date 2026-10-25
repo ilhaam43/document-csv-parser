@@ -2,10 +2,22 @@ import unittest
 from datetime import date, datetime
 from decimal import Decimal
 
-from weekly.rules import achievement_for, build_master_record, inclusive_networkdays
+from weekly.rules import achievement_for, build_master_record, inclusive_networkdays, source_metrics
 
 
 class WeeklyRulesTests(unittest.TestCase):
+    def test_source_metrics_preserve_currency_precision_and_workday_rules(self) -> None:
+        result = source_metrics(
+            fab_upload=datetime(2031, 12, 24, 15, 30),
+            cash_date=datetime(2031, 12, 26),
+            otc="1,000.25", mrc="0.75", holidays={date(2031, 12, 25)},
+        )
+        self.assertEqual(result, {
+            "Count Cash": 1, "LEADTIME FAB-CASH": 2,
+            "OTC+MRC": Decimal("1001.00"),
+            "OTC+MRC (inMio)": Decimal("0.001001"),
+        })
+
     def test_raw_bq_lifecycle_dates_are_date_only_but_fab_keeps_timestamp(self) -> None:
         result = build_master_record({
             "FAB_Upload": "2026-10-01 15:40:42 UTC",

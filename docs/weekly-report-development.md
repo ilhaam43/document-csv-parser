@@ -3,14 +3,14 @@
 ## Current scope
 
 The command-line workflow can prepare a Catalyst review package, finalize the
-Master and Mobile datasets, and write both Excel workbooks with refreshed native
+Master, Mobile, and M2M datasets, and write Excel workbooks with refreshed native
 PivotTables. It uses the prior week's workbooks as templates and requires Windows,
 Microsoft Excel, and pywin32 for the workbook stage. The original templates are
 copied; they are never edited in place.
 
 The Catalyst check is a human checkpoint until dashboard access is available.
-The Weekly web page and API implement that checkpoint. The Mobile PowerPoint
-generator uses the prior week's PPTX as an editable template; it leaves the
+The Weekly web page and API implement that checkpoint. Both PowerPoint
+generators use the prior week's service-specific PPTX as editable templates; they leave the
 Power BI dashboard slide content unchanged.
 
 ## Weekly web workflow
@@ -23,7 +23,10 @@ remains the cutoff and the date printed in the PPT. The month defaults to the
 report date's month unless explicitly supplied via CLI/API. For example,
 Excel `WEEKNUM(date, 14)` evaluates that date as W39 and must not determine the
 workbook name or Mobile pivot window. Upload the BQ CSV, previous Master old
-format, previous Mobile workbook, previous Mobile weekly PPT, and holiday workbook. The page preserves the
+format and holiday workbook. Select Mobile, M2M, or both, then upload each
+selected service's previous workbook and weekly PPT. Unselected templates are
+not required or submitted. The Master always includes all three services.
+The page preserves the
 job ID when navigating away and back.
 
 After preparation, the page lists only Master rows that need Catalyst review.
@@ -52,17 +55,26 @@ An optional `pivot_review` CSV records a confirmed change to an `ADJUSTMENT`
 filter in a named PivotTable. None of these files is required for normal web
 generation. A note in `ADJUSTMENT` alone never approves `ACHIEVEMENT`.
 
-Finalization creates a ZIP with Master Excel, Mobile Excel, Mobile weekly PPT,
-`audit.json`,
-`exceptions.csv`, and `review-decisions.csv`.
-Uploaded slide, pivot, and approved-correction CSVs are included when supplied,
-so their decisions remain traceable with the generated files.
-An uploaded presentation chart review is also included when supplied.
+Finalization creates a user-facing ZIP containing only Master Excel and each
+selected service's Excel/PPT: three files for Mobile or M2M, five for both.
+The API retains the legacy default `output_services=mobile` and accepts
+`m2m` or `both`; `previous_m2m` and `previous_m2m_ppt` are the M2M upload fields.
+PPT templates are required by the web form, but remain optional for direct API
+clients that need Excel only. Audit files
+(`audit.json`, `exceptions.csv`, `review-decisions.csv`, and
+`bq-source-decisions.csv`) remain in the job's server-side `output/` directory.
+Uploaded correction and review files remain in `input/`; they are not included
+in the report ZIP. Downloading an older completed job also repackages its
+existing reports without internal files, without recalculating report data.
 The audit records remaining unresolved Catalyst statuses and the web shows a
 warning if any remain; a generated report is not proof that all reviews were
 completed.
 If a Catalyst review conflicts or Excel fails, the review can be corrected and
-submitted again without uploading the source files again. Preparation and final
+submitted again without uploading the source files again. Completed report
+artifacts are reused on retry only when input/review/code fingerprints and their
+saved SHA-256 checksums match. Changing a review invalidates the saved artifacts.
+Native Excel jobs run sequentially in the existing single-worker queue.
+Preparation and final
 exception CSVs are available from the status panel.
 
 The endpoints are `POST /api/weekly/jobs`, `GET /api/weekly/jobs/{job_id}`,
@@ -80,6 +92,9 @@ long-term audit store. A server restart during an active job does not resume it.
 
 - Master services: `Bulk Service`, `Mobile`, and `M2M`.
 - Mobile output services: `Bulk Service` and `Mobile`.
+- M2M output service: `M2M`, filtered from the same finalized Master, with
+  independent sequential numbering. It does not repeat Catalyst review or
+  introduce a second lead-time/achievement calculation.
 - A source quote already present in the previous master is not appended again.
 - New source rows must have `FAB_Upload` in the explicitly selected FAB reporting
   month and no later than the report date. A first-week-of-October W39 report
@@ -103,15 +118,21 @@ long-term audit store. A server restart during an active job does not resume it.
 - A calculated FAB-CASH lead time of zero is preserved, matching the subsequently
   approved manual-file behavior. CASH-COMPLETE uses a minimum of one day for a
   calculated zero (confirmed by 456 newly added W38 rows). This is a column-level
-  calculation policy, not a global replacement of zeros. Historical reviewed
-  values are retained when their supporting dates have not changed.
+  calculation policy, not a global replacement of zeros. Published, integer
+  FAB-CASH values are retained when both supporting dates remain unchanged.
+  Missing/invalid results and rows with changed dates use the same calculation
+  as new rows. Missing dates clear stale metrics. Count Cash and both revenue
+  totals are always derived from source fields. An explicitly supplied lead-time
+  correction takes precedence over the published baseline.
 - Negative lead time remains visible as an exception.
 - Achievement limits: Mobile 3 days, Bulk Service 5 days, M2M 19 days.
 - PM approval must be explicitly recorded in the review CSV to override the
   calculated achievement. A reviewed workbook can also explicitly change
   `NOT ACHIEVED` to `ACHIEVED`; an `ADJUSTMENT` note alone is not approval.
-  Historical approved values are carried from the prior master when the
-  relevant dates do not change.
+  Published historical CASH-COMPLETE and achievement values are carried from the
+  prior master when the supporting dates do not change. Their presence does not
+  prove that historical PM approval was obtained. A new approval is never
+  inferred from a note. A date change invalidates the inherited SLA calculation.
 - New-row sales hierarchy and activation date stay blank to match the reviewed
   master contract.
 - A reviewed Catalyst workbook can supply corrected `order_status` and a
@@ -131,15 +152,29 @@ long-term audit store. A server restart during an active job does not resume it.
   matches remain in `exceptions.csv`.
 - Mobile week pivots retain a rolling four-week window and use the prior Mobile
   workbook as their template. Five M2M-only pivots are removed.
-- The existing Mobile adjustment-inclusion pivot group includes all current
-  adjustment notes, not only notes that changed since the template. This matches
-  all three manual Mobile samples. It changes aggregation membership, not
-  ACHIEVEMENT or PM approval. Other curated pivot filters remain unchanged.
+- Adjacent formula columns inherit each refreshed pivot row's fill, bold, and
+  horizontal borders while retaining their own numeric format. Grand Total
+  styling follows the actual total row when a pivot grows or shrinks; obsolete
+  helper formulas and their formatting are cleared without removing unrelated notes.
+- Performance summary pivots include all ADJUSTMENT notes in both
+  Master and Mobile. This changes aggregation membership, not ACHIEVEMENT or PM
+  approval. A note is not an automatic exclusion. SLIDE GH MEETING and
+  detail/exception sheets retain their separate operational/investigation
+  filters; an explicit pivot-review input is applied after
+  the default summary policy. Manual samples with additional exclusions remain
+  differences, not evidence that the default reproduces those selections.
+- Every refresh includes finite, nonnegative FAB-CASH values in page filters,
+  including zero, for both report roles. The policy no longer depends on a month
+  rollover or cached numeric checkboxes. Negative and missing values remain in
+  ALL DATA but are excluded from these average-lead-time populations.
+- Summary column fitting covers numeric values, bounded/wrapped column headers,
+  page-filter captions and values, and adjacent percentage helpers. It only
+  widens columns as needed and does not apply sheet-wide AutoFit to ALL DATA.
 - FAB timestamps preserve available time precision. Lifecycle report dates
   (`cash_dt`, `order created`, `order_completion_date`) are date-only values.
 - Missing completion dates clear stale completion counts, periods and calculated
   cash-completion SLA values, even when the date was already blank last week.
-  An existing approved ACHIEVED value accompanied by ADJUSTMENT is preserved;
+  An existing published ACHIEVED value accompanied by ADJUSTMENT is preserved;
   merely filling an adjustment note does not grant a new approval.
 
 ## Create a preparation package
@@ -193,7 +228,7 @@ with `quote` (or `order`) on only the affected rows in `source-review.csv` and
 upload it; blank rows retain the default. The API also accepts a sparse
 `reviewed_sources` JSON object keyed by `master_row`. Finalization validates
 the identity of every supplied override and writes the effective choice and
-method for every conflict to `bq-source-decisions.csv` in the output ZIP.
+method for every conflict to the server-side `output/bq-source-decisions.csv`.
 Overrides can change completion, achievement, pivot totals, and PPT charts;
 they must not be inferred from the FAB reporting period. Catalyst decisions
 remain separate.
@@ -275,32 +310,31 @@ The writer rebuilds `SLIDE GH MEETING` chart-source values from its refreshed
 pivot. Completed months are collapsed to weighted monthly pivot subtotals;
 the reporting month expands into weeks. The reporting month comes from the
 Thursday-start report week, not the BQ export month (W39 remains September
-even with an October export). Mobile weekly values are rounded as in the
-existing template convention; monthly averages retain their precision.
+even with an October export). Both Master and Mobile retain the full precision
+of the refreshed pivot, including weekly values and the weighted grand total.
+The template's number formats control display precision without rounding the
+stored cell values.
 All chart series are resized to the resulting range. Helper percentage formulas
 are restored relative to each refreshed pivot's data and grand-total rows.
-At a detected month rollover, Master nonnegative numeric FAB-CASH filter values
-are included even when a prior template hid them; negative/blank metrics remain
-excluded from that filtered average. Within the same reporting month the template
-selection is preserved. This rollover policy is inferred from the supplied
-September/October samples, not an independently confirmed owner instruction.
-Mobile templates retain their distinct, curated numeric selections;
-they are not normalized to the Master filter. Other manually decided values belong in
+Both Master and Mobile include finite, nonnegative numeric FAB-CASH values in
+summary page filters on every refresh, even when a prior template hid them.
+Zero participates in the average; negative/blank metrics do not. The old
+month-rollover-only reset and Mobile numeric checkbox inheritance are no longer
+used. Separate operational/detail filters remain unchanged. Other explicitly
+reviewed values belong in
 `slide-review.csv` with columns
-`workbook,cell,value,reviewed_by,review_reason`. For W38, Master cell `U21`
-needs the manually confirmed total of 16; do not infer it from the pivot.
-Review the chart values before distribution. A W38 reference fixture copied
+`workbook,cell,value,reviewed_by,review_reason`. These are optional, attributed
+exceptions, not a required way to copy stale manual summaries. No review CSV
+is needed to populate normal summaries or charts. A reference fixture copied
 from the manual file is useful for regression, but is not production approval.
-The W39 reference revises W2-W4 to unrounded values, unlike W38. Use an
-attributed slide review for those values; the two examples do not establish a
-general rounding rule for future weeks.
 
 W39's manual Master also changes two `ADJUSTMENT` pivot filters compared with
-W38, including four August orders. This change is not inferable from BQ data.
-Leave the previous week's filter state in place unless the report owner confirms
-the new selection. To reproduce the reviewed W39 file, upload an attributed
-`pivot-review.csv` alongside the Catalyst review, or pass `--pivot-review` to
-`weekly.workbook`. Its columns are
+W38, including four August orders. The default performance-summary policy now
+includes all notes for both roles, covering those orders without a W39-specific
+override. An additional exclusion or exceptional ordering still needs an explicit
+review decision rather than inference from note text. Such optional decisions
+can be supplied in an attributed `pivot-review.csv` alongside the Catalyst
+review, or with `--pivot-review` to `weekly.workbook`. Its columns are
 `workbook,pivot,field,item,visible,position,reviewed_by,review_reason`.
 For an `ADJUSTMENT` filter decision, set `visible` to `true` or `false` and
 leave `position` blank. For an approved `Week FAB` or `Week Completion` order,
@@ -383,10 +417,18 @@ After pivot refresh, the writer grows numeric summary columns to fit their
 displayed values, sizes top service filters with dropdown clearance, and fits
 the numeric helper column beside the status summary. It preserves wider
 template widths and caps filter growth to avoid excessive horizontal spread.
+Helper styling is synchronized after Excel's full recalculation, revealing
+hidden pivot totals and fitting summary columns. Hidden total rows report
+different display borders, so copying styles before unhiding them loses the
+visible total separator. This final styling pass does not rewrite formulas or
+report values, and runs before automatic calculation is restored.
 
 ## Write Mobile PowerPoint
 
-### October snapshot validation
+### Earlier October snapshot validation
+
+These runs preceded the unconditional historical FAB-CASH recalculation below.
+They describe the tested engine at that time, not current whole-workbook parity.
 
 The W40 retry with the original 8 October BQ snapshot confirmed 97 new rows,
 54,959 Master rows and 54,464 Mobile rows. With only 67 Catalyst status decisions
@@ -396,6 +438,25 @@ chart series match numerically. This does not make the entire workbooks identica
 one valid FAB-CASH value is blank in manual, and SLIDE GH MEETING retains a
 spelling difference and two Mobile static-source rounding/copy differences.
 Those differences remain visible in the comparison results.
+
+A fresh local browser run on 19 October 2026 exercised the complete W40 upload,
+67 direct Catalyst selections, generation and ZIP download, without mocked API
+responses. It used report date `2026-10-08`, reporting month `2026-10`, week 40,
+the 8 October BQ export and W39 templates. Catalyst statuses were replayed only
+as test inputs from the original manual W40: 66 InProgress and one Cancelled.
+The final run after the hidden-total border fix completed in approximately
+10 minutes 46 seconds on the test machine; this includes automated review
+entry, not real dashboard review time. The ZIP
+contained only the Master workbook, Mobile workbook and Mobile PPT. All six
+worksheets in each downloaded workbook matched the previously validated W40
+values, chart references and content visibility. Review selections survived a
+page reload, and desktop and 390-pixel mobile views had no page overflow or
+browser errors. Native Excel inspection found no helper formatting differences
+across five Master and four Mobile tables, and all six PPT chart series matched
+the manual W40 values while preserving template scales. The automated suite
+ran 226 tests without failures, with two opt-in tests skipped.
+This confirms the tested local workflow, not deployed-server
+status or whole-workbook equivalence to every manual sample.
 
 The W38/W39 data regressions no longer need BQ-source overrides. W38 still
 needs two external PM approvals to reproduce the final manual achievement values;
@@ -411,8 +472,13 @@ test fixtures, not evidence of automatic access to those external facts.
 
 All PPT historical lead-time points now refresh from the generated workbook.
 The prior behavior that silently retained FAB-CASH points from the template is
-removed. When new values exceed a fixed template axis, that axis expands with
-headroom so the point is visible. Explicit presentation reviews still override
+removed. Fixed template axes and category-label spacing are preserved so weekly
+and monthly chart shapes remain comparable. Values outside a fixed axis are not
+clamped, replaced, or silently hidden: an editable chart overlay names the
+out-of-scale point and its actual value. Old generated overlays are replaced or
+removed when the next report changes. Integer chart caches and embedded workbook
+cells share the same thousands-separated number format.
+Explicit presentation reviews still override
 approved historical exceptions. Layout, chart editability and non-chart media
 remain based on the previous-week deck.
 
@@ -448,7 +514,27 @@ at two historical Mobile lead-time points and has several 2025 month labels on
 2026 data. Those manual discrepancies are not reproduced. Review the final
 PPT against the workbook before distribution.
 
-## Run the W38 golden regression
+## Audit any weekly reference
+
+`weekly.regression` calls `finalize_weekly_data`, the same finalizer used by the
+web API. It does not contain week-specific expected counts, quote-specific
+exemptions, or a second implementation of source selection. Master and Mobile
+are compared independently, keyed by quote, order, and FAB minute. Duplicate
+occurrences, missing and extra rows, and every business column are checked.
+Only sequential `No.` and FAB seconds are excluded by the owner's agreed policy.
+Numeric comparisons use an absolute tolerance of `1e-8`; text is not rewritten
+to make a comparison pass.
+
+The audit separately reports reference FAB-CASH and revenue inconsistencies
+against source formulas. It does not repair the reference or excuse an actual
+parity mismatch. An audit failure therefore remains a failure even when its
+cause is understood. The data audit does not certify workbook layout, pivot
+filters, or PPT parity; those need their own native workbook/chart comparisons.
+
+For another sample, replace the paths and report date below. Pass an explicit
+`--report-month YYYY-MM` when the FAB month differs from the BQ cutoff month.
+Approved correction inputs can be passed as `--manual-decisions` and
+`--source-review`; they remain explicit inputs, not inferred expected values.
 
 ```powershell
 python -m weekly.regression `
@@ -461,12 +547,11 @@ python -m weekly.regression `
   --report-date 2026-09-24
 ```
 
-The audit checks the selected row count, identity multiset, every generated field,
-master and mobile row counts, and mobile service scope. With only the supplied
-pre-Catalyst checkpoint, it reports 64 unresolved status differences from the
-manual final, while the seven other documented post-checkpoint differences are
-classified separately. The generator does not silently infer missing Catalyst
-decisions to make the regression pass.
+The supplied pre-Catalyst W38 checkpoint is not a complete set of final Catalyst
+and PM decisions. Its audit is expected to expose differences, not report a
+golden-file pass. No known quote is exempted, and no missing decision is inferred
+to make the regression pass. The older fixture-specific counts above describe
+historical runs, not the current comparison result.
 
 The same regression is available through `tests/test_weekly_reference_w38.py`:
 
@@ -475,7 +560,265 @@ $env:WEEKLY_REFERENCE_DIR = "D:\SECM\Weekly 38"
 python -m unittest tests.test_weekly_reference_w38 -v
 ```
 
+## Cross-week calculation ownership
+
+The October 2026 review distinguishes reproducible calculations from published
+historical decisions. This policy is the same for every week:
+
+| Field | Calculation or ownership |
+| --- | --- |
+| Historical FAB-CASH | Retain a published integer with unchanged FAB/CASH dates. Calculate missing/invalid results and changed-date rows; clear the value if a required date is missing. Explicit reviewed corrections take precedence. |
+| New FAB-CASH | Inclusive NETWORKDAYS(FAB, CASH, uploaded holidays), keeping zero and negative results. |
+| Count Cash | Always derive from the presence of a CASH date. |
+| OTC+MRC | Always sum the row's raw OTC and MRC with decimal arithmetic. |
+| OTC+MRC (inMio) | Always divide the total by 1,000,000, without rounding away source precision. |
+| Historical CASH-COMPLETE | Retain a published integer with unchanged supporting dates; recompute missing/invalid results or after a date correction. Missing lifecycle dates clear stale SLA values. |
+| New CASH-COMPLETE | Inclusive NETWORKDAYS(CASH, completion, holidays), normalizing calculated zero to one. |
+| Historical achievement | Preserve the existing published result with unchanged dates. Do not treat this as newly inferred PM approval. |
+| New or corrected achievement | Apply the service SLA; only an explicit reviewed approval can override it. |
+| Pivot and PPT | Refresh from the resulting dataset and workbook, not the target manual report. |
+
+Read-only inspection of the original W39-W41 references found incompatible
+historical calculation bases: W39/W40 retain normalized FAB-CASH constants and
+values that differ from the supplied holiday calendar, while W41 recalculates
+them. In all three samples, thousands of
+published CASH-COMPLETE constants instead match FAB-to-completion, while the
+confirmed new-row rule is CASH-to-completion. These historical SLA values are
+not silently reinterpreted or overwritten. W41 also leaves both derived revenue
+columns empty on all newly appended rows even though raw OTC/MRC are populated.
+The generator calculates the revenue rather than dropping it to imitate blanks.
+
+Consequently, a single source-consistent calculation cannot be byte-for-byte or
+cell-for-cell identical to every unreconciled manual reference. A consistent
+historical SLA restatement needs owner approval and a corrected reference; it
+must not be hidden in a week-specific rule. Original source files are never
+edited during validation. Status-only Catalyst replay fixtures are test inputs,
+not evidence that the application can query Catalyst automatically.
+
+### Earlier validation before published FAB-CASH preservation
+
+The updated production prepare/finalize/workbook/PPT functions were rerun with
+the original W39, W40, and W41 BQ snapshots and prior-week templates. Only pending
+Catalyst statuses were replayed from each original manual reference: 66, 67, and
+67 respectively. No PM, BQ-source, pivot, slide, or presentation overrides were
+supplied. Results and previews are stored outside the repository at
+`D:\SECM\weekly-crossweek-consistency-20261023`.
+
+| Sample | Master rows | Mobile rows | Remaining ALL DATA differences from manual | PPT charts matching manual |
+| --- | ---: | ---: | --- | ---: |
+| W39 | 54,862 | 54,372 | Historical FAB-CASH: 249 Master / 245 Mobile; one stale cancelled-order SLA and achievement in each. | 5/6 |
+| W40 | 54,959 | 54,464 | Historical FAB-CASH: 250 Master / 246 Mobile. | 6/6 |
+| W41 | 56,555 | 56,058 | Both revenue fields blank in manual on 1,596 new Master / 1,594 new Mobile rows. | 3/6 |
+
+All generated source-metric checks pass. Each saved workbook's complete ALL DATA
+matches its finalizer CSV, numbering is sequential, all 18 PPT charts match
+their generated pivot sources and editable embedded workbooks, and all template
+images are preserved. Native Excel independently checked 96 representative
+NETWORKDAYS values across positive, zero, negative, weekend, and year categories.
+No helper-style mismatches were found across 27 helper tables. All 12 slides
+were opened and rendered in PowerPoint. Original input SHA256 hashes are unchanged.
+
+The data consistency and native checks are not manual parity passes. Raw cell
+comparisons still report historical filter/order and static summary differences.
+The W41 revenue diagnostic that completes only a copy of the manual rows in
+memory leaves zero ALL DATA differences, but the original reference remains
+unchanged and the actual parity audit still fails. `weekly.regression` was also
+executed against W41 and correctly exited nonzero for that unresolved difference.
+The standard unit suite includes an API test with the real finalizer/rule engine;
+only file adapters and native writers are substituted there. Both opt-in W38
+reference tests were separately executed and passed, including the test that
+expects the incomplete legacy checkpoint to expose differences.
+
+## Earlier summary population and layout validation
+
+The performance-summary policy is metric-specific. PIVOT PERFORMANCE includes
+all ADJUSTMENT notes for both roles. SLIDE GH MEETING and the monitoring and
+exception sheets retain their separate operational populations; resetting their
+filters globally changes otherwise matching reference values. Explicit optional
+pivot reviews are still applied last. No additional review is required for
+normal generation.
+
+Numeric FAB-CASH page filters in summaries are rebuilt from finite values >= 0
+on every run, rather than inheriting a service-specific numeric checkbox list.
+This deliberately includes zero. Layout fitting is bounded to pivot/filter/
+helper ranges, preserves wider columns, wraps oversized headers, and preserves
+intentionally hidden rows when AutoFit changes header heights.
+
+The W39-W41 validation compares PIVOT PERFORMANCE by pivot name, row label and
+column label as well as the strict whole-workbook coordinate comparison. This
+avoids classifying reordered weeks as numeric discrepancies. With the supplied
+published history preserved, count and achievement cells match all three
+reference samples. Revenue matches W39/W40; W41 retains the documented derived
+revenue blanks in the reference. FAB-CASH averages still differ where historical
+values or reference numeric selections differ from the declared calculation
+policy. These are not full manual-parity passes.
+
+The workbook-only patch reuses the verified prepare/finalize CSV datasets and
+re-runs the same native writers called by the web API. Independent aggregate
+checks read saved pivot filters and recompute totals and displayed period groups
+from source rows; these checks do not use manual target values. Native checks
+also cover saved ALL DATA, formula/number overflow, hidden rows, helper fill/
+bold/borders, editable chart data and rendered tables. Validation files and
+previews are outside the repository at
+`D:\SECM\weekly-pivot-validation-20261023`, not in the user's report ZIP.
+
+## Published-history refresh policy
+
+The current policy is `preserve_published_history_v1`. The preceding validation
+tables describe earlier runs with unconditional historical FAB-CASH calculation;
+they are not claimed as results for the current policy.
+
+- The prior published master is a baseline. Valid historical lead times remain
+  stable when their supporting calendar dates do not change, even if the uploaded
+  holiday calendar has changed. Invalid/missing values are repaired from dates.
+- A changed CASH/completion date invalidates the corresponding inherited metric.
+  Missing achievement is calculated from the final CASH-COMPLETE value and the
+  service SLA. An adjustment note does not grant PM approval.
+- An explicit reviewed FAB-CASH correction or PM approval/rejection takes
+  precedence. An inherited ACHIEVED value is not newly certified as PM-approved.
+- Revenue remains an arithmetic calculation, not a manual exception. Missing
+  revenue formulas are completed instead of copying blanks into pivots.
+- `SLIDE GH MEETING` values use current pivot precision. Older manually typed
+  numbers and premature integer rounding are not reused as calculation inputs.
+- PowerPoint chart caches and editable data also retain pivot precision. Their
+  `#,##0` number formats and summary text annotations provide rounded display
+  values, without replacing fractional lead times or revenue in the chart data.
+- `metric-decisions.csv` in the internal job directory records row identity,
+  metric, previous/calculated/final values and the decision method. `audit.json`
+  records policy version, the supplied holiday dates, method counts and formula
+  variances. Neither file is added to the normal core-report ZIP or requires
+  another web review step.
+
+W39's original Master demonstrates the reconciliation issue directly: its
+`SLIDE GH MEETING!T18` retains 4 while its own `N19` pivot cell contains
+2.090909090909091. The static value and its AVG Total also equal the preceding
+W38 static table. A consistent generator follows the refreshed pivot rather
+than reproducing both contradictory values.
+
+W41 restates old FAB-CASH values without changing the supporting dates. The
+current preservation policy does not silently infer that restatement from the
+week number. An intentional historical correction must be supplied explicitly;
+matching every unreconciled manual cell is not a generation guarantee.
+
+### Validation of the published-history policy
+
+Fresh production prepare/finalize and native Excel/PPT runs are stored outside
+the repository at `D:\SECM\weekly-history-validation-20261023`. These results
+supersede the older unconditional-recalculation run above:
+
+| Sample | Remaining ALL DATA differences from manual (Master / Mobile) | PPT charts with matching rounded label values |
+| --- | --- | ---: |
+| W39 | One cancelled-order CASH-COMPLETE and achievement in each; FAB-CASH matches. | 5/6 |
+| W40 | One missing FAB-CASH result in each; generator calculates the missing value. | 6/6 |
+| W41 | Historical FAB-CASH restatement: 249 / 245; both revenue columns blank in manual on 1,596 / 1,594 new rows. | 3/6 |
+
+All 2,730 independent pivot aggregates match final data and saved filters, all
+180 static-summary values match native GetPivotData, and 127 calculated metric
+samples match native NETWORKDAYS with the declared per-column zero policy.
+The six saved ALL DATA datasets match their finalizer CSVs with sequential
+numbering. All 18 chart caches match generated pivot precision; editable data
+matches within floating-point serialization tolerance and all template images
+remain unchanged. All 12 slides were rendered in PowerPoint. Static summary
+styles now move with period/total rows instead of leaving old footer formatting
+on the newly inserted week, without changing the saved summary values.
+
+W40 using the generated W39 baseline and W41 using the generated W40 baseline
+produce the same final datasets as using the respective published manual
+baselines. Input hashes remain unchanged. Pending Catalyst statuses were
+replayed solely for testing; no new automatic Catalyst access is implied.
+
+The standard suite runs 253 tests: 251 pass and two opt-in reference tests are
+skipped when their environment variable is absent. The API test exercises the
+real finalizer with file adapters/native writers substituted, checks historical
+preservation and revenue completion, and asserts that the user ZIP contains
+only the named core reports. This is not a full manual-parity claim: declared
+filter differences, manual restatements, blank reference revenue and stale
+summary/chart values remain explicitly reported.
+
 ## Next implementation stages
 
-1. Add the M2M output path after its business rules and manual example are reviewed.
-2. Add job retention and startup recovery after server deployment requirements are set.
+1. Add job retention and startup recovery after server deployment requirements are set.
+
+## M2M Report Implementation
+
+`weekly/profiles.py` holds workbook-specific service scope, weekly window and
+summary location. `weekly/workbook.py --report-type m2m` uses the same native
+Excel writer as Master/Mobile, without removing the M2M-only pivots.
+`weekly/m2m_presentation.py` maps the M2M pivot sections to the existing editable
+M2M deck; chart XML, embedded data, layout preservation and validation reuse
+`weekly/presentation.py`. No week-specific or quote-specific target values are
+used. Master processing, status resolution, holidays and the 19-day M2M SLA
+remain shared with the existing pipeline.
+
+Standalone M2M commands after finalization:
+
+```powershell
+python -m weekly.workbook --data-csv .\output\m2m-data.csv --template .\previous-m2m.xlsx --output .\output\m2m.xlsx --report-type m2m --report-week 40 --report-date 2026-10-01
+python -m weekly.m2m_presentation --m2m-workbook .\output\m2m.xlsx --template .\previous-m2m.pptx --output .\output\m2m.pptx --report-week 40 --report-date 2026-10-08 --report-month 2026-10
+```
+
+The supplied M2M templates have four sheets, 20 PivotTables and four editable
+PowerPoint charts. Their legacy `MONITORING ORDER - MOBILE` sheet name is
+preserved. `SLIDE GH MEETING` uses Q:R instead of Mobile's S:U. The four extra
+empty `Table1` columns are retained because pivot metadata references them;
+populated unknown extra columns fail with an explicit mapping error instead
+of being discarded. Only the canonical 34 columns receive generated data.
+
+The weekly PPT charts show the last four report weeks; earlier embedded columns
+remain hidden. The monthly lead-time chart has one M2M series, unlike Mobile's
+two. Monthly labels derive their year from the selected reporting period,
+correcting stale 2025 labels in the reference decks. Revenue preserves fractional
+millions with `#,##0.00` display. Monthly lead-time labels sit above their points
+instead of overlapping month labels, without moving chart frames or axes.
+Missing M2M periods use zero for count/revenue
+and a gap for an undefined lead-time mean, never a fabricated zero-day mean.
+Power BI slide imagery remains unchanged.
+
+Legacy optional slide/pivot/chart correction files still apply to Master/Mobile;
+their cell/chart coordinates are not silently applied to M2M. Normal M2M output
+uses refreshed native pivot values and requires no additional manual checkpoint.
+
+The M2M ALL DATA in the supplied W39/W40/W41 files equals the corresponding
+manual Master's M2M subset (490 / 495 / 497 rows). This validates the shared-data
+contract, not universal manual parity: the historical Master/filter differences
+documented above propagate to the M2M report too. Static manual averages may
+also be rounded while the generator retains pivot precision. Do not report
+these known differences as a fully identical manual-output pass.
+
+Development samples, native outputs, comparisons and rendered previews are kept
+outside the repository at `D:\SECM\m2m-development-20261025`.
+
+### M2M Validation Results
+
+The real multipart prepare/review/finalize API flow for W40 produced all five
+core reports in the combined ZIP. Catalyst statuses were replayed from the
+supplied manual sample solely for this test; no live Catalyst access is implied.
+Native Excel/PowerPoint checks cover M2M W40 and W41:
+
+| Sample | M2M rows | Independent pivot aggregates checked | Remaining ALL DATA differences from manual |
+| --- | ---: | ---: | --- |
+| W40 | 495 | 247, all pass | None |
+| W41 | 497 | 248, all pass | Four inherited FAB-CASH values; four calculated revenue values versus manual blanks |
+
+All generated M2M data cells match their finalized Master subset, extra
+structural columns stay blank, and all four chart caches agree with editable
+embedded data and current pivot precision. All eight generated slides were
+rendered in native PowerPoint and inspected. Table/number-overflow checks pass.
+The monthly chart's labels were moved above points after visual inspection.
+
+This is not full pivot/manual parity. Strict coordinate comparisons still find
+11 / 12 PIVOT PERFORMANCE differences and 3 / 4 SLIDE GH MEETING differences
+for W40 / W41 respectively: existing historical/filter policies, rounded static
+values, week-label language and refreshed empty results remain distinguishable.
+For example, the manual W40 achievement Grand Total helper is 100%, while its
+counts are 239 / 275; the generated formula yields 86.91%.
+
+Browser tests cover Mobile/M2M/both selections, conditional required uploads,
+actual multipart field names, zero-row review completion, reset behavior and
+desktop/mobile layouts (1440px and 390px) with no page overflow or JS errors.
+These browser interaction tests stub job responses; the separate W40 API test
+uses the real finalizer and native report writers. Standard tests also cover
+legacy Mobile requests, core-only downloads and checksum-verified retries.
+A native sparse-week test uses the W41 dataset with a later empty reporting
+week and verifies successful workbook/PPT output with zero counts/revenue and
+blank lead-time chart points, rather than claiming a live W42 data sample.

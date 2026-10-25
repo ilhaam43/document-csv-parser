@@ -96,6 +96,24 @@ def achievement_for(
     return "ACHIEVED" if leadtime_cash_complete <= max_days else "NOT ACHIEVED"
 
 
+def source_metrics(
+    *,
+    fab_upload: Any,
+    cash_date: Any,
+    otc: Any,
+    mrc: Any,
+    holidays: Collection[date] = (),
+) -> dict[str, Any]:
+    """Calculate source-owned metrics independently of prior report values."""
+    total = to_decimal(otc) + to_decimal(mrc)
+    return {
+        "Count Cash": 1 if parse_datetime(cash_date) else None,
+        "LEADTIME FAB-CASH": inclusive_networkdays(fab_upload, cash_date, holidays),
+        "OTC+MRC": total,
+        "OTC+MRC (inMio)": total / Decimal("1000000"),
+    }
+
+
 def build_master_record(
     source: dict[str, Any],
     *,
@@ -114,8 +132,6 @@ def build_master_record(
     normalized_status = normalize_order_status(raw_status)
     otc = to_decimal(source.get("otc"))
     mrc = to_decimal(source.get("mrc"))
-    total = otc + mrc
-    fab_cash = inclusive_networkdays(fab_upload, cash_date, holidays)
     cash_complete = inclusive_networkdays(cash_date, completion_date, holidays, normalize_zero=True)
 
     return {
@@ -132,7 +148,6 @@ def build_master_record(
         "fab_upload": fab_upload,
         "Count FAB": 1,
         "cash_dt": cash_date,
-        "Count Cash": 1 if cash_date else None,
         "order number": clean_text(source.get("order_number")) or None,
         "order created": order_created,
         "order_completion_date": completion_date,
@@ -142,9 +157,13 @@ def build_master_record(
         "Year Completion": str(completion_date.year) if completion_date else None,
         "otc": otc,
         "mrc": mrc,
-        "OTC+MRC": total,
-        "OTC+MRC (inMio)": total / Decimal("1000000"),
-        "LEADTIME FAB-CASH": fab_cash,
+        **source_metrics(
+            fab_upload=fab_upload,
+            cash_date=cash_date,
+            otc=otc,
+            mrc=mrc,
+            holidays=holidays,
+        ),
         "LEADTIME CASH-COMPLETE": cash_complete,
         "ACHIEVEMENT": achievement_for(
             service_group=service_group,
@@ -155,7 +174,7 @@ def build_master_record(
         # This column is maintained manually downstream; mld_dt is not equivalent.
         "ACTIVATION DATE": None,
         "SALES NAME": str(source.get("sales_name") or "").strip() or None,
-        # Manual W38 leaves hierarchy blank for newly appended rows.
+        # New rows have no reviewed sales-hierarchy mapping.
         "DEPT SALES": None,
         "DIVISION SALES": None,
         "GROUP SALES": None,

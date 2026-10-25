@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Weekly Mobile Report</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261007-source-review">
+  <title>Weekly Report</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261025-m2m">
 </head>
 <body>
   <main>
@@ -34,7 +34,7 @@
 
     <header class="app-header">
       <div>
-        <p class="eyebrow">Weekly Mobile Service</p>
+        <p class="eyebrow">Weekly Services</p>
         <h1>Weekly Report</h1>
       </div>
       <div class="health" id="health">API status: checking</div>
@@ -47,6 +47,12 @@
             <h2>Prepare Master Data</h2>
           </div>
           <form id="prepare-form">
+            <fieldset class="weekly-output-options">
+              <legend>Reports</legend>
+              <label><input id="include_mobile" type="checkbox" checked> Mobile</label>
+              <label><input id="include_m2m" type="checkbox"> M2M</label>
+            </fieldset>
+            <input id="output_services" name="output_services" type="hidden" value="mobile">
             <div class="field">
               <label for="report_date">Report date / BQ cutoff</label>
               <input id="report_date" name="report_date" type="date" required>
@@ -67,13 +73,25 @@
               <label for="previous_master">Previous Master old format</label>
               <input id="previous_master" name="previous_master" type="file" accept=".xlsx" required>
             </div>
-            <div class="field">
-              <label for="previous_mobile">Previous Mobile workbook</label>
-              <input id="previous_mobile" name="previous_mobile" type="file" accept=".xlsx" required>
+            <div id="mobile-template-fields">
+              <div class="field">
+                <label for="previous_mobile">Previous Mobile workbook</label>
+                <input id="previous_mobile" name="previous_mobile" type="file" accept=".xlsx" required>
+              </div>
+              <div class="field">
+                <label for="previous_ppt">Previous Mobile weekly PPT</label>
+                <input id="previous_ppt" name="previous_ppt" type="file" accept=".pptx" required>
+              </div>
             </div>
-            <div class="field">
-              <label for="previous_ppt">Previous Mobile weekly PPT</label>
-              <input id="previous_ppt" name="previous_ppt" type="file" accept=".pptx" required>
+            <div id="m2m-template-fields" hidden>
+              <div class="field">
+                <label for="previous_m2m">Previous M2M workbook</label>
+                <input id="previous_m2m" name="previous_m2m" type="file" accept=".xlsx" disabled>
+              </div>
+              <div class="field">
+                <label for="previous_m2m_ppt">Previous M2M weekly PPT</label>
+                <input id="previous_m2m_ppt" name="previous_m2m_ppt" type="file" accept=".pptx" disabled>
+              </div>
             </div>
             <div class="field">
               <label for="holiday_workbook">National holiday workbook</label>
@@ -146,6 +164,6 @@
       </aside>
     </div>
   </main>
-  <script src="/static/weekly.js?v=20261007-order-status"></script>
+  <script src="/static/weekly.js?v=20261025-m2m"></script>
 </body>
 </html>

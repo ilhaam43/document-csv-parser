@@ -8,7 +8,7 @@ from weekly.regression import run_reference_audit
 
 @unittest.skipUnless(
     os.environ.get("WEEKLY_REFERENCE_DIR"),
-    "Set WEEKLY_REFERENCE_DIR to run the W38 golden-file regression.",
+    "Set WEEKLY_REFERENCE_DIR to audit the supplied W38 reference without parity exemptions.",
 )
 class WeeklyReferenceW38Tests(unittest.TestCase):
     def test_w38_reference_exposes_missing_post_checkpoint_status_reviews(self) -> None:
@@ -29,11 +29,10 @@ class WeeklyReferenceW38Tests(unittest.TestCase):
             name for name, check in audit.checks.items()
             if check["actual"] != check["expected"]
         }
-        self.assertEqual(failed_checks, {"unexpected_existing_field_mismatches"}, audit.failures)
-        self.assertEqual(
-            audit.checks["unexpected_existing_field_mismatches"]["actual"],
-            {"order_status": 64},
-        )
+        self.assertIn("master_field_mismatches", failed_checks, audit.failures)
+        self.assertGreater(audit.checks["master_field_mismatches"]["actual"].get("order_status", 0), 0)
+        self.assertFalse(audit.passed)
+        self.assertEqual(audit.checks["master_row_count"]["actual"], audit.checks["master_row_count"]["expected"])
 
 
 if __name__ == "__main__":

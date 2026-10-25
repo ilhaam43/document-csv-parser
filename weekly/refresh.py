@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .catalyst import apply_catalyst_status
-from .dates import excel_week_number, parse_date_only, parse_datetime
+from .dates import as_date, excel_week_number, parse_date_only, parse_datetime
 from .matching import record_key
 from .models import CatalystOverride, RecordKey, ReviewDecision, ValidationIssue
 from .rules import (
@@ -18,7 +19,7 @@ from .rules import (
     is_unresolved_order_status,
     normalize_identifier,
     normalize_order_status,
-    to_decimal,
+    source_metrics,
 )
 
 
@@ -115,6 +116,18 @@ def _fill_blank_from_source(current: Any, source_value: Any, *, date_value: bool
     return parse_date_only(source_value) if date_value else clean_text(source_value)
 
 
+def _published_days(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
 def refresh_existing_record(
     master_row: Mapping[str, Any],
     *,
@@ -122,11 +135,13 @@ def refresh_existing_record(
     catalyst_override: CatalystOverride | None,
     review_decision: ReviewDecision | None = None,
     holidays: set[date],
+    metric_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Refresh source-owned fields, then recalculate all derived master fields."""
+    """Refresh sources and calculations, preserving unchanged published SLA decisions."""
     updated = dict(master_row)
-    previous_cash_date = parse_datetime(master_row.get("cash_dt"))
-    previous_completion_date = parse_datetime(master_row.get("order_completion_date"))
+    previous_fab_date = as_date(master_row.get("fab_upload"))
+    previous_cash_date = as_date(master_row.get("cash_dt"))
+    previous_completion_date = as_date(master_row.get("order_completion_date"))
     if catalyst_override is not None:
         updated = apply_catalyst_status(updated, catalyst_override)
     if review_decision is not None and review_decision.order_status is not None:
@@ -200,13 +215,25 @@ def refresh_existing_record(
     fab_upload = parse_datetime(updated.get("fab_upload"))
     cash_date = parse_datetime(updated.get("cash_dt"))
     completion_date = parse_datetime(updated.get("order_completion_date"))
-    cash_changed = cash_date != previous_cash_date
-    completion_changed = completion_date != previous_completion_date
-    if cash_changed or cash_date is None or fab_upload is None:
-        updated["Count Cash"] = 1 if cash_date else None
-        updated["LEADTIME FAB-CASH"] = inclusive_networkdays(
-            fab_upload, cash_date, holidays
-        )
+    fab_changed = as_date(fab_upload) != previous_fab_date
+    cash_changed = as_date(cash_date) != previous_cash_date
+    completion_changed = as_date(completion_date) != previous_completion_date
+    calculated = source_metrics(
+        fab_upload=fab_upload,
+        cash_date=cash_date,
+        otc=updated.get("otc"),
+        mrc=updated.get("mrc"),
+        holidays=holidays,
+    )
+    updated.update(calculated)
+    fab_method = "calculated"
+    published_fab = _published_days(master_row.get("LEADTIME FAB-CASH"))
+    if fab_upload is not None and cash_date is not None and not (fab_changed or cash_changed):
+        if published_fab is not None:
+            updated["LEADTIME FAB-CASH"] = published_fab
+            fab_method = "published_history"
+    # A published value is a baseline, not evidence that a PM approved it.
+    # Changed dates or missing results must still be calculated from source.
     if completion_changed or completion_date is None:
         updated["Count Completion"] = 1 if completion_date else None
         if completion_date:
@@ -218,10 +245,17 @@ def refresh_existing_record(
             updated["Month Completion"] = None
             updated["Year Completion"] = None
             updated["LEADTIME CASH-COMPLETE"] = None
-    if (cash_changed or completion_changed) and completion_date:
-        updated["LEADTIME CASH-COMPLETE"] = inclusive_networkdays(
-            cash_date, completion_date, holidays, normalize_zero=True
-        )
+    calculated_cash = inclusive_networkdays(cash_date, completion_date, holidays, normalize_zero=True)
+    published_cash = _published_days(master_row.get("LEADTIME CASH-COMPLETE"))
+    cash_method = "published_history"
+    if cash_date is None or completion_date is None or cash_changed or completion_changed or published_cash is None:
+        cash_method = "calculated"
+        updated["LEADTIME CASH-COMPLETE"] = calculated_cash
+    else:
+        updated["LEADTIME CASH-COMPLETE"] = published_cash
+    achievement_method = "published_history"
+    if cash_method == "calculated" or updated.get("ACHIEVEMENT") not in {"ACHIEVED", "NOT ACHIEVED"}:
+        achievement_method = "calculated"
         updated["ACHIEVEMENT"] = achievement_for(
             service_group=updated.get("service_group"),
             completion_date=completion_date,
@@ -236,6 +270,7 @@ def refresh_existing_record(
             and normalized_status != "CANCEL"
             else None
         )
+        achievement_method = "published_history" if updated["ACHIEVEMENT"] else "calculated"
     if review_decision is not None and review_decision.leadtime_fab_cash is not None:
         if (
             review_decision.leadtime_fab_cash == 0
@@ -243,20 +278,39 @@ def refresh_existing_record(
         ):
             raise ValueError("Reviewed zero FAB-CASH lead time does not match the source dates.")
         updated["LEADTIME FAB-CASH"] = review_decision.leadtime_fab_cash
+        fab_method = "explicit_override"
     if review_decision is not None and review_decision.pm_approved is True:
-        if completion_date is None:
+        if completion_date is None or normalized_status != "COMPLETE":
             raise ValueError("PM approval requires an order completion date.")
         updated["ACHIEVEMENT"] = "ACHIEVED"
+        achievement_method = "explicit_pm_approval"
     elif review_decision is not None and review_decision.pm_approved is False:
         updated["ACHIEVEMENT"] = achievement_for(
             service_group=updated.get("service_group"),
             completion_date=completion_date,
             leadtime_cash_complete=updated.get("LEADTIME CASH-COMPLETE"),
         )
+        achievement_method = "explicit_pm_rejection"
 
-    otc = to_decimal(updated.get("otc"))
-    mrc = to_decimal(updated.get("mrc"))
-    total = otc + mrc
-    updated["OTC+MRC"] = total
-    updated["OTC+MRC (inMio)"] = total / to_decimal(1_000_000)
+    if metric_decisions is not None:
+        calculations = {
+            "LEADTIME FAB-CASH": calculated["LEADTIME FAB-CASH"],
+            "LEADTIME CASH-COMPLETE": calculated_cash,
+            "ACHIEVEMENT": achievement_for(
+                service_group=updated.get("service_group"),
+                completion_date=completion_date,
+                leadtime_cash_complete=calculated_cash,
+            ),
+        }
+        for field, method in (
+            ("LEADTIME FAB-CASH", fab_method),
+            ("LEADTIME CASH-COMPLETE", cash_method),
+            ("ACHIEVEMENT", achievement_method),
+        ):
+            metric_decisions.append({
+                "metric": field, "previous_value": master_row.get(field),
+                "calculated_value": calculations[field], "final_value": updated.get(field),
+                "decision_method": method,
+            })
+
     return updated

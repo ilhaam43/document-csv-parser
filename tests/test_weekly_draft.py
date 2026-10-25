@@ -118,6 +118,13 @@ class WeeklyDraftTests(unittest.TestCase):
         self.assertEqual(final[0]["order number"], "O-1")
         self.assertEqual(final[0]["order_status"], "Complete")
         self.assertEqual(final[2]["order_status"], "#N/A")
+        m2m = self._read_csv(self.directory / "final" / "m2m-data.csv")
+        mobile = self._read_csv(self.directory / "final" / "mobile-data.csv")
+        self.assertEqual(audit["m2m_rows"], 1)
+        self.assertEqual(len(m2m) + len(mobile), len(final))
+        expected_m2m = dict(final[1], **{"No.": "1"})
+        self.assertEqual(m2m, [expected_m2m])
+        self.assertTrue(all(row["service_group"] != "M2M" for row in mobile))
 
     def test_matched_empty_bq_lifecycle_is_resolved_before_catalyst_review(self) -> None:
         self.bq_rows[0]["order_status"] = ""
@@ -134,6 +141,35 @@ class WeeklyDraftTests(unittest.TestCase):
         self.assertEqual(draft[0]["order_status (Confirmed by MIDO Dept.)"], "In Progress")
         review = self._read_csv(self.directory / "prepare" / "catalyst-review.csv")
         self.assertEqual([row["quote_num"] for row in review], ["Q-3"])
+
+    def test_finalizer_records_history_provenance_without_extra_review_inputs(self) -> None:
+        self.previous_rows[1].update({
+            "fab_upload": datetime(2026, 9, 20), "cash_dt": datetime(2026, 9, 20),
+            "order_completion_date": datetime(2026, 9, 21),
+            "LEADTIME FAB-CASH": 1, "LEADTIME CASH-COMPLETE": 6, "ACHIEVEMENT": "ACHIEVED",
+        })
+        patches = self._inputs("weekly.prepare")
+        with patches[0], patches[1], patches[2]:
+            prepare_weekly_inputs(
+                bq_csv="bq.csv", previous_master="old.xlsx", holiday_workbook="holiday.xlsx",
+                report_date=date(2026, 9, 24), output_dir=self.directory / "prepare",
+            )
+        patches = self._inputs("weekly.finalize")
+        with patches[0], patches[1], patches[2]:
+            audit = finalize_weekly_data(
+                bq_csv="bq.csv", previous_master="old.xlsx",
+                catalyst_review=self.directory / "prepare" / "catalyst-review.csv",
+                holiday_workbook="holiday.xlsx", report_date=date(2026, 9, 24),
+                output_dir=self.directory / "final",
+            )
+        metrics = self._read_csv(Path(audit["outputs"]["metric_decisions"]))
+        self.assertEqual(len(metrics), 9)
+        self.assertEqual(len({(r["master_row"], r["metric"]) for r in metrics}), 9)
+        fab = next(r for r in metrics if r["master_row"] == "3" and r["metric"] == "LEADTIME FAB-CASH")
+        self.assertEqual((fab["previous_value"], fab["calculated_value"], fab["final_value"]), ("1", "0", "1"))
+        self.assertEqual(fab["decision_method"], "published_history")
+        self.assertEqual(audit["metric_policy"], "preserve_published_history_v1")
+        self.assertEqual(audit["metric_calculation_variances"]["LEADTIME FAB-CASH"], 1)
 
     def test_prepare_preserves_timestamp_seconds_but_renumbers_source_no(self) -> None:
         self.bq_rows[2]["FAB_Upload"] = "2026-09-03 10:02:29"

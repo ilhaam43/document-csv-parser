@@ -25,7 +25,7 @@ By default, the script reads CSV files from `.\input-today` and writes results t
 - Date-like columns are scanned and formatted as Excel dates using `mm/dd/yyyy`; date-time columns keep time using `mm/dd/yyyy hh:mm`.
 - The iPhone generator preserves the column model for both `ALL ORDER` and `ALL ORDER IPHONE`, including dynamic headers such as `TARGET ...` and `Phase ...`.
 - `generate_ide_tracking.py` adds a standalone IDE Daily Tracking flow with historical lookup, previous-workbook OTC/MRC mapping, normalized Excel dates, and PivotTable refresh.
-- `weekly/` generates the Weekly Master and Mobile workbooks through a two-stage Catalyst review flow, available at `/weekly`; W38 golden-file regression is included.
+- `weekly/` generates the Weekly Master plus selected Mobile/M2M workbooks and editable PPTs through one shared Catalyst review flow at `/weekly`.
 
 ## Run Locally
 

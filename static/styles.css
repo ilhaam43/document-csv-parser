@@ -262,6 +262,34 @@ code {
   min-width: 0;
 }
 
+.weekly-output-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  min-width: 0;
+  margin: 0 0 22px;
+  padding: 12px 0 0;
+  border: 0;
+}
+
+.weekly-output-options legend {
+  padding: 0;
+  font-weight: 700;
+}
+
+.weekly-output-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.weekly-output-options input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .weekly-download {
   margin-bottom: 16px;
 }
@@ -427,6 +455,7 @@ code {
 }
 
 input[type="date"],
+input[type="month"],
 input[type="number"] {
   width: 100%;
   min-height: 48px;

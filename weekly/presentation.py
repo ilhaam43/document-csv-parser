@@ -1,10 +1,9 @@
-"""Update the editable Mobile weekly PowerPoint from the refreshed pivot workbook."""
+"""Update editable weekly PowerPoints from refreshed service-specific pivot workbooks."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -26,6 +25,7 @@ DRAW_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PRES_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"c": CHART_NS, "a": DRAW_NS, "p": PRES_NS}
+OVERFLOW_NOTE_URI = "urn:secm:weekly:chart-overflow"
 MONTHS = {name: number for number, name in enumerate(
     ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1
 )}
@@ -43,14 +43,32 @@ EXPECTED_SERIES = {
 @dataclass(frozen=True)
 class ChartData:
     labels: tuple[str, ...]
-    first: tuple[int, ...]
-    second: tuple[int, ...]
+    first: tuple[int | float | None, ...]
+    second: tuple[int | float | None, ...]
+
+
+@dataclass(frozen=True)
+class ChartOverflow:
+    series: str
+    label: str
+    value: float
+    limit: float
+    bound: str
 
 
 def _rounded(value: object) -> int:
     if not isinstance(value, (float, int, Decimal)):
         raise ValueError(f"Pivot metric is not numeric: {value!r}")
     return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _metric_value(value: object) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (float, int, Decimal)):
+        raise ValueError(f"Pivot metric is not numeric: {value!r}")
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError(f"Pivot metric is not finite: {value!r}")
+    return int(number) if number == number.to_integral_value() else float(number)
 
 
 def _section(sheet, column: int, title: str) -> int:
@@ -119,8 +137,8 @@ def extract_mobile_charts(workbook: str | Path, report_date: date, report_week: 
 
         def weekly(rows_a, rows_b):
             return ChartData(labels,
-                             tuple(_rounded(rows_a[label][0]) for label in labels),
-                             tuple(_rounded(rows_b[label][0]) for label in labels))
+                             tuple(_metric_value(rows_a[label][0]) for label in labels),
+                             tuple(_metric_value(rows_b[label][0]) for label in labels))
 
         months = sorted((key, label) for label in qty_month
                         if (key := _month_key(label)) and key[0] == report_date.year
@@ -137,11 +155,11 @@ def extract_mobile_charts(workbook: str | Path, report_date: date, report_week: 
             3: weekly(qty_mobile, rev_mobile),
             4: weekly(fab_mobile, cash_mobile),
             5: ChartData(month_labels,
-                         tuple(_rounded(cash_month[label][0]) for _, label in months),
-                         tuple(_rounded(cash_month[label][1]) for _, label in months)),
+                         tuple(_metric_value(cash_month[label][0]) for _, label in months),
+                         tuple(_metric_value(cash_month[label][1]) for _, label in months)),
             6: ChartData(month_labels,
-                         tuple(_rounded(qty_month[label][0]) for _, label in months),
-                         tuple(_rounded(rev_month[label][0]) for _, label in months)),
+                         tuple(_metric_value(qty_month[label][0]) for _, label in months),
+                         tuple(_metric_value(rev_month[label][0]) for _, label in months)),
         }
         averages = {
             "bulk_fab": _rounded(fab_bulk_total[0]),
@@ -164,60 +182,139 @@ def _bytes(root) -> bytes:
     return etree.tostring(root, encoding="UTF-8", xml_declaration=True, standalone=True)
 
 
-def _replace_cache(cache, values: tuple[str, ...] | tuple[int, ...]) -> None:
+def _replace_cache(cache, values: tuple[str, ...] | tuple[int | float | None, ...], *, format_code: str = "#,##0") -> None:
     point_count = cache.find(f"{{{CHART_NS}}}ptCount")
     if point_count is None:
         raise ValueError("PowerPoint chart cache has no point count.")
+    if cache.tag == f"{{{CHART_NS}}}numCache":
+        number_format = cache.find(f"{{{CHART_NS}}}formatCode")
+        if number_format is None:
+            number_format = etree.Element(f"{{{CHART_NS}}}formatCode")
+            cache.insert(0, number_format)
+        number_format.text = format_code
     point_count.set("val", str(len(values)))
     for point in cache.findall(f"{{{CHART_NS}}}pt"):
         cache.remove(point)
     for index, value in enumerate(values):
+        if value is None:
+            continue
         point = etree.SubElement(cache, f"{{{CHART_NS}}}pt", idx=str(index))
         etree.SubElement(point, f"{{{CHART_NS}}}v").text = str(value)
 
 
-def _refresh_fixed_axis_limits(root) -> None:
-    changed = False
+def _chart_axis_overflows(root) -> list[ChartOverflow]:
+    outliers: list[ChartOverflow] = []
     for axis in root.xpath("//c:valAx", namespaces=NS):
         axis_id = axis.find("c:axId", namespaces=NS)
         scaling = axis.find("c:scaling", namespaces=NS)
         if axis_id is None or scaling is None:
             continue
-        points = []
         for chart in root.xpath("//c:plotArea/*[c:ser]", namespaces=NS):
             if axis_id.get("val") not in chart.xpath("./c:axId/@val", namespaces=NS):
                 continue
-            points.extend(float(value) for value in chart.xpath("./c:ser/c:val//c:pt/c:v/text()", namespaces=NS))
-        if not points:
-            continue
-        for bound, outside in (("min", min(points)), ("max", max(points))):
-            limit = scaling.find(f"c:{bound}", namespaces=NS)
-            if limit is not None and (
-                outside < float(limit.get("val")) if bound == "min"
-                else outside > float(limit.get("val"))
-            ):
-                unit = 10 ** math.floor(math.log10(abs(outside))) if outside else 1
-                padded = outside + max(1, abs(outside) * 0.25) * (1 if bound == "max" else -1)
-                rounded = math.ceil(padded / unit) if bound == "max" else math.floor(padded / unit)
-                limit.set("val", str(rounded * unit))
-                changed = True
-    if changed:
-        # Keep below-point labels separate from the category labels near zero.
-        for axis in root.xpath("//c:catAx", namespaces=NS):
-            offset = axis.find("c:lblOffset", namespaces=NS)
-            if offset is not None:
-                offset.set("val", str(max(450, int(offset.get("val")))))
+            for series in chart.findall("c:ser", namespaces=NS):
+                name = "".join(series.xpath("./c:tx//c:v/text()", namespaces=NS)).strip()
+                labels = {point.get("idx"): point.findtext("c:v", namespaces=NS)
+                          for point in series.xpath("./c:cat//c:pt", namespaces=NS)}
+                for point in series.xpath("./c:val//c:pt", namespaces=NS):
+                    value = float(point.findtext("c:v", namespaces=NS))
+                    for bound in ("min", "max"):
+                        limit = scaling.find(f"c:{bound}", namespaces=NS)
+                        if limit is None:
+                            continue
+                        threshold = float(limit.get("val"))
+                        outside = value < threshold if bound == "min" else value > threshold
+                        if outside:
+                            outliers.append(ChartOverflow(
+                                name, labels.get(point.get("idx")) or f"Point {int(point.get('idx')) + 1}",
+                                value, threshold, bound,
+                            ))
+    return outliers
 
 
-def _update_chart_xml(data: bytes, values: ChartData, first_column: int, chart_number: int) -> bytes:
+def _set_chart_overflow_note(root, outliers: list[ChartOverflow], *, weekly: bool) -> None:
+    chart = root.find("c:chart", namespaces=NS)
+    if chart is None:
+        return
+    title = chart.find("c:title", namespaces=NS)
+    if title is not None and title.xpath(
+        "./c:extLst/c:ext[@uri=$uri]", uri=OVERFLOW_NOTE_URI, namespaces=NS
+    ):
+        chart.remove(title)
+        title = None
+        auto = chart.find("c:autoTitleDeleted", namespaces=NS)
+        if auto is not None:
+            auto.set("val", "1")
+    if not outliers:
+        return
+    if title is not None:
+        raise ValueError("Weekly chart has an existing title; cannot place the off-scale note safely.")
+
+    def number(value: float) -> str:
+        return f"{value:,.0f}" if value.is_integer() else f"{value:,g}"
+
+    ranked = sorted(outliers, key=lambda item: abs(item.value - item.limit) / max(abs(item.limit), 1), reverse=True)
+    if weekly:
+        point = ranked[0]
+        name = re.sub(r"^LEADTIME\s+", "", point.series, flags=re.IGNORECASE)
+        name = re.sub(r"\s*\((?:BRA|SAD)\)", "", name, flags=re.IGNORECASE).strip()
+        operator = "<" if point.bound == "min" else ">"
+        detail = f"{number(point.value)} ({operator}{number(point.limit)}, off-scale)"
+        if len(ranked) > 1:
+            detail = f"{number(point.value)} {operator}{number(point.limit)}; +{len(ranked) - 1} off-scale"
+        text = f"{name} {point.label}\n{detail}"
+    else:
+        items = [f"{point.label} {point.series} = {number(point.value)} "
+                 f"({'<' if point.bound == 'min' else '>'}{number(point.limit)})" for point in ranked[:2]]
+        text = "Off-scale: " + "; ".join(items)
+        if len(ranked) > 2:
+            remaining = len(ranked) - 2
+            text += f"; +{remaining} {'point' if remaining == 1 else 'points'}"
+
+    # An overlay title discloses clipped values without rescaling or replacing data.
+    title = etree.Element(f"{{{CHART_NS}}}title")
+    rich = etree.SubElement(etree.SubElement(title, f"{{{CHART_NS}}}tx"), f"{{{DRAW_NS}}}rich")
+    etree.SubElement(rich, f"{{{DRAW_NS}}}bodyPr", wrap="square", lIns="0", rIns="0", tIns="0", bIns="0")
+    etree.SubElement(rich, f"{{{DRAW_NS}}}lstStyle")
+    for line in text.split("\n"):
+        paragraph = etree.SubElement(rich, f"{{{DRAW_NS}}}p")
+        etree.SubElement(paragraph, f"{{{DRAW_NS}}}pPr", algn="l")
+        run = etree.SubElement(paragraph, f"{{{DRAW_NS}}}r")
+        properties = etree.SubElement(run, f"{{{DRAW_NS}}}rPr", lang="en-US", sz="800", b="1")
+        etree.SubElement(etree.SubElement(properties, f"{{{DRAW_NS}}}solidFill"),
+                         f"{{{DRAW_NS}}}srgbClr", val="333333")
+        etree.SubElement(run, f"{{{DRAW_NS}}}t").text = line
+    layout = etree.SubElement(etree.SubElement(title, f"{{{CHART_NS}}}layout"), f"{{{CHART_NS}}}manualLayout")
+    for name in ("xMode", "yMode", "wMode", "hMode"):
+        etree.SubElement(layout, f"{{{CHART_NS}}}{name}", val="edge" if name in {"xMode", "yMode"} else "factor")
+    coordinates = (0.68, 0.22, 0.31, 0.14) if weekly else (0.02, 0.90, 0.95, 0.09)
+    for name, value in zip(("x", "y", "w", "h"), coordinates):
+        etree.SubElement(layout, f"{{{CHART_NS}}}{name}", val=str(value))
+    etree.SubElement(title, f"{{{CHART_NS}}}overlay", val="1")
+    extension = etree.SubElement(etree.SubElement(title, f"{{{CHART_NS}}}extLst"),
+                                 f"{{{CHART_NS}}}ext", uri=OVERFLOW_NOTE_URI)
+    etree.SubElement(extension, f"{{{OVERFLOW_NOTE_URI}}}note")
+    chart.insert(0, title)
+    auto = chart.find("c:autoTitleDeleted", namespaces=NS)
+    if auto is None:
+        auto = etree.Element(f"{{{CHART_NS}}}autoTitleDeleted")
+        chart.insert(1, auto)
+    auto.set("val", "0")
+
+
+def _update_chart_xml(data: bytes, values: ChartData, first_column: int, chart_number: int,
+                      *, expected_series: tuple[str, ...] | None = None,
+                      weekly: bool | None = None, number_formats: tuple[str, ...] | None = None,
+                      label_position: str | None = None) -> bytes:
     root = _xml(data)
     series = root.xpath("//c:ser", namespaces=NS)
-    if len(series) != 2:
-        raise ValueError("Weekly PPT template chart must have exactly two series.")
+    expected = expected_series or EXPECTED_SERIES[chart_number]
+    if len(series) != len(expected):
+        raise ValueError(f"Weekly PPT template chart must have exactly {len(expected)} series.")
     titles = [" ".join("".join(node.xpath("./c:tx//c:v/text()", namespaces=NS)).upper().split())
               for node in series]
-    if any(expected not in title for expected, title in zip(EXPECTED_SERIES[chart_number], titles)):
-        raise ValueError(f"Weekly PPT chart {chart_number} series do not match the Mobile template.")
+    if any(name not in title for name, title in zip(expected, titles)):
+        raise ValueError(f"Weekly PPT chart {chart_number} series do not match the selected template.")
     last_column = first_column + len(values.labels) - 1
     start = get_column_letter(first_column)
     end = get_column_letter(last_column)
@@ -234,8 +331,11 @@ def _update_chart_xml(data: bytes, values: ChartData, first_column: int, chart_n
             if formula is None or cache is None:
                 raise ValueError("Weekly PPT template chart cache is missing.")
             formula.text = f"Sheet1!${start}${row}:${end}${row}"
-            _replace_cache(cache, points)
-    _refresh_fixed_axis_limits(root)
+            _replace_cache(cache, points, format_code=number_formats[index] if number_formats else "#,##0")
+    if label_position is not None:
+        for position in root.xpath("//c:dLbls/c:dLblPos | //c:dLbl/c:dLblPos", namespaces=NS):
+            position.set("val", label_position)
+    _set_chart_overflow_note(root, _chart_axis_overflows(root), weekly=chart_number <= 4 if weekly is None else weekly)
     return _bytes(root)
 
 
@@ -252,7 +352,8 @@ def _apply_presentation_review(
     return ChartData(data.labels, tuple(values[0]), tuple(values[1]))
 
 
-def _update_embedded(data: bytes, values: ChartData, *, weekly: bool, report_week: int) -> tuple[bytes, int]:
+def _update_embedded(data: bytes, values: ChartData, *, weekly: bool, report_week: int,
+                     number_formats: tuple[str, ...] | None = None) -> tuple[bytes, int]:
     workbook = load_workbook(BytesIO(data))
     try:
         sheet = workbook.active
@@ -288,7 +389,9 @@ def _update_embedded(data: bytes, values: ChartData, *, weekly: bool, report_wee
             column = first + offset
             sheet.cell(1, column).value = label
             sheet.cell(2, column).value = values.first[offset]
-            sheet.cell(3, column).value = values.second[offset]
+            sheet.cell(3, column).value = values.second[offset] if values.second else None
+            sheet.cell(2, column).number_format = number_formats[0] if number_formats else "#,##0"
+            sheet.cell(3, column).number_format = number_formats[1] if number_formats and len(number_formats) > 1 else "#,##0"
         output = BytesIO()
         workbook.save(output)
         return output.getvalue(), first
@@ -313,17 +416,17 @@ def _set_shape_text(root, shape_id: str, value: str, expected: str) -> None:
         run.text = ""
 
 
-def _set_annotation(root, shape_id: str, values: tuple[int, int]) -> None:
+def _set_annotation(root, shape_id: str, values: tuple[int | None, ...]) -> None:
     runs = _shape(root, shape_id).xpath(".//a:t", namespaces=NS)
-    candidates = [run for run in runs if re.search(r"(?::\s*|^\s*)\d+\s*$", run.text or "")]
-    if len(candidates) != 2:
+    candidates = [run for run in runs if re.search(r"(?::\s*|^\s*)(?:\d+|N/A)\s*$", run.text or "")]
+    if len(candidates) != len(values):
         raise ValueError(f"Weekly PPT template annotation {shape_id} has unexpected layout.")
     for run, number in zip(candidates, values):
-        run.text = re.sub(r"\d+(\s*)$", lambda match: f"{number}{match.group(1)}", run.text)
+        run.text = re.sub(r"(?:\d+|N/A)(\s*)$", lambda match: f"{number if number is not None else 'N/A'}{match.group(1)}", run.text)
 
 
 def _update_slide(data: bytes, slide_number: int, report_date: date, report_week: int,
-                  averages: dict[str, int]) -> bytes:
+                  averages: dict[str, int | None], *, report_type: str = "mobile") -> bytes:
     root = _xml(data)
     if slide_number == 1:
         _set_shape_text(root, "8", str(report_date.year), "20")
@@ -343,10 +446,14 @@ def _update_slide(data: bytes, slide_number: int, report_date: date, report_week
         _set_shape_text(root, "27" if slide_number == 2 else "17",
                         f"Weekly Report Group Customer Operations W{report_week}", "Weekly Report Group Customer")
         if slide_number == 2:
-            _set_annotation(root, "45", (averages["bulk_fab"], averages["bulk_cash"]))
-            _set_annotation(root, "47", (averages["mobile_fab"], averages["mobile_cash"]))
+            if report_type == "m2m":
+                _set_annotation(root, "46", (averages["m2m_fab"], averages["m2m_cash"]))
+            else:
+                _set_annotation(root, "45", (averages["bulk_fab"], averages["bulk_cash"]))
+                _set_annotation(root, "47", (averages["mobile_fab"], averages["mobile_cash"]))
         elif slide_number == 3:
-            _set_annotation(root, "15", (averages["monthly_bulk_cash"], averages["monthly_mobile_cash"]))
+            _set_annotation(root, "15", (averages["monthly_m2m_cash"],) if report_type == "m2m"
+                            else (averages["monthly_bulk_cash"], averages["monthly_mobile_cash"]))
     return _bytes(root)
 
 
@@ -360,7 +467,7 @@ def _embedded_path(archive: ZipFile, chart_number: int) -> str:
     return "ppt/" + targets[0][3:]
 
 
-def _validate_chart_placement(archive: ZipFile) -> None:
+def _validate_chart_placement(archive: ZipFile, *, report_type: str = "mobile") -> None:
     placements: dict[int, tuple[int, int, int]] = {}
     relation_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
     for slide_number in (2, 3):
@@ -378,6 +485,13 @@ def _validate_chart_placement(archive: ZipFile) -> None:
             if match is None or offset is None:
                 raise ValueError("Weekly PPT chart placement is invalid.")
             placements[int(match.group(1))] = (slide_number, int(offset.get("x")), int(offset.get("y")))
+    if report_type == "m2m":
+        if set(placements) != set(range(1, 5)) or not (
+            placements[1][0] == placements[2][0] == 2 and placements[2][2] < placements[1][2]
+            and placements[3][0] == placements[4][0] == 3 and placements[4][2] < placements[3][2]
+        ):
+            raise ValueError("Weekly PPT chart positions do not match the M2M template.")
+        return
     if set(placements) != set(range(1, 7)) or not (
         placements[2][0] == placements[3][0] == placements[1][0] == placements[4][0] == 2
         and placements[2][1] < placements[3][1]
@@ -393,13 +507,22 @@ def _validate_chart_placement(archive: ZipFile) -> None:
 def write_weekly_presentation(*, mobile_workbook: str | Path, template_pptx: str | Path,
                               output_pptx: str | Path, report_date: date, report_week: int,
                               report_month: date | None = None,
-                              presentation_review: str | Path | None = None) -> Path:
-    """Make a new PPTX, preserving the W37 deck's layout and non-chart content."""
+                              presentation_review: str | Path | None = None,
+                              report_type: str = "mobile") -> Path:
+    """Make a new PPTX, preserving the supplied deck's layout and non-chart content."""
     source_path = Path(template_pptx)
     destination = Path(output_pptx)
     if source_path.resolve() == destination.resolve():
         raise ValueError("Output PPTX must not overwrite the template.")
-    charts, averages = extract_mobile_charts(mobile_workbook, report_month or report_date, report_week)
+    if report_type not in {"mobile", "m2m"}:
+        raise ValueError("Presentation report_type must be mobile or m2m.")
+    chart_series = EXPECTED_SERIES
+    number_formats = {}
+    if report_type == "m2m":
+        from .m2m_presentation import extract_m2m_charts, EXPECTED_SERIES as chart_series, NUMBER_FORMATS as number_formats
+        charts, averages = extract_m2m_charts(mobile_workbook, report_month or report_date, report_week)
+    else:
+        charts, averages = extract_mobile_charts(mobile_workbook, report_month or report_date, report_week)
     review_values = load_presentation_review(presentation_review)
     replacements: dict[str, bytes] = {}
     with ZipFile(source_path) as source:
@@ -409,23 +532,27 @@ def write_weekly_presentation(*, mobile_workbook: str | Path, template_pptx: str
                              if re.fullmatch(r"ppt/slides/slide\d+\.xml", name))
         chart_parts = sorted(name for name in source.namelist()
                              if re.fullmatch(r"ppt/charts/chart\d+\.xml", name))
-        if len(slide_parts) != 4 or len(chart_parts) != 6:
-            raise ValueError("Weekly Mobile PPT template must have four slides and six editable charts.")
-        _validate_chart_placement(source)
+        if len(slide_parts) != 4 or len(chart_parts) != len(chart_series):
+            raise ValueError(f"Weekly {report_type} PPT template must have four slides and {len(chart_series)} editable charts.")
+        _validate_chart_placement(source, report_type=report_type)
         for number, data in charts.items():
             chart_part = f"ppt/charts/chart{number}.xml"
             chart_xml = source.read(chart_part)
             data = _apply_presentation_review(number, data, review_values)
             embedded = _embedded_path(source, number)
             edited_workbook, first_column = _update_embedded(
-                source.read(embedded), data, weekly=number <= 4, report_week=report_week
+                source.read(embedded), data, weekly=number <= (2 if report_type == "m2m" else 4),
+                report_week=report_week, number_formats=number_formats.get(number),
             )
             replacements[embedded] = edited_workbook
-            replacements[chart_part] = _update_chart_xml(chart_xml, data, first_column, number)
+            replacements[chart_part] = _update_chart_xml(chart_xml, data, first_column, number,
+                expected_series=chart_series[number], weekly=number <= (2 if report_type == "m2m" else 4),
+                number_formats=number_formats.get(number),
+                label_position="t" if report_type == "m2m" and number == 3 else None)
         for slide_number in range(1, 5):
             path = f"ppt/slides/slide{slide_number}.xml"
             replacements[path] = _update_slide(source.read(path), slide_number, report_date,
-                                               report_week, averages)
+                                               report_week, averages, report_type=report_type)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(".pptx.tmp")
         try:

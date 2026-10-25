@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import itertools
 import json
 import logging
@@ -21,6 +22,7 @@ from .dates import parse_report_month
 from .finalize import finalize_weekly_data
 from .prepare import prepare_weekly_inputs
 from .presentation import write_weekly_presentation
+from .m2m_presentation import write_m2m_presentation
 from .rules import normalize_order_status
 from .workbook import write_weekly_workbook
 
@@ -72,6 +74,63 @@ def _update_state(job_id: str, **updates: object) -> dict:
         state.update(updates, updated_at=time.time())
         _write_state(job_id, state)
         return state
+
+
+def _report_filenames(state: dict) -> tuple[str, str, str]:
+    week = int(state["report_week"])
+    year = parse_report_month(state.get("report_month", state["report_date"][:7])).year
+    return (
+        f"Master Raw Mobile Service - W{week} {year} old format.xlsx",
+        f"Master Raw Mobile Service - W{week} {year}.xlsx",
+        f"Mobile Services W{week} - {year} (Weekly).pptx",
+    )
+
+
+def _output_services(state: dict) -> tuple[str, ...]:
+    return {"mobile": ("mobile",), "m2m": ("m2m",), "both": ("mobile", "m2m")}[state.get("output_services", "mobile")]
+
+
+def _m2m_filenames(state: dict) -> tuple[str, str]:
+    week = int(state["report_week"])
+    year = parse_report_month(state.get("report_month", state["report_date"][:7])).year
+    return f"Master Raw M2M Service - W{week}.xlsx", f"M2M Services W{week}- {year} (Weekly).pptx"
+
+
+def _allowed_report_files(state: dict) -> list[str]:
+    master, mobile, ppt = _report_filenames(state)
+    return [master] + ([mobile, ppt] if "mobile" in _output_services(state) else []) + (
+        list(_m2m_filenames(state)) if "m2m" in _output_services(state) else [])
+
+
+def _file_digest(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _generation_signature(job_dir: Path, state: dict, reviews: tuple[str | None, ...]) -> str:
+    files = ["bq.csv", "previous-master.xlsx", "holidays.xlsx", *filter(None, reviews)]
+    for service in _output_services(state):
+        files.extend([f"previous-{service}.xlsx", f"previous-{service}.pptx"])
+    payload = {name: _file_digest(job_dir / "input" / name) for name in sorted(set(files))}
+    # A code update invalidates saved artifacts even when uploads are unchanged.
+    payload["engine"] = {p.name: _file_digest(p) for p in Path(__file__).parent.glob("*.py")}
+    payload["period"] = [state["report_date"], state.get("report_month"), state["report_week"], _output_services(state)]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _write_report_archive(job_dir: Path, files: list[str]) -> Path:
+    path = job_dir / "weekly-mobile-output.zip"
+    temporary = path.with_suffix(".zip.tmp")
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name in files:
+                archive.write(job_dir / "output" / name, arcname=name)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 
 async def _save_upload(upload: UploadFile, path: Path) -> None:
@@ -242,7 +301,11 @@ def _run_finalize(
     report_week = int(state["report_week"])
     output_dir = job_dir / "output"
     try:
-        _update_state(job_id, status="finalizing", stage="Finalizing Master and Mobile data")
+        signature = _generation_signature(job_dir, state, (review_filename, decisions_filename,
+            slide_filename, pivot_filename, presentation_filename, source_filename))
+        completed = dict(state.get("completed_artifacts", {})) if state.get("generation_signature") == signature else {}
+        _update_state(job_id, status="finalizing", stage="Finalizing weekly Master data",
+                      generation_signature=signature, completed_artifacts=completed)
         audit = finalize_weekly_data(
             bq_csv=job_dir / "input" / "bq.csv",
             previous_master=job_dir / "input" / "previous-master.xlsx",
@@ -257,10 +320,19 @@ def _run_finalize(
         if audit["invalid_master_services"] or audit["issue_counts"].get("conflicting_catalyst_status"):
             raise RuntimeError("Final data has invalid services or conflicting Catalyst statuses; review exceptions.csv.")
 
-        master_name = f"Master Raw Mobile Service - W{report_week} {report_month.year} old format.xlsx"
-        mobile_name = f"Master Raw Mobile Service - W{report_week} {report_month.year}.xlsx"
-        _update_state(job_id, status="generating", stage="Generating Master workbook")
-        write_weekly_workbook(
+        def artifact(name: str, stage: str, writer, **kwargs):
+            _update_state(job_id, status="generating", stage=stage)
+            path = output_dir / name
+            if not completed.get(name) or completed[name] != _file_digest(path):
+                writer(**kwargs)
+                digest = _file_digest(path)
+                if digest is None:
+                    raise RuntimeError(f"Report writer did not produce {name}.")
+                completed[name] = digest
+                _update_state(job_id, completed_artifacts=completed)
+
+        master_name, mobile_name, ppt_name = _report_filenames(state)
+        artifact(master_name, "Generating Master workbook", write_weekly_workbook,
             data_csv=output_dir / "master-final-data.csv",
             template_workbook=job_dir / "input" / "previous-master.xlsx",
             output_workbook=output_dir / master_name,
@@ -269,78 +341,63 @@ def _run_finalize(
             slide_review=(job_dir / "input" / slide_filename) if slide_filename else None,
             pivot_review=(job_dir / "input" / pivot_filename) if pivot_filename else None,
         )
-        _update_state(job_id, stage="Generating Mobile workbook")
-        write_weekly_workbook(
-            data_csv=output_dir / "mobile-data.csv",
-            template_workbook=job_dir / "input" / "previous-mobile.xlsx",
-            output_workbook=output_dir / mobile_name,
-            mobile=True,
-            report_week=report_week,
-            report_date=report_month,
-            slide_review=(job_dir / "input" / slide_filename) if slide_filename else None,
-            pivot_review=(job_dir / "input" / pivot_filename) if pivot_filename else None,
-        )
-        ppt_name = f"Mobile Services W{report_week} - {report_month.year} (Weekly).pptx"
-        ppt_template = job_dir / "input" / "previous-mobile.pptx"
-        if ppt_template.is_file():
-            _update_state(job_id, stage="Generating Mobile presentation")
-            write_weekly_presentation(
-                mobile_workbook=output_dir / mobile_name,
-                template_pptx=ppt_template,
-                output_pptx=output_dir / ppt_name,
-                report_date=report_date,
-                report_month=report_month,
+        files = [master_name]
+        if "mobile" in _output_services(state):
+            artifact(mobile_name, "Generating Mobile workbook", write_weekly_workbook,
+                data_csv=output_dir / "mobile-data.csv",
+                template_workbook=job_dir / "input" / "previous-mobile.xlsx",
+                output_workbook=output_dir / mobile_name,
+                mobile=True,
                 report_week=report_week,
-                presentation_review=(job_dir / "input" / presentation_filename)
-                if presentation_filename else None,
+                report_date=report_month,
+                slide_review=(job_dir / "input" / slide_filename) if slide_filename else None,
+                pivot_review=(job_dir / "input" / pivot_filename) if pivot_filename else None,
             )
-        archive_path = job_dir / "weekly-mobile-output.zip"
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            files = [master_name, mobile_name, "audit.json", "exceptions.csv", "review-decisions.csv", "bq-source-decisions.csv"]
+            files.append(mobile_name)
+            ppt_template = job_dir / "input" / "previous-mobile.pptx"
             if ppt_template.is_file():
-                files.append(ppt_name)
-            for name in files:
-                archive.write(output_dir / name, arcname=name)
-            if slide_filename:
-                archive.write(job_dir / "input" / slide_filename, arcname="slide-review.csv")
-            if pivot_filename:
-                archive.write(job_dir / "input" / pivot_filename, arcname="pivot-review.csv")
-            if decisions_filename:
-                archive.write(job_dir / "input" / decisions_filename, arcname="approved-corrections.csv")
-            if presentation_filename:
-                archive.write(
-                    job_dir / "input" / presentation_filename,
-                    arcname="presentation-review.csv",
+                artifact(ppt_name, "Generating Mobile presentation", write_weekly_presentation,
+                    mobile_workbook=output_dir / mobile_name,
+                    template_pptx=ppt_template,
+                    output_pptx=output_dir / ppt_name,
+                    report_date=report_date,
+                    report_month=report_month,
+                    report_week=report_week,
+                    presentation_review=(job_dir / "input" / presentation_filename)
+                    if presentation_filename else None,
                 )
-            if source_filename:
-                archive.write(job_dir / "input" / source_filename, arcname="source-review.csv")
+                files.append(ppt_name)
+        if "m2m" in _output_services(state):
+            m2m_name, m2m_ppt = _m2m_filenames(state)
+            artifact(m2m_name, "Generating M2M workbook", write_weekly_workbook,
+                data_csv=output_dir / "m2m-data.csv", template_workbook=job_dir / "input" / "previous-m2m.xlsx",
+                output_workbook=output_dir / m2m_name, report_type="m2m", report_week=report_week,
+                report_date=report_month)
+            files.append(m2m_name)
+            if (job_dir / "input" / "previous-m2m.pptx").is_file():
+                artifact(m2m_ppt, "Generating M2M presentation", write_m2m_presentation,
+                    m2m_workbook=output_dir / m2m_name, template_pptx=job_dir / "input" / "previous-m2m.pptx",
+                    output_pptx=output_dir / m2m_ppt, report_date=report_date, report_month=report_month,
+                    report_week=report_week)
+                files.append(m2m_ppt)
+        _write_report_archive(job_dir, files)
         warnings = ["Verify SLIDE GH MEETING totals against the approved source before distribution."]
         pending = audit.get("pending_catalyst_rows", 0)
         if pending:
             warnings.insert(0, f"{pending} Catalyst statuses remain unresolved; verify before distribution.")
-        source_auto = audit.get("source_auto_order_rows", 0)
-        if source_auto:
-            warnings.append(
-                f"{source_auto} closed BQ orders retained their own status "
-                "(see bq-source-decisions.csv)."
-            )
         issue_count = sum(audit.get("issue_counts", {}).values())
         if issue_count:
-            warnings.append(f"{issue_count} data exceptions remain; inspect exceptions.csv before distribution.")
+            warnings.append(
+                f"{issue_count} data exceptions remain; use Download Exceptions CSV "
+                "for details before distribution."
+            )
         _update_state(
             job_id,
             status="succeeded",
             stage="Complete",
             final_audit=audit,
             warnings=warnings,
-            output_files=[
-                *files,
-                *(["slide-review.csv"] if slide_filename else []),
-                *(["pivot-review.csv"] if pivot_filename else []),
-                *(["approved-corrections.csv"] if decisions_filename else []),
-                *(["presentation-review.csv"] if presentation_filename else []),
-                *(["source-review.csv"] if source_filename else []),
-            ],
+            output_files=files,
         )
     except Exception as exc:
         logger.exception("Weekly finalization failed for %s", job_id)
@@ -351,19 +408,34 @@ def _run_finalize(
 async def start_weekly_job(
     bq_csv: UploadFile = File(...),
     previous_master: UploadFile = File(...),
-    previous_mobile: UploadFile = File(...),
+    previous_mobile: UploadFile | None = File(default=None),
     previous_ppt: UploadFile | None = File(default=None),
+    previous_m2m: UploadFile | None = File(default=None),
+    previous_m2m_ppt: UploadFile | None = File(default=None),
     holiday_workbook: UploadFile = File(...),
     report_date: str = Form(...),
     report_week: int = Form(...),
     report_month: str | None = Form(default=None),
     job_id: str | None = Form(default=None),
+    output_services: str = Form(default="mobile"),
 ) -> dict:
     _require_extension(bq_csv, "bq_csv", {".csv"})
     _require_extension(previous_master, "previous_master", {".xlsx"})
-    _require_extension(previous_mobile, "previous_mobile", {".xlsx"})
+    if output_services not in {"mobile", "m2m", "both"}:
+        raise HTTPException(status_code=400, detail="output_services must be mobile, m2m, or both.")
+    selected = _output_services({"output_services": output_services})
+    if "mobile" in selected and previous_mobile is None:
+        raise HTTPException(status_code=400, detail="Previous Mobile workbook is required for Mobile output.")
+    if "m2m" in selected and previous_m2m is None:
+        raise HTTPException(status_code=400, detail="Previous M2M workbook is required for M2M output.")
+    if previous_mobile is not None:
+        _require_extension(previous_mobile, "previous_mobile", {".xlsx"})
     if previous_ppt is not None:
         _require_extension(previous_ppt, "previous_ppt", {".pptx"})
+    if previous_m2m is not None:
+        _require_extension(previous_m2m, "previous_m2m", {".xlsx"})
+    if previous_m2m_ppt is not None:
+        _require_extension(previous_m2m_ppt, "previous_m2m_ppt", {".pptx"})
     _require_extension(holiday_workbook, "holiday_workbook", {".xlsx"})
     try:
         parsed_report_date = date.fromisoformat(report_date)
@@ -390,6 +462,7 @@ async def start_weekly_job(
             "report_date": report_date,
             "report_month": parsed_report_month.strftime("%Y-%m"),
             "report_week": report_week,
+            "output_services": output_services,
             "status": "uploading",
             "stage": "Uploading files",
             "created_at": time.time(),
@@ -399,12 +472,17 @@ async def start_weekly_job(
         for upload, name in (
             (bq_csv, "bq.csv"),
             (previous_master, "previous-master.xlsx"),
-            (previous_mobile, "previous-mobile.xlsx"),
             (holiday_workbook, "holidays.xlsx"),
         ):
             await _save_upload(upload, job_dir / "input" / name)
-        if previous_ppt is not None:
+        if previous_mobile is not None and "mobile" in selected:
+            await _save_upload(previous_mobile, job_dir / "input" / "previous-mobile.xlsx")
+        if previous_ppt is not None and "mobile" in selected:
             await _save_upload(previous_ppt, job_dir / "input" / "previous-mobile.pptx")
+        if previous_m2m is not None and "m2m" in selected:
+            await _save_upload(previous_m2m, job_dir / "input" / "previous-m2m.xlsx")
+        if previous_m2m_ppt is not None and "m2m" in selected:
+            await _save_upload(previous_m2m_ppt, job_dir / "input" / "previous-m2m.pptx")
     except Exception as exc:
         _update_state(normalized_id, status="failed", stage="Upload failed", error=str(exc))
         raise
@@ -433,6 +511,9 @@ def weekly_job_status(job_id: str) -> dict:
     if (_job_dir(job_id) / "output" / "exceptions.csv").is_file():
         response["final_exceptions_url"] = f"/api/weekly/jobs/{job_id}/exceptions/final"
     if state["status"] == "succeeded":
+        response["output_files"] = [
+            name for name in _allowed_report_files(state) if name in state.get("output_files", [])
+        ]
         response["download_url"] = f"/api/weekly/jobs/{job_id}/download"
     return response
 
@@ -609,4 +690,14 @@ def download_weekly_output(job_id: str) -> FileResponse:
     path = _job_dir(job_id) / "weekly-mobile-output.zip"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Weekly output is missing.")
+    files = [name for name in _allowed_report_files(state)
+             if name.endswith(".xlsx") or name in state.get("output_files", [])]
+    # Older completed jobs also expose only reports, without rerunning generation.
+    with STATE_LOCK:
+        with zipfile.ZipFile(path) as archive:
+            current_files = archive.namelist()
+        if sorted(current_files) != sorted(files):
+            if any(not (_job_dir(job_id) / "output" / name).is_file() for name in files):
+                raise HTTPException(status_code=404, detail="Weekly report files are missing.")
+            _write_report_archive(_job_dir(job_id), files)
     return FileResponse(path, media_type="application/zip", filename=path.name)

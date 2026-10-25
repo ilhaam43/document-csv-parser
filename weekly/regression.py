@@ -1,4 +1,4 @@
-"""Read-only W38 regression audit for the weekly rule engine."""
+"""Audit any weekly sample using the production finalizer, without parity exemptions."""
 
 from __future__ import annotations
 
@@ -8,122 +8,102 @@ from collections import Counter, defaultdict, deque
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from .constants import MASTER_COLUMNS, MOBILE_SERVICE_GROUPS
-from .dates import parse_datetime
-from .io import iter_master_rows, load_holidays
+from .dates import parse_datetime, parse_report_month
+from .finalize import finalize_weekly_data
+from .io import iter_master_csv, iter_master_rows, load_holidays
 from .models import WeeklyAudit
-from .refresh import ExistingSourceIndex, refresh_existing_record
-from .review import load_review_decisions
-from .rules import (
-    build_master_record,
-    clean_text,
-    normalize_identifier,
-    normalize_service_group,
-)
-from .selection import iter_bq_rows, select_new_source_rows
+from .rules import inclusive_networkdays, normalize_identifier, normalize_service_group, to_decimal
 
 
 def _identity(row: dict[str, Any]) -> tuple[str, str, str]:
-    fab_upload = parse_datetime(row.get("fab_upload") or row.get("FAB_Upload"))
-    fab_key = fab_upload.isoformat(timespec="minutes") if fab_upload else ""
+    fab = parse_datetime(row.get("fab_upload"))
     return (
         normalize_identifier(row.get("quote_num")),
-        normalize_identifier(row.get("order number", row.get("order_number"))),
-        fab_key,
+        normalize_identifier(row.get("order number")),
+        fab.isoformat(timespec="minutes") if fab else "",
     )
 
 
 def _normalized_value(field: str, value: Any) -> Any:
     if isinstance(value, datetime):
-        if field == "fab_upload":
-            return value.replace(second=0, microsecond=0)
-        return value.date()
-    if isinstance(value, Decimal):
-        return value.quantize(Decimal("0.000001"))
-    if isinstance(value, float):
-        return Decimal(str(value)).quantize(Decimal("0.000001"))
-    if field in {
-        "quote_num",
-        "order number",
-        "ca_name",
-        "SALES NAME",
-    }:
-        return clean_text(value)
+        return value.replace(second=0, microsecond=0) if field == "fab_upload" else value.date()
+    if isinstance(value, (float, Decimal)):
+        return Decimal(str(value))
     return value
 
 
-def _field_mismatches(
+def _values_equal(field: str, actual: Any, expected: Any) -> bool:
+    actual = _normalized_value(field, actual)
+    expected = _normalized_value(field, expected)
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(actual, (int, Decimal)) and isinstance(expected, (int, Decimal)):
+        return abs(Decimal(actual) - Decimal(expected)) <= Decimal("0.00000001")
+    return actual == expected
+
+
+def compare_master_records(
     generated_rows: list[dict[str, Any]],
     expected_rows: list[dict[str, Any]],
-) -> dict[str, int]:
-    expected_by_identity: dict[tuple[str, str, str], deque[dict[str, Any]]] = defaultdict(deque)
-    for row in expected_rows:
-        expected_by_identity[_identity(row)].append(row)
-
-    ignored_fields = {"No."}
-    mismatches: Counter[str] = Counter()
-    for generated in generated_rows:
-        candidates = expected_by_identity[_identity(generated)]
+    *,
+    example_limit: int = 20,
+) -> dict[str, Any]:
+    """Match duplicate identities by occurrence; never ignore an unmatched row."""
+    expected_by_identity: dict[tuple[str, str, str], deque] = defaultdict(deque)
+    for number, row in enumerate(expected_rows, start=2):
+        expected_by_identity[_identity(row)].append((number, row))
+    counts: Counter[str] = Counter()
+    examples: list[dict[str, Any]] = []
+    for number, actual in enumerate(generated_rows, start=2):
+        candidates = expected_by_identity[_identity(actual)]
         if not candidates:
-            mismatches["<missing expected row>"] += 1
+            counts["<extra generated row>"] += 1
+            if len(examples) < example_limit:
+                examples.append({"generated_row": number, "identity": _identity(actual), "field": "<extra generated row>"})
             continue
-        expected = candidates.popleft()
+        expected_number, expected = candidates.popleft()
         for field in MASTER_COLUMNS:
-            if field in ignored_fields:
+            if field == "No." or _values_equal(field, actual.get(field), expected.get(field)):
                 continue
-            actual_value = _normalized_value(field, generated.get(field))
-            expected_value = _normalized_value(field, expected.get(field))
-            if actual_value != expected_value:
-                mismatches[field] += 1
-    return dict(sorted(mismatches.items()))
+            counts[field] += 1
+            if len(examples) < example_limit:
+                examples.append({
+                    "generated_row": number, "reference_row": expected_number,
+                    "quote_num": actual.get("quote_num"), "order_number": actual.get("order number"),
+                    "field": field, "generated": actual.get(field), "reference": expected.get(field),
+                })
+    for candidates in expected_by_identity.values():
+        for number, expected in candidates:
+            counts["<missing generated row>"] += 1
+            if len(examples) < example_limit:
+                examples.append({"reference_row": number, "identity": _identity(expected), "field": "<missing generated row>"})
+    return {
+        "matches": not counts,
+        "generated_rows": len(generated_rows), "reference_rows": len(expected_rows),
+        "differences_by_field": dict(sorted(counts.items())), "examples": examples,
+    }
 
 
-_W38_DOCUMENTED_REFERENCE_ANOMALIES: dict[str, set[str]] = {
-    # These duplicate rows were changed to Cancelled in the manual final without a
-    # matching BQ row or Catalyst review value.
-    "2-790232122621": {
-        "order_status",
-        "order_status2",
-        "order_status (Confirmed by MIDO Dept.)",
-    },
-    # The manual workbook used the first quote match (a different order). The rule
-    # engine intentionally keeps the exact quote + order match.
-    "2-830925854851": {
-        "order_completion_date",
-        "Week Completion",
-        "LEADTIME CASH-COMPLETE",
-    },
-    # The final manual file changed achievement after the Catalyst checkpoint.
-    # A note in ADJUSTMENT is not itself evidence of PM approval.
-    "2-829340096158": {"ACHIEVEMENT"},
-    "2-829335407089": {"ACHIEVEMENT"},
-    # The manual final clears completion on a cancelled order but leaves stale
-    # lead time and achievement values from the earlier completed state.
-    "2-791214170813": {"LEADTIME CASH-COMPLETE", "ACHIEVEMENT"},
-}
-
-
-def _classify_w38_existing_mismatches(
-    generated_rows: list[dict[str, Any]],
-    expected_rows: list[dict[str, Any]],
-) -> tuple[dict[str, int], dict[str, int]]:
-    unexpected: Counter[str] = Counter()
-    documented: Counter[str] = Counter()
-    for generated, expected in zip(generated_rows, expected_rows, strict=True):
-        quote_num = clean_text(expected.get("quote_num"))
-        allowed_fields = _W38_DOCUMENTED_REFERENCE_ANOMALIES.get(quote_num, set())
-        for field in MASTER_COLUMNS:
-            if field == "No.":
-                continue
-            if _normalized_value(field, generated.get(field)) == _normalized_value(
-                field, expected.get(field)
-            ):
-                continue
-            target = documented if field in allowed_fields else unexpected
-            target[field] += 1
-    return dict(sorted(unexpected.items())), dict(sorted(documented.items()))
+def reference_formula_mismatches(
+    records: list[dict[str, Any]], holidays: set[date]
+) -> dict[str, int]:
+    """Diagnose the reference itself, without changing either comparison input."""
+    counts: Counter[str] = Counter()
+    for row in records:
+        total = to_decimal(row.get("otc")) + to_decimal(row.get("mrc"))
+        calculated = {
+            "LEADTIME FAB-CASH": inclusive_networkdays(row.get("fab_upload"), row.get("cash_dt"), holidays),
+            "OTC+MRC": total,
+            "OTC+MRC (inMio)": total / Decimal("1000000"),
+        }
+        for field, value in calculated.items():
+            if not _values_equal(field, value, row.get(field)):
+                counts[field] += 1
+    return dict(sorted(counts.items()))
 
 
 def run_reference_audit(
@@ -135,166 +115,68 @@ def run_reference_audit(
     holiday_workbook: str | Path,
     catalyst_review: str | Path,
     report_date: date,
+    report_month: date | None = None,
+    manual_decisions: str | Path | None = None,
+    source_review: str | Path | None = None,
 ) -> WeeklyAudit:
+    """Replay real inputs. Expected workbooks are read only after finalization."""
+    with TemporaryDirectory(prefix="weekly-reference-") as directory:
+        result = finalize_weekly_data(
+            bq_csv=bq_csv, previous_master=previous_master,
+            catalyst_review=catalyst_review, holiday_workbook=holiday_workbook,
+            report_date=report_date, report_month=report_month,
+            manual_decisions=manual_decisions, source_review=source_review,
+            output_dir=directory,
+        )
+        generated_master = list(iter_master_csv(Path(directory) / "master-final-data.csv"))
+        generated_mobile = list(iter_master_csv(Path(directory) / "mobile-data.csv"))
     audit = WeeklyAudit()
-    previous_rows = list(iter_master_rows(previous_master))
-    expected_rows = list(iter_master_rows(expected_master))
-    mobile_rows = list(iter_master_rows(expected_mobile))
-    existing_quotes = {
-        clean_text(row.get("quote_num"))
-        for row in previous_rows
-        if clean_text(row.get("quote_num"))
-    }
-    source_index = ExistingSourceIndex(previous_rows)
-
-    def indexed_source_rows():
-        for source_row in iter_bq_rows(bq_csv):
-            source_index.add(source_row)
-            yield source_row
-
-    selection = select_new_source_rows(
-        indexed_source_rows(),
-        existing_quote_nums=existing_quotes,
-        report_date=report_date,
-    )
-    expected_appended = expected_rows[len(previous_rows) :]
     holidays = load_holidays(holiday_workbook)
-    generated_rows = [
-        build_master_record(
-            row,
-            row_number=len(previous_rows) + offset,
-            holidays=holidays,
-        )
-        for offset, row in enumerate(selection.selected_rows, start=1)
-    ]
-    existing_refresh_issues = []
-    draft_existing_rows: list[dict[str, Any]] = []
-    sources: list[dict[str, Any] | None] = []
-    for previous_row in previous_rows:
-        source, issue = source_index.resolve(previous_row)
-        sources.append(source)
-        if issue is not None:
-            existing_refresh_issues.append(issue)
-        draft_existing_rows.append(refresh_existing_record(
-            previous_row,
-            source=source,
-            catalyst_override=None,
-            holidays=holidays,
-        ))
-    review_result = load_review_decisions(
-        catalyst_review,
-        draft_existing_rows + generated_rows,
-        first_new_row=len(previous_rows) + 2,
-    )
-    refreshed_existing_rows: list[dict[str, Any]] = []
-    for row_number, (previous_row, draft_row, source) in enumerate(
-        zip(previous_rows, draft_existing_rows, sources, strict=True), start=2
+    for role, generated, reference in (
+        ("master", generated_master, expected_master),
+        ("mobile", generated_mobile, expected_mobile),
     ):
-        decision = review_result.decisions.get(row_number)
-        refreshed_existing_rows.append(
-            refresh_existing_record(
-                previous_row,
-                source=source,
-                catalyst_override=None,
-                review_decision=decision,
-                holidays=holidays,
-            )
-            if decision is not None else draft_row
+        expected = list(iter_master_rows(reference))
+        audit.check(f"{role}_row_count", len(generated), len(expected))
+        comparison = compare_master_records(generated, expected)
+        audit.check(f"{role}_field_mismatches", comparison["differences_by_field"], {})
+        audit.check(
+            f"{role}_reference_formula_mismatches",
+            reference_formula_mismatches(expected, holidays), {},
         )
-
-    audit.check("previous_master_rows", len(previous_rows), 52_820)
-    audit.check("selected_source_rows", len(selection.selected_rows), 772)
-    audit.check("expected_appended_rows", len(expected_appended), 772)
-    audit.check("expected_master_rows", len(expected_rows), 53_592)
-    audit.check("expected_mobile_rows", len(mobile_rows), 53_108)
-
-    source_identities = Counter(_identity(row) for row in selection.selected_rows)
-    expected_identities = Counter(_identity(row) for row in expected_appended)
+    audit.check("pending_catalyst_rows", result["pending_catalyst_rows"], 0)
+    audit.check("invalid_master_services", result["invalid_master_services"], [])
     audit.check(
-        "selected_source_identity_multiset",
-        source_identities == expected_identities,
-        True,
+        "source_pair_conflict_issues", result["issue_counts"].get("conflicting_source_pair", 0), 0
     )
-    audit.check(
-        "generated_new_row_field_mismatches",
-        _field_mismatches(generated_rows, expected_appended),
-        {},
-    )
-    unexpected_existing, documented_existing = _classify_w38_existing_mismatches(
-        refreshed_existing_rows,
-        expected_rows[: len(previous_rows)],
-    )
-    audit.check("unexpected_existing_field_mismatches", unexpected_existing, {})
-    audit.check(
-        "documented_w38_reference_anomalies",
-        documented_existing,
-        {
-            "ACHIEVEMENT": 3,
-            "LEADTIME CASH-COMPLETE": 2,
-            "Week Completion": 1,
-            "order_completion_date": 1,
-            "order_status": 2,
-            "order_status (Confirmed by MIDO Dept.)": 2,
-            "order_status2": 2,
-        },
-    )
-    audit.check("catalyst_unmatched_new_rows", review_result.unmatched_new_rows, 0)
-    audit.check(
-        "source_pair_conflict_issues",
-        sum(issue.code == "conflicting_source_pair" for issue in existing_refresh_issues),
-        0,
-    )
-
-    invalid_mobile_services = sorted(
-        {
-            normalize_service_group(row.get("service_group"))
-            for row in mobile_rows
-            if normalize_service_group(row.get("service_group")) not in MOBILE_SERVICE_GROUPS
-        }
-    )
-    audit.check("mobile_out_of_scope_services", invalid_mobile_services, [])
-    audit.check("selection_parse_issues", len(selection.issues), 0)
-    audit.check(
-        "selected_rows_after_cutoff",
-        sum(
-            1
-            for row in selection.selected_rows
-            if parse_datetime(row.get("FAB_Upload")).date() > report_date
-        ),
-        0,
-    )
+    audit.check("mobile_out_of_scope_services", sorted({
+        normalize_service_group(row.get("service_group")) for row in generated_mobile
+        if normalize_service_group(row.get("service_group")) not in MOBILE_SERVICE_GROUPS
+    }), [])
     return audit
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bq-csv", required=True, type=Path)
-    parser.add_argument("--previous-master", required=True, type=Path)
-    parser.add_argument("--expected-master", required=True, type=Path)
-    parser.add_argument("--expected-mobile", required=True, type=Path)
-    parser.add_argument("--holiday-workbook", required=True, type=Path)
-    parser.add_argument("--catalyst-review", required=True, type=Path)
+    for name in ("bq-csv", "previous-master", "expected-master", "expected-mobile", "holiday-workbook", "catalyst-review"):
+        parser.add_argument(f"--{name}", required=True, type=Path)
     parser.add_argument("--report-date", required=True, type=date.fromisoformat)
+    parser.add_argument("--report-month", type=parse_report_month)
+    parser.add_argument("--manual-decisions", type=Path)
+    parser.add_argument("--source-review", type=Path)
     parser.add_argument("--json-output", type=Path)
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    audit = run_reference_audit(
-        bq_csv=args.bq_csv,
-        previous_master=args.previous_master,
-        expected_master=args.expected_master,
-        expected_mobile=args.expected_mobile,
-        holiday_workbook=args.holiday_workbook,
-        catalyst_review=args.catalyst_review,
-        report_date=args.report_date,
-    )
+    args = vars(build_parser().parse_args())
+    output = args.pop("json_output")
+    audit = run_reference_audit(**args)
     payload = json.dumps(audit.to_dict(), indent=2, default=str)
     print(payload)
-    if args.json_output:
-        args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(payload + "\n", encoding="utf-8")
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(payload + "\n", encoding="utf-8")
     return 0 if audit.passed else 1
 
 

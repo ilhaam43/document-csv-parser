@@ -9,29 +9,6 @@ PIVOT_PERFORMANCE_SHEET_NAME = "PIVOT PERFORMANCE"
 MOBILE_ONLY_REMOVED_PIVOTS = frozenset(
     {"PivotTable25", "PivotTable18", "PivotTable8", "PivotTable6", "PivotTable13"}
 )
-MASTER_ADJUSTMENT_REVIEW_PIVOTS = frozenset(
-    {
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable5"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable8"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable10"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable15"),
-    }
-)
-MOBILE_ADJUSTMENT_REVIEW_PIVOTS = frozenset(
-    {
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable2"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable7"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable14"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable16"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable17"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable20"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable21"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable22"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable23"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable24"),
-        (PIVOT_PERFORMANCE_SHEET_NAME, "PivotTable26"),
-    }
-)
 
 DATE_COLUMNS = frozenset(
     {
@@ -130,6 +107,7 @@ SOURCE_COLUMNS: tuple[str, ...] = (
 
 MASTER_SERVICE_GROUPS = frozenset({"Bulk Service", "Mobile", "M2M"})
 MOBILE_SERVICE_GROUPS = frozenset({"Bulk Service", "Mobile"})
+M2M_SERVICE_GROUPS = frozenset({"M2M"})
 
 SERVICE_ALIASES: dict[str, str] = {
     "bulk service": "Bulk Service",

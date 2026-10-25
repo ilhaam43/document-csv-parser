@@ -10,7 +10,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .constants import MASTER_SERVICE_GROUPS, MOBILE_SERVICE_GROUPS
+from .constants import MASTER_SERVICE_GROUPS, MOBILE_SERVICE_GROUPS, M2M_SERVICE_GROUPS
 from .dates import has_explicit_seconds, parse_report_month
 from .io import (
     iter_master_rows,
@@ -122,6 +122,7 @@ def finalize_weekly_data(
 
     issues = list(selection.issues)
     sources_by_row: dict[int, dict[str, Any] | None] = {}
+    metric_decisions_by_row: dict[int, list[dict[str, Any]]] = {}
     draft_existing_rows: list[dict[str, Any]] = []
     for row_number, previous_row in enumerate(previous_rows, start=2):
         source, source_issue = source_index.resolve(previous_row)
@@ -135,6 +136,7 @@ def finalize_weekly_data(
         sources_by_row[row_number] = source
         if source_issue is not None:
             issues.append(_issue_with_row(source_issue, row_number))
+        metric_decisions_by_row[row_number] = []
         draft_existing_rows.append(refresh_existing_record(
             previous_row,
             source=source,
@@ -144,6 +146,7 @@ def finalize_weekly_data(
                 if quote_choice else None
             ),
             holidays=holidays,
+            metric_decisions=metric_decisions_by_row[row_number],
         ))
     draft_rows = draft_existing_rows + appended_rows
     catalyst_review_result = load_review_decisions(
@@ -207,6 +210,8 @@ def finalize_weekly_data(
     refreshed_rows: list[dict[str, Any]] = []
     for row_number, previous_row in enumerate(previous_rows, start=2):
         decision = decisions.get(row_number)
+        if decision is not None:
+            metric_decisions_by_row[row_number] = []
         refreshed_rows.append(
             refresh_existing_record(
                 previous_row,
@@ -214,12 +219,14 @@ def finalize_weekly_data(
                 catalyst_override=None,
                 review_decision=decision,
                 holidays=holidays,
+                metric_decisions=metric_decisions_by_row[row_number],
             )
             if decision is not None else draft_existing_rows[row_number - 2]
         )
 
     for offset, record in enumerate(appended_rows, start=len(previous_rows) + 2):
         decision = decisions.get(offset)
+        metric_decisions_by_row[offset] = []
         if decision is not None:
             appended_rows[offset - len(previous_rows) - 2] = refresh_existing_record(
                 record,
@@ -227,7 +234,18 @@ def finalize_weekly_data(
                 catalyst_override=None,
                 review_decision=decision,
                 holidays=holidays,
+                metric_decisions=metric_decisions_by_row[offset],
             )
+            for metric in metric_decisions_by_row[offset]:
+                if metric["decision_method"] == "published_history":
+                    metric["decision_method"] = "calculated_new"
+        else:
+            for field in ("LEADTIME FAB-CASH", "LEADTIME CASH-COMPLETE", "ACHIEVEMENT"):
+                metric_decisions_by_row[offset].append({
+                    "metric": field, "previous_value": None,
+                    "calculated_value": record.get(field), "final_value": record.get(field),
+                    "decision_method": "calculated_new",
+                })
 
     master_rows = refreshed_rows + appended_rows
     for number, row in enumerate(master_rows, start=1):
@@ -239,9 +257,14 @@ def finalize_weekly_data(
     ]
     for record_number, row in enumerate(mobile_rows, start=1):
         row["No."] = record_number
+    m2m_rows = [dict(row) for row in master_rows
+                if normalize_service_group(row.get("service_group")) in M2M_SERVICE_GROUPS]
+    for record_number, row in enumerate(m2m_rows, start=1):
+        row["No."] = record_number
 
     master_path = write_master_csv(output_path / "master-final-data.csv", master_rows)
     mobile_path = write_master_csv(output_path / "mobile-data.csv", mobile_rows)
+    m2m_path = write_master_csv(output_path / "m2m-data.csv", m2m_rows)
     issues_path = write_issues_csv(output_path / "exceptions.csv", issues)
     source_decisions_path = output_path / "bq-source-decisions.csv"
     with source_decisions_path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -290,6 +313,25 @@ def finalize_weekly_data(
                 "reviewed_by": decision.reviewed_by,
                 "review_reason": decision.review_reason,
             })
+    metric_decisions_path = output_path / "metric-decisions.csv"
+    metric_methods: Counter[str] = Counter()
+    metric_variances: Counter[str] = Counter()
+    with metric_decisions_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=(
+            "master_row", "quote_num", "order_number", "metric", "previous_value",
+            "calculated_value", "final_value", "decision_method",
+        ))
+        writer.writeheader()
+        for row_number, metrics in metric_decisions_by_row.items():
+            row = master_rows[row_number - 2]
+            for metric in metrics:
+                writer.writerow({
+                    "master_row": row_number, "quote_num": row.get("quote_num"),
+                    "order_number": row.get("order number"), **metric,
+                })
+                metric_methods[metric["decision_method"]] += 1
+                if metric["calculated_value"] != metric["final_value"]:
+                    metric_variances[metric["metric"]] += 1
     audit_path = output_path / "audit.json"
     issue_counts = Counter(issue.code for issue in issues)
     invalid_master_services = sorted(
@@ -307,11 +349,16 @@ def finalize_weekly_data(
         "new_rows_without_fab_seconds": unverified_fab_seconds,
         "master_final_rows": len(master_rows),
         "mobile_rows": len(mobile_rows),
+        "m2m_rows": len(m2m_rows),
         "catalyst_decisions": catalyst_count,
         "checkpoint_matched_new_rows": len(catalyst_review_result.checkpoint_rows),
         "checkpoint_unmatched_new_rows": catalyst_review_result.unmatched_new_rows,
         "checkpoint_zero_leadtime_reviews": reviewed_zero_leadtimes,
         "manual_decisions": len(manual_review_decisions),
+        "metric_policy": "preserve_published_history_v1",
+        "metric_decision_methods": dict(sorted(metric_methods.items())),
+        "metric_calculation_variances": dict(sorted(metric_variances.items())),
+        "holiday_dates": sorted(day.isoformat() for day in holidays),
         "source_conflict_rows": len(source_conflicts),
         "source_reviewed_rows": len(source_choices),
         "source_auto_order_rows": sum(
@@ -334,9 +381,11 @@ def finalize_weekly_data(
         "outputs": {
             "master_final_data": str(master_path.resolve()),
             "mobile_data": str(mobile_path.resolve()),
+            "m2m_data": str(m2m_path.resolve()),
             "exceptions": str(issues_path.resolve()),
             "bq_source_decisions": str(source_decisions_path.resolve()),
             "review_decisions": str(decisions_path.resolve()),
+            "metric_decisions": str(metric_decisions_path.resolve()),
             "audit": str(audit_path.resolve()),
         },
     }

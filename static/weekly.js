@@ -22,6 +22,8 @@ const reviewButton = document.getElementById("review-button");
 const sourceReviewLink = document.getElementById("source-review-link");
 const sourceReviewFileField = document.getElementById("source-review-file-field");
 const sourceReviewFile = document.getElementById("source_review");
+const includeMobile = document.getElementById("include_mobile");
+const includeM2m = document.getElementById("include_m2m");
 let activeJobId = null;
 let pollingTimer = null;
 let requestPending = false;
@@ -30,6 +32,20 @@ let loadedReviewJobId = null;
 let reviewSelections = {};
 let reviewEditable = false;
 let currentJobStatus = null;
+
+function syncOutputSelection() {
+  includeMobile.setCustomValidity(includeMobile.checked || includeM2m.checked ? "" : "Select at least one report.");
+  document.getElementById("output_services").value = includeMobile.checked && includeM2m.checked
+    ? "both" : includeM2m.checked ? "m2m" : "mobile";
+  for (const [id, selected] of [["mobile-template-fields", includeMobile.checked], ["m2m-template-fields", includeM2m.checked]]) {
+    const fields = document.getElementById(id);
+    fields.hidden = !selected;
+    for (const input of fields.querySelectorAll("input")) {
+      input.disabled = !selected;
+      input.required = selected;
+    }
+  }
+}
 
 function normalizeJobId(jobId) {
   if (!jobId) return jobId;
@@ -248,10 +264,7 @@ function renderJob(job) {
       ? Object.values(job.final_audit.issue_counts).reduce((a, b) => a + b, 0)
       : 0;
     const warning = job.warnings?.length ? ` ${job.warnings.join(" ")}` : "";
-    const outputs = job.output_files?.some((name) => name.endsWith(".pptx"))
-      ? "Master, Mobile, and PPT"
-      : "Master and Mobile";
-    setStatus(`Weekly ${outputs} generated. ${issueCount} audit exceptions.${warning}`, warning ? "" : "ok");
+    setStatus(`Weekly reports ready. ${job.output_files?.length || 0} files. ${issueCount} audit exceptions.${warning}`, warning ? "" : "ok");
   }
   else setStatus(job.stage || "Processing...");
 }
@@ -277,6 +290,8 @@ async function pollJob() {
 prepareForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (requestPending || activeJobId) return;
+  syncOutputSelection();
+  if (!prepareForm.reportValidity()) return;
   requestPending = true;
   const data = new FormData(prepareForm);
   setFormDisabled(prepareForm, true);
@@ -292,12 +307,14 @@ prepareForm.addEventListener("submit", async (event) => {
     if ([400, 413, 422].includes(error.status)) {
       forgetJob();
       setFormDisabled(prepareForm, false);
+      syncOutputSelection();
     } else {
       // A gateway can fail after the upload was accepted; keep the ID for polling.
       pollingTimer = window.setTimeout(pollJob, 5000);
     }
   } finally {
     requestPending = false;
+    updateReviewProgress();
   }
 });
 
@@ -315,6 +332,7 @@ refreshReviewButton.addEventListener("click", async () => {
   } finally {
     requestPending = false;
     refreshReviewButton.disabled = false;
+    updateReviewProgress();
   }
 });
 
@@ -372,8 +390,13 @@ newJobButton.addEventListener("click", () => {
   downloadLink.classList.remove("visible");
   newJobButton.hidden = true;
   setFormDisabled(prepareForm, false);
+  syncOutputSelection();
   setStatus("Ready.");
 });
+
+includeMobile.addEventListener("change", syncOutputSelection);
+includeM2m.addEventListener("change", syncOutputSelection);
+syncOutputSelection();
 
 const now = new Date();
 document.getElementById("report_date").value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
