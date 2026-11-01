@@ -332,7 +332,56 @@ def _leadtime_item_visible(value: Any) -> bool:
     return number.is_finite() and number >= 0
 
 
-def _apply_nonnegative_leadtime_filters(workbook) -> set[tuple[str, str]]:
+@dataclass(frozen=True)
+class LeadtimeFilterSelection:
+    known: frozenset[Decimal]
+    excluded: frozenset[Decimal]
+    include_new: bool
+
+    def accepts(self, value: Any) -> bool:
+        if not _leadtime_item_visible(value):
+            return False
+        number = Decimal(str(value))
+        return number not in self.excluded if number in self.known else self.include_new
+
+
+def _capture_leadtime_filters(workbook) -> dict[tuple[str, str], LeadtimeFilterSelection]:
+    """Capture selection by value and Excel's rule for newly appearing items."""
+    selections: dict[tuple[str, str], LeadtimeFilterSelection] = {}
+    for sheet in workbook.Worksheets:
+        if str(sheet.Name) not in SUMMARY_SHEET_NAMES:
+            continue
+        for index in range(1, sheet.PivotTables().Count + 1):
+            pivot = sheet.PivotTables(index)
+            try:
+                field = pivot.PivotFields("LEADTIME FAB-CASH")
+                if int(field.Orientation) != 3:
+                    continue
+            except Exception:
+                continue
+            items = field.PivotItems()
+            hidden = set()
+            known = set()
+            for number in range(1, items.Count + 1):
+                item = items(number)
+                if _leadtime_item_visible(item.Name):
+                    value = Decimal(str(item.Name))
+                    known.add(value)
+                    if not bool(item.Visible):
+                        hidden.add(value)
+            selections[str(sheet.Name), str(pivot.Name)] = LeadtimeFilterSelection(
+                frozenset(known), frozenset(hidden),
+                bool(field.AllItemsVisible) or bool(field.IncludeNewItemsInFilter),
+            )
+    return selections
+
+
+def _apply_nonnegative_leadtime_filters(
+    workbook,
+    selections: dict[tuple[str, str], LeadtimeFilterSelection] | None = None,
+) -> set[tuple[str, str]]:
+    if selections is None:
+        selections = _capture_leadtime_filters(workbook)
     changed: set[tuple[str, str]] = set()
     for sheet in workbook.Worksheets:
         if str(sheet.Name) not in SUMMARY_SHEET_NAMES:
@@ -346,11 +395,12 @@ def _apply_nonnegative_leadtime_filters(workbook) -> set[tuple[str, str]]:
             except Exception:
                 continue
             items = field.PivotItems()
+            selection = selections.get((str(sheet.Name), str(pivot.Name)))
             desired = []
             valid_records = False
             for item_number in range(1, items.Count + 1):
                 item = items(item_number)
-                visible = _leadtime_item_visible(item.Name)
+                visible = selection.accepts(item.Name) if selection else _leadtime_item_visible(item.Name)
                 current = bool(item.Visible)
                 if visible and current:
                     valid_records = True
@@ -364,6 +414,10 @@ def _apply_nonnegative_leadtime_filters(workbook) -> set[tuple[str, str]]:
             pivot.ManualUpdate = True
             try:
                 field.EnableMultiplePageItems = True
+                if selection is not None and bool(field.IncludeNewItemsInFilter) != selection.include_new:
+                    # An initially unfiltered field must still admit new valid
+                    # values after we hide invalid metrics and save it as a template.
+                    field.IncludeNewItemsInFilter = selection.include_new
                 for item, visible in sorted(desired, key=lambda pair: not pair[1]):
                     try:
                         item.Visible = visible
@@ -499,6 +553,7 @@ def _refresh_pivots(
     report_week: int | None,
     pivot_review: list[PivotReviewDecision],
 ) -> None:
+    leadtime_filters = _capture_leadtime_filters(workbook)
     refreshed_caches: set[int] = set()
     for sheet in workbook.Worksheets:
         pivot_tables = sheet.PivotTables()
@@ -511,8 +566,8 @@ def _refresh_pivots(
                 refreshed_caches.add(cache_index)
             pivot.RefreshTable()
     changed_pivots = _reset_summary_adjustment_filters(workbook)
-    # Include every valid value, including zero, on every run and report role.
-    changed_pivots.update(_apply_nonnegative_leadtime_filters(workbook))
+    # Data normalization is separate from each template pivot's population.
+    changed_pivots.update(_apply_nonnegative_leadtime_filters(workbook, leadtime_filters))
     if mobile:
         if report_week is None:
             raise ValueError("Mobile PivotTable refresh requires a report week.")

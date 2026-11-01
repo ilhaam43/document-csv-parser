@@ -82,6 +82,40 @@ class WeeklyDraftTests(unittest.TestCase):
             review = list(reader)
         self.assertEqual([(row["master_row"], row["order_number"]) for row in review], [("2", "O-1"), ("4", "O-3")])
 
+    def test_prepare_and_finalize_agree_on_late_fab_rows_without_extra_review(self) -> None:
+        self.bq_rows.append({
+            "quote_num": "LATE", "order_number": "LATE-ORDER", "order_status": "Complete",
+            "service_group": "Mobile", "FAB_Upload": "2026-08-31 16:15:04",
+            "cash_date": "2026-09-02", "order_completion_date": "2026-09-03",
+        })
+        patches = self._inputs("weekly.prepare")
+        with patches[0], patches[1], patches[2]:
+            prepared = prepare_weekly_inputs(
+                bq_csv="bq.csv", previous_master="old.xlsx", holiday_workbook="holiday.xlsx",
+                report_date=date(2026, 9, 24), output_dir=self.directory / "prepare",
+            )
+        self.assertEqual(prepared["historical_backfill_rows"], 1)
+        self.assertEqual(prepared["historical_backfill_by_fab_month"], {"2026-08": 1})
+        self.assertEqual(prepared["selected_source_rows"], 2)
+        self.assertEqual(prepared["pending_catalyst_rows"], 2)
+        review = self._read_csv(self.directory / "prepare" / "catalyst-review.csv")
+        self.assertNotIn("LATE", [r["quote_num"] for r in review])
+        patches = self._inputs("weekly.finalize")
+        with patches[0], patches[1], patches[2]:
+            finalized = finalize_weekly_data(
+                bq_csv="bq.csv", previous_master="old.xlsx",
+                catalyst_review=self.directory / "prepare" / "catalyst-review.csv",
+                holiday_workbook="holiday.xlsx", report_date=date(2026, 9, 24),
+                output_dir=self.directory / "final",
+            )
+        for field in ("source_selection_policy", "historical_backfill_rows", "historical_backfill_by_fab_month"):
+            self.assertEqual(prepared[field], finalized[field])
+        late = next(r for r in self._read_csv(self.directory / "final" / "master-final-data.csv")
+                    if r["quote_num"] == "LATE")
+        self.assertEqual(late["fab_upload"], "2026-08-31 16:15:04")
+        self.assertEqual(late["Month of FAB Upload"], "August-26")
+        self.assertEqual(late["order_status2"], "COMPLETE")
+
     def test_finalize_uses_draft_identity_and_leaves_blank_review_pending(self) -> None:
         patches = self._inputs("weekly.prepare")
         with patches[0], patches[1], patches[2]:

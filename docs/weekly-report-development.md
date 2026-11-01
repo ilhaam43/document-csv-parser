@@ -15,10 +15,11 @@ Power BI dashboard slide content unchanged.
 
 ## Weekly web workflow
 
-Open `/weekly` on the running server. Enter the **BQ cutoff/report date, FAB
+Open `/weekly` on the running server. Enter the **BQ cutoff/report date,
 reporting month, and business report week separately**. For example, W38 uses
 24 September 2026 / September 2026 / W38, while W39 uses 2 October 2026 /
-September 2026 / W39. The report month selects new FAB rows; the report date
+September 2026 / W39. The report month selects current FAB rows and older FAB
+orders with CASH/completion activity in that month; the report date
 remains the cutoff and the date printed in the PPT. The month defaults to the
 report date's month unless explicitly supplied via CLI/API. For example,
 Excel `WEEKNUM(date, 14)` evaluates that date as W39 and must not determine the
@@ -96,9 +97,18 @@ long-term audit store. A server restart during an active job does not resume it.
   independent sequential numbering. It does not repeat Catalyst review or
   introduce a second lead-time/achievement calculation.
 - A source quote already present in the previous master is not appended again.
-- New source rows must have `FAB_Upload` in the explicitly selected FAB reporting
+- Normal new source rows must have `FAB_Upload` in the explicitly selected reporting
   month and no later than the report date. A first-week-of-October W39 report
   may still add September FAB rows.
+  An older FAB row is also eligible when it has a real `order_number` and a
+  `cash_date` or `order_completion_date` in the reporting month, no later than
+  the report date. The source quote must still be absent from the previous
+  Master, the service must be in scope, and FAB must be populated. Future FAB,
+  quote-only records and unrelated historical activity remain excluded.
+  There is no fixed month lookback, week-specific rule, or reference-quote list.
+  Original dates and source row order are retained; a late-loaded order is not
+  relabeled into the current FAB/completion week. Malformed historical activity
+  dates are reported instead of guessed.
   The owner's Thursday-to-Wednesday FAB periods were W37: 10-16 September,
   W38: 17-23 September, and W39: 24-30 September 2026. They describe the
   reporting window, not a strict new-row cutoff: the manual W38 Master also
@@ -163,10 +173,14 @@ long-term audit store. A server restart during an active job does not resume it.
   filters; an explicit pivot-review input is applied after
   the default summary policy. Manual samples with additional exclusions remain
   differences, not evidence that the default reproduces those selections.
-- Every refresh includes finite, nonnegative FAB-CASH values in page filters,
-  including zero, for both report roles. The policy no longer depends on a month
-  rollover or cached numeric checkboxes. Negative and missing values remain in
-  ALL DATA but are excluded from these average-lead-time populations.
+- FAB-CASH page filters preserve each template pivot's explicit numeric
+  exclusions, including zero when excluded. The writer captures these selections
+  before cache refresh and reapplies them by value, not cache index. Newly seen
+  values follow the template's `IncludeNewItemsInFilter` setting; an unfiltered
+  field includes new valid values. When invalid values are first hidden on an
+  unfiltered field, its effective include-new behavior is saved for the next run.
+  Negative and missing values remain in ALL DATA but are excluded from these
+  average-lead-time populations. Data normalization does not reset pivot scope.
 - Summary column fitting covers numeric values, bounded/wrapped column headers,
   page-filter captions and values, and adjacent percentage helpers. It only
   widens columns as needed and does not apply sheet-wide AutoFit to ALL DATA.
@@ -316,17 +330,22 @@ The template's number formats control display precision without rounding the
 stored cell values.
 All chart series are resized to the resulting range. Helper percentage formulas
 are restored relative to each refreshed pivot's data and grand-total rows.
-Both Master and Mobile include finite, nonnegative numeric FAB-CASH values in
-summary page filters on every refresh, even when a prior template hid them.
-Zero participates in the average; negative/blank metrics do not. The old
-month-rollover-only reset and Mobile numeric checkbox inheritance are no longer
-used. Separate operational/detail filters remain unchanged. Other explicitly
+Master, Mobile and M2M retain each template pivot's numeric FAB-CASH exclusions
+across cache refresh. Values are captured before refresh and matched by numeric
+value, so a changed cache order does not change membership. New nonnegative
+values follow the field's `IncludeNewItemsInFilter` setting; existing excluded
+values, including zero, stay excluded. Negative/blank metrics are excluded. These template settings define
+report population; they are not universal SLA thresholds. Separate
+operational/detail filters remain unchanged. Other explicitly
 reviewed values belong in
 `slide-review.csv` with columns
 `workbook,cell,value,reviewed_by,review_reason`. These are optional, attributed
 exceptions, not a required way to copy stale manual summaries. No review CSV
 is needed to populate normal summaries or charts. A reference fixture copied
 from the manual file is useful for regression, but is not production approval.
+
+Excel's inclusion/exclusion tracking behavior is documented in
+[PivotField.IncludeNewItemsInFilter](https://learn.microsoft.com/en-us/office/vba/api/excel.pivotfield.includenewitemsinfilter).
 
 W39's manual Master also changes two `ADJUSTMENT` pivot filters compared with
 W38, including four August orders. The default performance-summary policy now
@@ -638,9 +657,10 @@ filters globally changes otherwise matching reference values. Explicit optional
 pivot reviews are still applied last. No additional review is required for
 normal generation.
 
-Numeric FAB-CASH page filters in summaries are rebuilt from finite values >= 0
-on every run, rather than inheriting a service-specific numeric checkbox list.
-This deliberately includes zero. Layout fitting is bounded to pivot/filter/
+The original validation below reset numeric FAB-CASH page filters to all finite
+values >= 0. The October 26 revalidation supersedes that behavior: resetting
+explicit exclusions changed the manual report population, even when ALL DATA
+matched. The writer now preserves per-pivot template exclusions. Layout fitting is bounded to pivot/filter/
 helper ranges, preserves wider columns, wraps oversized headers, and preserves
 intentionally hidden rows when AutoFit changes header heights.
 
@@ -822,3 +842,127 @@ legacy Mobile requests, core-only downloads and checksum-verified retries.
 A native sparse-week test uses the W41 dataset with a later empty reporting
 week and verifies successful workbook/PPT output with zero counts/revenue and
 blank lead-time chart points, rather than claiming a live W42 data sample.
+
+## Cross-report filter reconciliation (October 26)
+
+The former unconditional nonnegative FAB-CASH filter reset changed the
+population of existing template pivots. Numeric validity in ALL DATA is not
+the same as inclusion in a report's average. The writer now captures each
+pivot's numeric selection before cache refresh, restores it by numeric value,
+and follows `IncludeNewItemsInFilter` for newly appearing values. Unfiltered
+fields continue to admit new valid values when used as the next template.
+Selections are isolated by worksheet and pivot name; explicit reviewed filter
+decisions still apply last. No week-specific values or reference totals are
+embedded in the writer.
+
+This fixes a generator discrepancy but cannot reconstruct subsequent manual
+changes not represented in the inputs. In particular:
+
+- W40 manual Master changes its monthly FAB-CASH selections to include 57, 58
+  and 103, previously excluded in W39. The preceding template does not contain
+  that later change. These numbers are diagnostic examples, not generator rules.
+- W41 manual changes FAB-CASH cells from published constants to NETWORKDAYS,
+  changing 249 historical values without changing their supporting dates.
+  Preserving published history and recalculating it are distinct policies.
+- Both calculated revenue columns are blank on 1,596 new W41 Master rows.
+  Eleven sums are nonzero, totaling IDR 3,463,082,558 before pivot filters.
+  The generator completes these sums; copying blank values would omit revenue.
+- The original Mobile W39 PPT shows FAB-CASH W37 as 3, while its own manual
+  pivot is 1.5287878788 (rounded display 2). M2M W41 PPT shows CASH-COMPLETE W41
+  as 4 while its own manual pivot is 5. Generated presentations use pivot values.
+
+The revalidation uses previously verified production finalizer CSVs, rebuilds
+all three workbook roles and both presentations for W39-W41, compares against
+the original manual files, and independently audits saved pivot aggregates and
+editable chart values. W39 M2M lacks a previous W38 workbook: its W39 layout is
+used with all table data replaced and pivots refreshed. This is a disclosed
+layout/data check, not a full previous-week-template replay. W40/W41 M2M use
+their actual previous-week templates. All evidence and output files are outside
+the repository at `D:\SECM\weekly-parity-20261025`.
+
+### Final Cross-report Validation
+
+All nine workbooks and six presentations were rebuilt with the filter fix.
+The numeric comparison below matches pivot name, metric, period and category,
+not worksheet coordinates; it does not claim identical entire files.
+
+| Week | Report | PIVOT PERFORMANCE values compared | Values differing from manual | PPT charts matching manual after display rounding |
+| --- | --- | ---: | ---: | --- |
+| W39 | Master | 756 | 0 | - |
+| W39 | Mobile | 250 | 0 | 5 / 6 |
+| W39 | M2M | 130 | 0 | 4 / 4 |
+| W40 | Master | 796 | 10 | - |
+| W40 | Mobile | 271 | 0 | 6 / 6 |
+| W40 | M2M | 141 | 0 | 4 / 4 |
+| W41 | Master | 808 | 50 | - |
+| W41 | Mobile | 271 | 24 | 3 / 6 |
+| W41 | M2M | 141 | 6 | 3 / 4 |
+
+W40 Master's ten differences are FAB-CASH averages. W41 differences comprise
+40 FAB-CASH and ten revenue aggregates for Master, 14 FAB-CASH and ten revenue
+aggregates for Mobile, and six FAB-CASH aggregates for M2M. Their causes are
+documented above; these are not unexplained comparison failures or values
+silently copied from the target manual reports.
+
+Independent aggregation of the finalized CSVs using the saved native pivot
+filters passed all 3,468 checks. All 30 generated chart caches and their
+editable embedded Excel values match their generated workbook pivots. Native
+Excel checks found no numeric display overflow or formula errors in the audited
+tables. All six generated and six manual decks were rendered in PowerPoint for
+visual comparison. The original source/reference checksums remain unchanged.
+
+The unit suite ran 269 tests: 267 passed and two optional reference tests were
+skipped. The common workbook writer is also used by the web finalizer; this
+specific revalidation did not rerun BQ preparation or browser upload end to end.
+Support files remain outside the repository and user-facing core-report ZIP.
+The external `hasil-validasi.md` and `hasil-analisis.md` summarize the evidence.
+
+## Late FAB Reconciliation (November 2)
+
+Selection policy `fab_or_current_lifecycle_v1` handles orders whose FAB appears
+late in BQ with an older date but current reporting-month CASH/completion.
+Prepare and finalization use the same selector. Their audits record
+`historical_backfill_rows` and `historical_backfill_by_fab_month` under
+`source_selection_policy`; these are informational, not extra approval inputs.
+The web status includes the selected historical-row count during review and
+after generation. There is no extra section, upload, or mandatory review.
+Completed historical job downloads are not recalculated; start a new job to
+apply the updated selection to the same inputs.
+
+Snapshot analysis found the affected W42 quote in W39-W41 BQ with blank FAB.
+W40/W41 already had its October CASH/completion dates; only W42 supplied FAB
+for five real order rows. The new rule derives their eligibility from dates,
+not that quote's identity. W42 selects 160 new rows (155 current FAB and five
+September FAB with October activity), while 113,681 unrelated older FAB rows
+remain excluded. The Catalyst queue remains 70 rows. Neither the shared SLA
+calculations nor the previous quote-lookup/status policy is changed.
+
+Regression evidence and native outputs for this change are outside the repository
+at `D:\SECM\weekly-carryover-fix-20261102`.
+
+### Reconciliation Validation
+
+Fresh W42 prepare/finalize and native report generation produce 56,715 Master,
+56,205 Mobile and 510 M2M rows, matching the manual row counts. All 820 / 271 /
+141 PIVOT PERFORMANCE values respectively match the original manual files.
+All ten PPT charts match the manual numbers after integer display rounding;
+their caches and editable embedded data retain generated pivot precision.
+Independent native aggregation passes 1,202 checks with no audited formula
+errors or number overflow. W39-W41 Master/Mobile/M2M datasets remain unchanged
+from the pre-fix generator baselines, including previously documented manual
+differences. No target totals or historical metric overrides were added.
+
+This still does not mean identical entire files. One historical Mobile order
+has raw `Cancelled` in the manual but `In Progress` in both derived status
+columns; the generator retains consistent `CANCEL`. Some manual static slide
+summaries differ from their own pivot values, and month-language/year labels
+and rounding remain distinct. These differences are outside late-FAB selection.
+
+The suite runs 279 tests (277 pass, two optional reference tests skipped).
+Browser tests cover count zero/five, Catalyst progress, completion and reset
+at desktop/mobile widths without a new input or page overflow. Browser job
+responses are stubbed; separate real sample replay exercises production
+prepare/finalize and native writers. API tests exercise actual selection and
+finalization with synthetic data, stubbing only the native writers. Source
+checksums are unchanged. The external `hasil-validasi.md` records remaining
+manual differences and the scope of each verification.

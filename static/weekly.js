@@ -32,6 +32,11 @@ let loadedReviewJobId = null;
 let reviewSelections = {};
 let reviewEditable = false;
 let currentJobStatus = null;
+let historicalBackfillRows = 0;
+
+function backfillNote() {
+  return historicalBackfillRows > 0 ? ` ${historicalBackfillRows} prior-month order rows included.` : "";
+}
 
 function syncOutputSelection() {
   includeMobile.setCustomValidity(includeMobile.checked || includeM2m.checked ? "" : "Select at least one report.");
@@ -71,6 +76,7 @@ function resetReviewView() {
   reviewDirect.hidden = false;
   refreshReviewButton.hidden = true;
   currentJobStatus = null;
+  historicalBackfillRows = 0;
 }
 
 function saveReviewSelections() {
@@ -90,7 +96,7 @@ function updateReviewProgress() {
   const completed = reviewRows?.filter((row) => Boolean(reviewSelections[row.master_row])).length || 0;
   if (reviewRows) reviewCount.textContent = `${completed} of ${total} Catalyst statuses checked`;
   if (reviewRows && currentJobStatus === "waiting_review" && !requestPending) {
-    setStatus(`Master draft ready. ${completed} of ${total} Catalyst statuses checked.`, "ok");
+    setStatus(`Master draft ready. ${completed} of ${total} Catalyst statuses checked.${backfillNote()}`, "ok");
   }
   reviewButton.disabled = !reviewEditable || requestPending ||
     (!reviewFile.files.length && (!reviewRows || completed !== total));
@@ -228,6 +234,8 @@ async function requestJson(url, options = {}) {
 function renderJob(job) {
   const status = job.status;
   currentJobStatus = status;
+  const backfill = job.final_audit?.historical_backfill_rows ?? job.preparation_audit?.historical_backfill_rows;
+  historicalBackfillRows = Number.isInteger(backfill) && backfill > 0 ? backfill : 0;
   const preparing = ["uploading", "queued", "preparing", "refreshing_review"].includes(status);
   const finalizing = ["uploading_review", "queued_finalization", "finalizing", "generating"].includes(status);
   setFormDisabled(prepareForm, true);
@@ -257,14 +265,14 @@ function renderJob(job) {
   }
   else if (status === "waiting_review") {
     const pending = job.preparation_audit?.pending_catalyst_rows;
-    setStatus(`Master draft ready. ${pending ?? "Pending"} Catalyst statuses need review.`, "ok");
+    setStatus(`Master draft ready. ${pending ?? "Pending"} Catalyst statuses need review.${backfillNote()}`, "ok");
   }
   else if (status === "succeeded") {
     const issueCount = job.final_audit?.issue_counts
       ? Object.values(job.final_audit.issue_counts).reduce((a, b) => a + b, 0)
       : 0;
     const warning = job.warnings?.length ? ` ${job.warnings.join(" ")}` : "";
-    setStatus(`Weekly reports ready. ${job.output_files?.length || 0} files. ${issueCount} audit exceptions.${warning}`, warning ? "" : "ok");
+    setStatus(`Weekly reports ready. ${job.output_files?.length || 0} files.${backfillNote()} ${issueCount} audit exceptions.${warning}`, warning ? "" : "ok");
   }
   else setStatus(job.stage || "Processing...");
 }

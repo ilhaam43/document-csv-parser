@@ -16,6 +16,8 @@ from weekly.workbook import (
     _leadtime_item_visible,
     _uniform_relative_formula,
     _apply_nonnegative_leadtime_filters,
+    _capture_leadtime_filters,
+    LeadtimeFilterSelection,
     _restore_pivot_helpers,
     _style_pivot_helpers,
     PivotHelperFormula,
@@ -189,7 +191,7 @@ class WeeklyWorkbookValueTests(unittest.TestCase):
                         _refresh_pivots(workbook, mobile=mobile, report_week=week, pivot_review=[])
                     self.assertEqual(events, ["adjustment", "leadtime", "review"])
 
-    def test_leadtime_filter_includes_previously_hidden_valid_values(self) -> None:
+    def test_leadtime_numeric_validity_is_separate_from_template_population(self) -> None:
         for value in (0, 1, 57, 58, 103, "102.91666"):
             self.assertTrue(_leadtime_item_visible(value))
         for value in (None, "(blank)", "", "NaN", "Infinity", -1, "-20"):
@@ -219,14 +221,21 @@ class WeeklyWorkbookValueTests(unittest.TestCase):
             SimpleNamespace(Name="-2", Visible=True, RecordCount=1),
             SimpleNamespace(Name="(blank)", Visible=True, RecordCount=2),
         ])
-        field = SimpleNamespace(Orientation=3, EnableMultiplePageItems=False, PivotItems=lambda: items)
+        field = SimpleNamespace(Orientation=3, EnableMultiplePageItems=False, PivotItems=lambda: items,
+                                AllItemsVisible=False, IncludeNewItemsInFilter=True)
         pivot = SimpleNamespace(Name="Average", ManualUpdate=False, PivotFields=lambda _: field)
         pivots = Items([pivot])
         sheet = SimpleNamespace(Name="PIVOT PERFORMANCE", PivotTables=lambda index=None: pivots if index is None else pivot)
         workbook = SimpleNamespace(Worksheets=[sheet])
-        changed = _apply_nonnegative_leadtime_filters(workbook)
+        exclusions = _capture_leadtime_filters(workbook)
+        self.assertEqual(exclusions[("PIVOT PERFORMANCE", "Average")].excluded, frozenset(map(Decimal, (0, 57, 103))))
+        # Cache refresh can reveal an excluded old value and hide a new value.
+        items.values[2].Visible = True
+        items.values.append(SimpleNamespace(Name="58", Visible=False, RecordCount=2))
+        items.Count += 1
+        changed = _apply_nonnegative_leadtime_filters(workbook, exclusions)
         self.assertEqual(changed, {("PIVOT PERFORMANCE", "Average")})
-        self.assertEqual([i.Visible for i in items.values], [True, True, True, False, False, False])
+        self.assertEqual([i.Visible for i in items.values], [True, False, False, False, False, False, True])
         self.assertTrue(field.EnableMultiplePageItems)
         self.assertFalse(pivot.ManualUpdate)
         self.assertEqual(_apply_nonnegative_leadtime_filters(workbook), set())
@@ -234,6 +243,89 @@ class WeeklyWorkbookValueTests(unittest.TestCase):
         sheet.Name = "LEADTIME NOT ACHIEVED"
         self.assertEqual(_apply_nonnegative_leadtime_filters(workbook), set())
         self.assertFalse(items.values[1].Visible)
+
+    def test_numeric_exclusions_are_captured_before_refresh(self) -> None:
+        snapshots = {("PIVOT PERFORMANCE", "Monthly"): LeadtimeFilterSelection(
+            frozenset(map(Decimal, (0, 1, 21))), frozenset(map(Decimal, (0, 21))), False)}
+        events = []
+        cache = SimpleNamespace(Refresh=lambda: events.append("cache"))
+        pivot = SimpleNamespace(CacheIndex=1, PivotCache=lambda: cache,
+            RefreshTable=lambda: events.append("pivot"))
+        class Pivots:
+            Count = 1
+            def __call__(self, _):
+                return pivot
+        workbook = SimpleNamespace(Worksheets=[SimpleNamespace(PivotTables=lambda: Pivots())])
+        def capture(_):
+            events.append("capture")
+            return snapshots
+        with patch("weekly.workbook._capture_leadtime_filters", side_effect=capture), \
+             patch("weekly.workbook._apply_nonnegative_leadtime_filters", return_value=set()) as apply, \
+             patch("weekly.workbook._reset_summary_adjustment_filters", return_value=set()), \
+             patch("weekly.workbook._order_week_items", return_value=set()), \
+             patch("weekly.workbook._apply_pivot_review", return_value=set()), \
+             patch("weekly.workbook._refresh_selected_pivots"):
+            _refresh_pivots(workbook, mobile=False, report_week=40, pivot_review=[])
+        self.assertEqual(events, ["capture", "cache", "pivot"])
+        apply.assert_called_once_with(workbook, snapshots)
+
+    def test_same_numeric_value_can_be_excluded_in_one_pivot_only(self) -> None:
+        class Collection:
+            def __init__(self, values):
+                self.values = values
+                self.Count = len(values)
+            def __call__(self, number):
+                return self.values[number - 1]
+        def make_pivot(name, visible):
+            items = Collection([SimpleNamespace(Name="1", Visible=True, RecordCount=1),
+                                SimpleNamespace(Name="21", Visible=visible, RecordCount=3)])
+            field = SimpleNamespace(Orientation=3, PivotItems=lambda: items,
+                                    AllItemsVisible=False, IncludeNewItemsInFilter=False)
+            return SimpleNamespace(Name=name, ManualUpdate=False, PivotFields=lambda _: field), items
+        monthly, monthly_items = make_pivot("Monthly", False)
+        weekly, weekly_items = make_pivot("Weekly", True)
+        pivots = Collection([monthly, weekly])
+        sheet = SimpleNamespace(Name="PIVOT PERFORMANCE", PivotTables=lambda index=None: pivots if index is None else pivots(index))
+        workbook = SimpleNamespace(Worksheets=[sheet])
+        snapshot = _capture_leadtime_filters(workbook)
+        monthly_items(2).Visible = True
+        weekly_items(2).Visible = False
+        _apply_nonnegative_leadtime_filters(workbook, snapshot)
+        self.assertFalse(monthly_items(2).Visible)
+        self.assertTrue(weekly_items(2).Visible)
+
+    def test_new_numeric_items_follow_template_include_new_items_setting(self) -> None:
+        for include_new in (False, True):
+            selection = LeadtimeFilterSelection(
+                frozenset(map(Decimal, (0, 1, 21))), frozenset(map(Decimal, (0, 21))), include_new)
+            self.assertTrue(selection.accepts("1.0"))
+            self.assertFalse(selection.accepts(0))
+            self.assertFalse(selection.accepts(21))
+            self.assertEqual(selection.accepts(44), include_new)
+            for invalid in (None, "(blank)", -1, "NaN"):
+                self.assertFalse(selection.accepts(invalid))
+
+    def test_unfiltered_template_keeps_admitting_new_values_after_invalid_items_hidden(self) -> None:
+        class Collection:
+            def __init__(self, values):
+                self.values = values
+                self.Count = len(values)
+            def __call__(self, number):
+                return self.values[number - 1]
+        items = Collection([SimpleNamespace(Name="1", Visible=True, RecordCount=2),
+                            SimpleNamespace(Name="-1", Visible=True, RecordCount=1)])
+        field = SimpleNamespace(Orientation=3, AllItemsVisible=True, IncludeNewItemsInFilter=False,
+                                PivotItems=lambda: items)
+        pivot = SimpleNamespace(Name="All", ManualUpdate=False, PivotFields=lambda _: field)
+        pivots = Collection([pivot])
+        sheet = SimpleNamespace(Name="PIVOT PERFORMANCE",
+            PivotTables=lambda index=None: pivots if index is None else pivots(index))
+        workbook = SimpleNamespace(Worksheets=[sheet])
+        _apply_nonnegative_leadtime_filters(workbook)
+        self.assertTrue(field.IncludeNewItemsInFilter)
+        self.assertFalse(items(2).Visible)
+        field.AllItemsVisible = False
+        self.assertTrue(_capture_leadtime_filters(workbook)[("PIVOT PERFORMANCE", "All")].accepts(2))
 
     def test_helper_formula_extends_through_refreshed_grand_total(self) -> None:
         area = SimpleNamespace(Row=20, Rows=SimpleNamespace(Count=12),

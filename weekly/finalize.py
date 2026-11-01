@@ -24,7 +24,7 @@ from .refresh import ExistingSourceIndex, refresh_existing_record
 from .review import load_review_decisions
 from .rules import build_master_record, clean_text, is_unresolved_order_status, normalize_service_group
 from .rules import inclusive_networkdays
-from .selection import iter_bq_rows, select_new_source_rows
+from .selection import SOURCE_SELECTION_POLICY, iter_bq_rows, select_new_source_rows
 from .source_review import (
     SOURCE_REVIEW_COLUMNS,
     automatic_source_choice,
@@ -346,6 +346,9 @@ def finalize_weekly_data(
         "report_month": (report_month or report_date).strftime("%Y-%m"),
         "previous_master_rows": len(previous_rows),
         "selected_new_rows": len(selection.selected_rows),
+        "source_selection_policy": SOURCE_SELECTION_POLICY,
+        "historical_backfill_rows": selection.historical_backfill_rows,
+        "historical_backfill_by_fab_month": dict(sorted(selection.historical_backfill_by_fab_month.items())),
         "new_rows_without_fab_seconds": unverified_fab_seconds,
         "master_final_rows": len(master_rows),
         "mobile_rows": len(mobile_rows),

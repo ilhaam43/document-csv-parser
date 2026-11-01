@@ -6,6 +6,7 @@ import csv
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ from .constants import MASTER_SERVICE_GROUPS, SOURCE_COLUMNS
 from .dates import parse_datetime, same_reporting_month
 from .models import SourceSelectionResult, ValidationIssue
 from .rules import clean_text, normalize_identifier, normalize_service_group
+
+
+SOURCE_SELECTION_POLICY = "fab_or_current_lifecycle_v1"
 
 
 _SOURCE_COLUMN_ALIASES = {
@@ -50,9 +54,17 @@ def select_new_source_rows(
     report_date: date,
     report_month: date | None = None,
 ) -> SourceSelectionResult:
-    """Apply the reviewed quote-level, service, month, and cutoff filters."""
+    """Select current FAB rows and older orders with current reporting activity."""
     result = SourceSelectionResult()
     known_quotes = {normalize_identifier(value) for value in existing_quote_nums}
+    reporting_month = report_month or report_date
+    month_start = reporting_month.replace(day=1)
+
+    @lru_cache(maxsize=4096)
+    def activity_in_reporting_month(value: str) -> bool:
+        activity = parse_datetime(value)
+        return bool(activity and same_reporting_month(activity, reporting_month)
+                    and activity.date() <= report_date)
 
     for source_row_number, raw_row in enumerate(rows, start=2):
         row = dict(raw_row)
@@ -91,14 +103,34 @@ def select_new_source_rows(
         if fab_upload is None:
             result.rejected_reasons["missing_fab_upload"] += 1
             continue
-        if not same_reporting_month(fab_upload, report_month or report_date):
-            result.rejected_reasons["outside_reporting_month"] += 1
-            continue
+        historical = not same_reporting_month(fab_upload, reporting_month)
+        if historical:
+            # A late FAB value must not hide a real order's current-period
+            # CASH/completion. Quote-only rows and unrelated history stay out.
+            if fab_upload.date() >= month_start or not normalize_identifier(row.get("order_number")):
+                result.rejected_reasons["outside_reporting_month"] += 1
+                continue
+            try:
+                activities = tuple(activity_in_reporting_month(clean_text(row.get(field)))
+                                   for field in ("cash_date", "order_completion_date"))
+            except ValueError as exc:
+                result.rejected_reasons["invalid_backfill_activity"] += 1
+                result.issues.append(ValidationIssue(
+                    code="invalid_backfill_activity",
+                    message=f"Historical order has an invalid CASH/completion date: {exc}",
+                    row_number=source_row_number,
+                ))
+                continue
+            if not any(activities):
+                result.rejected_reasons["outside_reporting_month"] += 1
+                continue
         if fab_upload.date() > report_date:
             result.rejected_reasons["after_report_cutoff"] += 1
             continue
 
         row["service_group"] = service_group
         result.selected_rows.append(row)
+        if historical:
+            result.historical_backfill_by_fab_month[fab_upload.strftime("%Y-%m")] += 1
 
     return result

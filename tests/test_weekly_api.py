@@ -206,6 +206,49 @@ class WeeklyApiTests(unittest.TestCase):
             with zipfile.ZipFile(io.BytesIO(self.client.get(f"/api/weekly/jobs/{job_id}/download").content)) as archive:
                 self.assertEqual(set(archive.namelist()), set(status["output_files"]))
 
+    def test_web_backfills_current_activity_without_new_upload_or_review(self) -> None:
+        source = {
+            "quote_num": "LATE", "order_number": "LATE-ORDER", "order_status": "Complete",
+            "service_group": "Mobile", "FAB_Upload": "2026-08-31 16:15:04",
+            "cash_date": "2026-09-02", "order_completion_date": "2026-09-03",
+            "otc": "100", "mrc": "50",
+        }
+
+        def workbook(**kwargs):
+            rows = list(iter_master_csv(kwargs["data_csv"]))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["quote_num"], "LATE")
+            self.assertEqual(rows[0]["Month of FAB Upload"], "August-26")
+            kwargs["output_workbook"].write_bytes(b"native-writer-tested-separately")
+
+        with patch.object(weekly_api.JOB_EXECUTOR, "submit"):
+            job_id = self._start().json()["job_id"]
+            with (
+                patch("weekly.prepare.iter_master_rows", side_effect=lambda _: iter([])),
+                patch("weekly.prepare.iter_bq_rows", side_effect=lambda _: iter([source])),
+                patch("weekly.prepare.load_holidays", return_value=set()),
+            ):
+                weekly_api._run_prepare(job_id)
+            prepared = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+            self.assertEqual(prepared["preparation_audit"]["historical_backfill_rows"], 1)
+            self.assertEqual(prepared["preparation_audit"]["pending_catalyst_rows"], 0)
+            response = self.client.post(f"/api/weekly/jobs/{job_id}/finalize",
+                                        data={"reviewed_statuses": "{}"})
+            self.assertEqual(response.status_code, 202, response.text)
+            with (
+                patch("weekly.finalize.iter_master_rows", side_effect=lambda _: iter([])),
+                patch("weekly.finalize.iter_bq_rows", side_effect=lambda _: iter([source])),
+                patch("weekly.finalize.load_holidays", return_value=set()),
+                patch.object(weekly_api, "write_weekly_workbook", side_effect=workbook),
+            ):
+                weekly_api._run_finalize(job_id, "catalyst-review-inline.csv", None, None)
+            finished = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+            self.assertEqual(finished["status"], "succeeded", finished.get("error"))
+            self.assertEqual(finished["final_audit"]["historical_backfill_rows"], 1)
+            self.assertEqual(finished["final_audit"]["historical_backfill_by_fab_month"], {"2026-08": 1})
+            with zipfile.ZipFile(io.BytesIO(self.client.get(f"/api/weekly/jobs/{job_id}/download").content)) as archive:
+                self.assertTrue(all(Path(name).suffix in {".xlsx", ".pptx"} for name in archive.namelist()))
+
     def test_prepare_review_finalize_and_download(self) -> None:
         with patch.object(weekly_api.JOB_EXECUTOR, "submit") as submit:
             response = self._start()

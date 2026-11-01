@@ -57,6 +57,11 @@ class SourceSelectionResult:
     selected_rows: list[dict[str, Any]] = field(default_factory=list)
     rejected_reasons: Counter[str] = field(default_factory=Counter)
     issues: list[ValidationIssue] = field(default_factory=list)
+    historical_backfill_by_fab_month: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def historical_backfill_rows(self) -> int:
+        return sum(self.historical_backfill_by_fab_month.values())
 
 
 @dataclass(frozen=True)
