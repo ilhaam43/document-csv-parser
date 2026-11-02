@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import date
 from openpyxl.utils import get_column_letter
 
@@ -18,6 +19,10 @@ from completion_threshold_rules import (
 
 
 EXCEL_MAX_ROW = 1_048_576
+DAILY_TABLE_BODY_ALIGNMENTS = {
+    header: (-4108, -4108)
+    for header in ('RFS Commmit', 'Aging Of RFS', 'STATUS ORDER', 'Survey Date')
+}
 PERCENTAGE_COMPLETION_HEADER = "Percentage of Completion (SO Complete, Cancel & Change Target)"
 COMPLETION_SECTION_MARKERS = (
     "target complete",
@@ -34,6 +39,158 @@ COMPLETION_SECTION_MARKERS = (
 
 def normalize_layout_text(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _alignment_key(value: object) -> str:
+    return ' '.join(str(value).replace('\ufeff', '').split()).casefold()
+
+
+@dataclass(frozen=True)
+class PivotAlignmentModel:
+    headers: dict[str, tuple[int, int]]
+    header_default: tuple[int, int]
+    data_columns: dict[tuple, tuple[int, int]]
+    data_defaults: dict[tuple, tuple[int, int]]
+    empty_header_positions: dict[int, tuple[int, int]] = field(default_factory=dict)
+
+
+def pivot_data_column_key(cell) -> tuple:
+    pivot_cell = cell.PivotCell
+    field = pivot_cell.DataField
+    source = (_alignment_key(field.SourceName), int(field.Function))
+    items = pivot_cell.ColumnItems
+    return (*source, tuple(
+        (_alignment_key(items(i).Parent.SourceName), str(items(i).Name))
+        for i in range(1, int(items.Count) + 1)
+    ))
+
+
+def _cell_alignment(cell) -> tuple[int, int]:
+    return int(cell.HorizontalAlignment), int(cell.VerticalAlignment)
+
+
+def _data_column_key_or_none(cell) -> tuple | None:
+    try:
+        return pivot_data_column_key(cell)
+    except Exception:
+        # Excel exposes a blank total cell without DataField on a zero-record pivot.
+        if cell.Value2 not in (None, ''):
+            raise
+        return None
+
+
+def capture_pivot_alignments(worksheet) -> dict[str, PivotAlignmentModel]:
+    models = {}
+    for pivot in worksheet.PivotTables():
+        body = pivot.DataBodyRange
+        fields = list(getattr(pivot, 'DataFields', ())) if body is None else []
+        if body is None and not fields:
+            continue
+        region = pivot.TableRange1
+        bottom = int(region.Row + region.Rows.Count - 1) if body is None else 0
+        header_end = int(body.Row) if body is not None else max(int(region.Row) + 1, bottom)
+        headers = {}
+        for row in range(int(region.Row), header_end):
+            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
+                cell = worksheet.Cells(row, column)
+                if isinstance(cell.Value2, str) and cell.Value2:
+                    headers[_alignment_key(cell.Value2)] = _cell_alignment(cell)
+        header_column = int(body.Column) if body is not None else int(region.Column + region.Columns.Count - 1)
+        leaf_header = worksheet.Cells(header_end - 1, header_column)
+        data_columns, data_defaults = {}, {}
+        if body is None:
+            # A zero-record template still has a styled numeric total cell.
+            alignment = _cell_alignment(worksheet.Cells(bottom, header_column))
+            for field in fields:
+                data_defaults[(_alignment_key(field.SourceName), int(field.Function))] = alignment
+        else:
+            empty_alignments = set()
+            for column in range(1, int(body.Columns.Count) + 1):
+                cell = body.Cells(1, column)
+                key = _data_column_key_or_none(cell)
+                alignment = _cell_alignment(cell)
+                if key is None:
+                    empty_alignments.add(alignment)
+                else:
+                    data_columns[key] = alignment
+                    data_defaults.setdefault(key[:2], alignment)
+            if len(empty_alignments) == 1:
+                for field in pivot.DataFields:
+                    data_defaults.setdefault((_alignment_key(field.SourceName), int(field.Function)), next(iter(empty_alignments)))
+        positions = {}
+        if not data_columns:
+            right = int(region.Column + region.Columns.Count - 1)
+            positions = {column - int(region.Column): _cell_alignment(worksheet.Cells(header_end - 1, column))
+                         for column in range(int(region.Column), right + 1)}
+        models[str(pivot.Name)] = PivotAlignmentModel(
+            headers, _cell_alignment(leaf_header), data_columns, data_defaults, positions,
+        )
+    return models
+
+
+def restore_pivot_alignments(
+    worksheet, models: dict[str, PivotAlignmentModel], *,
+    preserve_new_header_horizontal: bool = False, native_row_headers: Iterable[str] = (),
+) -> None:
+    """Restore reference alignment without assuming fixed phase columns or row positions."""
+    for pivot in worksheet.PivotTables():
+        model = models.get(str(pivot.Name))
+        if model is None:
+            continue
+        body = pivot.DataBodyRange
+        region = pivot.TableRange1
+        row_header = pivot.RowRange if str(pivot.Name) in native_row_headers else None
+        header_end = int(body.Row) if body is not None else max(
+            int(region.Row) + 1, int(region.Row + region.Rows.Count - 1),
+        )
+        for row in range(int(region.Row), header_end):
+            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
+                cell = worksheet.Cells(row, column)
+                if isinstance(cell.Value2, str) and cell.Value2:
+                    if row_header is not None and row == int(row_header.Row) and int(row_header.Column) <= column < int(row_header.Column + row_header.Columns.Count):
+                        continue
+                    alignment = model.headers.get(_alignment_key(cell.Value2))
+                    if alignment is None and model.empty_header_positions:
+                        alignment = model.empty_header_positions.get(column - int(region.Column))
+                        if alignment is None:
+                            defaults = set(model.data_defaults.values())
+                            # New category columns inherit the measure style, not blank cells outside the old pivot.
+                            alignment = next(iter(defaults)) if len(defaults) == 1 else None
+                    if alignment is None and preserve_new_header_horizontal:
+                        alignment = (int(cell.HorizontalAlignment), model.header_default[1])
+                    cell.HorizontalAlignment, cell.VerticalAlignment = alignment or model.header_default
+        if body is not None:
+            for column in range(1, int(body.Columns.Count) + 1):
+                key = _data_column_key_or_none(body.Cells(1, column))
+                if key is None:
+                    defaults = set(model.data_defaults.values())
+                    alignment = next(iter(defaults)) if len(defaults) == 1 else None
+                else:
+                    alignment = model.data_columns.get(key, model.data_defaults.get(key[:2]))
+                if alignment is not None:
+                    target = body.Columns(column)
+                    target.HorizontalAlignment, target.VerticalAlignment = alignment
+
+
+def align_table_body_columns(worksheet, alignments: dict[str, tuple[int, int]] | None = None) -> int:
+    """Apply explicit column presentation rules only within the populated Excel table."""
+    if not worksheet.ListObjects.Count:
+        return 0
+    table = worksheet.ListObjects(1)
+    body = table.DataBodyRange
+    if body is None:
+        return 0
+    rules = {normalize_layout_text(header): alignment
+             for header, alignment in (DAILY_TABLE_BODY_ALIGNMENTS if alignments is None else alignments).items()}
+    headers = table.HeaderRowRange.Value2[0]
+    changed = 0
+    for column, header in enumerate(headers, 1):
+        alignment = rules.get(normalize_layout_text(header))
+        if alignment is not None:
+            target = body.Columns(column)
+            target.HorizontalAlignment, target.VerticalAlignment = alignment
+            changed += 1
+    return changed
 
 
 def pivot_row_identity(cell) -> tuple[tuple[str, str], ...]:
@@ -96,6 +253,39 @@ def completion_summary_pivot(pivot_sheet, phase_pivot):
     if not candidates:
         raise RuntimeError(f"PivotTable '{phase_pivot.Name}' has no adjacent quote-count summary.")
     return min(candidates, key=lambda candidate: abs(int(candidate.RowRange.Row) - int(phase_pivot.RowRange.Row)))
+
+
+def align_pivot_row_order(summary_pivot, phase_pivot) -> int:
+    """Keep paired row categories in the summary's order without changing filters."""
+    sources = {normalize_layout_text(field.SourceName): field for field in summary_pivot.RowFields}
+
+    def visible_items(field):
+        return sorted(
+            (item for item in field.PivotItems() if item.Visible and int(item.Position) > 0),
+            key=lambda item: int(item.Position),
+        )
+
+    changed = 0
+    for field in phase_pivot.RowFields:
+        source = sources.get(normalize_layout_text(field.SourceName))
+        if source is None:
+            continue
+        items = visible_items(field)
+        by_name = {str(item.Name): item for item in items}
+        names = [str(item.Name) for item in visible_items(source) if str(item.Name) in by_name]
+        known = set(names)
+        names.extend(str(item.Name) for item in items if str(item.Name) not in known)
+        if names == [str(item.Name) for item in items]:
+            continue
+        field.AutoSort(-4135, str(field.Name))  # xlManual; do not re-sort on the next refresh.
+        for position, name in enumerate(names, 1):
+            by_name[name].Position = position
+        if [str(item.Name) for item in visible_items(field)] != names:
+            raise RuntimeError(f"Could not align row order for PivotTable '{phase_pivot.Name}', field '{field.Name}'.")
+        changed += 1
+    if changed:
+        phase_pivot.Update()
+    return changed
 
 
 def completion_legend_values(

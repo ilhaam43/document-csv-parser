@@ -26,6 +26,9 @@ from excel_pivot_filters import (
 )
 from excel_pivot_layout import (
     align_completion_threshold_legends,
+    align_pivot_row_order,
+    align_table_body_columns,
+    capture_pivot_alignments,
     completion_denominator_references,
     completion_percentage_formula,
     completion_percentage_headers,
@@ -33,6 +36,7 @@ from excel_pivot_layout import (
     percentage_block_end_row,
     pivot_row_identity,
     restore_dashboard_pivot_presentation,
+    restore_pivot_alignments,
     resize_dynamic_pivot_section_banners,
     update_dynamic_pivot_section_titles,
 )
@@ -1217,6 +1221,8 @@ def repair_percentage_completion_columns(
 
     for pivot_name in ('PivotTable3', 'PivotTable4', 'PivotTable6'):
         pivot_table = pivot_sheet.PivotTables(pivot_name)
+        summary = completion_summary_pivot(pivot_sheet, pivot_table)
+        align_pivot_row_order(summary, pivot_table)
         body = pivot_table.DataBodyRange
         if body is None:
             continue
@@ -1229,7 +1235,6 @@ def repair_percentage_completion_columns(
         formula_col = table_end_col + 1
         data_row_start = int(body.Row)
         data_row_end = int(body.Row + body.Rows.Count - 1)
-        summary = completion_summary_pivot(pivot_sheet, pivot_table)
         denominators = completion_denominator_references(summary)
 
         pivot_sheet.Cells(header_row, formula_col).Value = PERCENTAGE_COMPLETION_HEADER
@@ -1324,6 +1329,7 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         if source_all_order is None or target_all_order is None or target_iphone is None or target_pivot_sheet is None:
             raise ValueError("Input/reference workbook must contain ALL ORDER and ALL ORDER IPHONE sheets.")
         normalize_iphone_completion_pivot_names(target_wb)
+        pivot_alignment_models = capture_pivot_alignments(target_pivot_sheet)
         pivot_column_widths = capture_column_widths(target_pivot_sheet, int(target_pivot_sheet.UsedRange.Columns.Count))
         template_top_height = pivot_group_max_height(
             target_pivot_sheet,
@@ -1439,6 +1445,9 @@ def generate_iphone_tracking(input_workbook: Path, reference_workbook: Path, out
         apply_dated_phase_width_adjustments(target_all_order, target_all_order_widths, target_all_order_captions)
         apply_dated_phase_width_adjustments(target_iphone, target_iphone_widths, target_iphone_captions)
         profile_log("restore column widths", phase_start)
+        restore_pivot_alignments(target_pivot_sheet, pivot_alignment_models)
+        align_table_body_columns(target_all_order)
+        align_table_body_columns(target_iphone)
 
         if pct_format_sheet is not None:
             try:

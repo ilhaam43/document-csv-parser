@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import subprocess
 import sys
@@ -40,6 +41,37 @@ class StageProcessResult:
     stderr: str
     elapsed_seconds: float
     metadata: dict[str, object] | None = None
+
+
+def optimize_xlsx_archive(path: Path) -> tuple[int, int]:
+    """Losslessly recompress the package; retain every part and independent cache."""
+    original_size = path.stat().st_size
+    # Report staging directories already consume much of Windows' path limit.
+    temporary = path.with_name(f".zip-{uuid.uuid4().hex}.xlsx")
+    try:
+        with zipfile.ZipFile(path) as source:
+            members = source.infolist()
+            if len({member.filename for member in members}) != len(members):
+                raise ValueError("Workbook contains duplicate package parts.")
+            if not REQUIRED_XLSX_MEMBERS.issubset(source.namelist()):
+                raise ValueError("Workbook is missing required package parts.")
+            expected = [(member.filename, member.CRC, member.file_size) for member in members]
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+                target.comment = source.comment
+                for member in members:
+                    target.writestr(copy.copy(member), source.read(member),
+                                    compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+        with zipfile.ZipFile(temporary) as result:
+            actual = [(member.filename, member.CRC, member.file_size) for member in result.infolist()]
+            if actual != expected or result.testzip() is not None:
+                raise RuntimeError("Workbook package changed during compression.")
+        compressed_size = temporary.stat().st_size
+        if compressed_size < original_size:
+            temporary.replace(path)
+            return original_size, compressed_size
+        return original_size, original_size
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def wait_for_xlsx(path: Path, timeout_seconds: int = FILE_READY_TIMEOUT_SECONDS) -> Path:
@@ -394,6 +426,9 @@ def main(argv: list[str] | None = None) -> int:
             _run_iphone(args)
         else:
             _run_ide(args)
+        if args.stage in {"daily", "ongoing", "iphone"}:
+            before, after = optimize_xlsx_archive(args.output)
+            print(f"[info] Workbook storage: {before / 1_000_000:.1f} MB -> {after / 1_000_000:.1f} MB")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

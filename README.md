@@ -301,6 +301,28 @@ missing category matches remain errors. Old standalone percentage blocks are
 cleared before refresh so moved or shrunken tables do not retain stale formulas.
 The final presentation pass restores template column widths and reveals pivot
 result rows without exposing intentionally hidden page-filter rows.
+All three Pipeline reports restore PIVOT header and numeric alignment from the
+reference after refresh, matching captions and data fields instead of fixed cell
+addresses. Empty template pivots retain their numeric alignment when they gain
+data. General/right-aligned totals and left-aligned names are not forced to the
+center. The bounded ALL ORDER table bodies center RFS Commit, RFS aging, STATUS
+ORDER and Survey Date; On Going retains General alignment for its rebuilt
+Pre-Installation Start Date and centers the aging/range columns. The alignment
+pass retains cell values, date/number formats, filters and aggregation.
+New Daily/On Going category headers retain native horizontal alignment and the
+reference vertical alignment. iPhone category headers inherit the reference
+header style. Categories expanding a previously empty pivot inherit its measure
+style. The Daily Non New Registration compact row label retains native alignment,
+as do row labels on pivots that must be rebuilt.
+Daily and iPhone completion phase tables follow their adjacent summary's row-item
+order, including division and department groups. Hidden categories stay hidden;
+new categories retain their relative order after known categories. Percentages
+are then rebuilt by category identity, not row number.
+Pipeline workers losslessly recompress the generated XLSX package before
+publication. Every XML part, image and independent PivotCache is retained; the
+compression pass checks package CRCs and sizes and only replaces the workbook
+when the result is smaller. It does not merge caches, disable saved pivot data or
+require a refresh on opening. IDE and Weekly output packaging is unchanged.
 Failed Excel rule updates or completion formula errors still fail the job rather
 than publishing a workbook with unchecked thresholds or broken percentages.
 Successful generation and presentation checks do not establish data parity with

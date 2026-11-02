@@ -27,6 +27,9 @@ from excel_pivot_filters import (
 )
 from excel_pivot_layout import (
     align_completion_threshold_legends,
+    align_pivot_row_order,
+    align_table_body_columns,
+    capture_pivot_alignments,
     completion_denominator_references,
     completion_percentage_formula,
     completion_percentage_headers,
@@ -35,6 +38,7 @@ from excel_pivot_layout import (
     percentage_format_row_spans,
     pivot_row_identity,
     restore_dashboard_pivot_presentation,
+    restore_pivot_alignments,
     update_dynamic_pivot_section_titles,
 )
 from openpyxl.styles import Font, PatternFill
@@ -97,6 +101,8 @@ REPORT_ONE_PIVOT_TARGET_FILTERS = {
     "PivotTable11": "after",
     "PivotTable12": "not_yet",
 }
+# The Non New Registration phase table keeps its native compact-row label alignment.
+REPORT_ONE_NATIVE_ROW_HEADER_PIVOTS = {"PivotTable17"}
 REPORT_ONE_ACTIVE_PHASES = PIVOT_PHASE_ORDER[:-2]
 FAB_UPLOAD_HEADER = "FAB Upload"
 YEAR_FAB_UPLOAD_HEADER = "YEAR FAB UPLOAD"
@@ -3021,6 +3027,8 @@ def update_template_workbook_via_com(
             if format_key not in completion_pivot_names:
                 return
 
+            summary = completion_summary_pivot(pivot_sheet, pivot_table)
+            align_pivot_row_order(summary, pivot_table)
             body = pivot_table.DataBodyRange
             if body is None:
                 return
@@ -3029,7 +3037,6 @@ def update_template_workbook_via_com(
             data_row_end = data_row_start + int(body.Rows.Count) - 1
             cancel_col = _pivot_header_column(pivot_table, header_row, "Cancel")
             so_col = _pivot_header_column(pivot_table, header_row, "SO Complete")
-            summary = completion_summary_pivot(pivot_sheet, pivot_table)
             denominators = completion_denominator_references(summary)
 
             def _apply_percentage_presentation(format_source) -> None:
@@ -3115,6 +3122,7 @@ def update_template_workbook_via_com(
             column: float(pivot_sheet.Columns(column).ColumnWidth)
             for column in range(1, int(pivot_sheet.UsedRange.Column + pivot_sheet.UsedRange.Columns.Count))
         }
+        pivot_alignment_models = capture_pivot_alignments(pivot_sheet)
         for pivot in pivot_sheet.PivotTables():
             pivot.PreserveFormatting = True
             pivot.HasAutoFormat = False
@@ -3405,6 +3413,7 @@ def update_template_workbook_via_com(
             return changed
 
         refreshed_count = 0
+        rebuilt_pivot_names = set()
         pivot_tables = pivot_sheet.PivotTables()
         for pivot_index in range(1, pivot_tables.Count + 1):
             pivot_table = pivot_tables(pivot_index)
@@ -3454,6 +3463,7 @@ def update_template_workbook_via_com(
                                 TableName="PivotTable17_Rebuilt",
                             )
 
+                        rebuilt_pivot_names.add(str(pivot_table.Name))
                         pivot_table.ManualUpdate = True
                         try:
                             pivot_table.CompactLayoutRowHeader = "Div./Dept."
@@ -3621,6 +3631,10 @@ def update_template_workbook_via_com(
         _apply_sheet_header_model(data_sheet, template_header_model, column_count)
         _delete_sheet_header_model(template_header_model)
         _profile("restore ALL ORDER header model")
+
+        restore_pivot_alignments(pivot_sheet, pivot_alignment_models, preserve_new_header_horizontal=True,
+                                 native_row_headers=rebuilt_pivot_names | REPORT_ONE_NATIVE_ROW_HEADER_PIVOTS)
+        align_table_body_columns(data_sheet)
 
         target_wb.Save()
         _profile("save workbook")

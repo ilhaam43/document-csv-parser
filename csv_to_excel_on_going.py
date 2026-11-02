@@ -22,7 +22,14 @@ from excel_pivot_filters import (
     set_pivot_item_order,
     set_visible_items_exact,
 )
-from excel_pivot_layout import align_completion_threshold_legends, resize_dynamic_pivot_section_banners
+from excel_pivot_layout import (
+    DAILY_TABLE_BODY_ALIGNMENTS,
+    align_completion_threshold_legends,
+    align_table_body_columns,
+    capture_pivot_alignments,
+    resize_dynamic_pivot_section_banners,
+    restore_pivot_alignments,
+)
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -2909,6 +2916,8 @@ def apply_logic_to_workbook_com(
         phase_start = time.perf_counter()
         wb = xl.Workbooks.Open(str(output_path.resolve()))
         profile_log("open target workbook", phase_start)
+        presentation_sheet = next((sheet for sheet in wb.Worksheets if sheet.Name == PIVOT_SHEET_NAME), None)
+        pivot_alignment_models = capture_pivot_alignments(presentation_sheet) if presentation_sheet is not None else {}
         if (clone_pivot_template or template_workbook_path is not None) and base_workbook_path.resolve() != tracking_workbook_path.resolve():
             phase_start = time.perf_counter()
             source_wb = xl.Workbooks.Open(str(tracking_workbook_path.resolve()))
@@ -3269,6 +3278,15 @@ def apply_logic_to_workbook_com(
                 write_pre_installation_range_payload(payload_lookup)
                 profile_log("restore display aging range", phase_start)
         phase_start = time.perf_counter()
+        if pivot_alignment_models:
+            restore_pivot_alignments(wb.Worksheets(PIVOT_SHEET_NAME), pivot_alignment_models,
+                                     preserve_new_header_horizontal=True)
+        align_table_body_columns(ws, {
+            **DAILY_TABLE_BODY_ALIGNMENTS,
+            PRE_INSTALLATION_START_DATE_HEADER: (1, -4107),
+            PRE_INSTALLATION_AGING_HEADER: (-4108, -4108),
+            RANGE_AGING_PRE_INSTALLATION_HEADER: (-4108, -4108),
+        })
         wb.Save()
         profile_log("save workbook", phase_start)
         profile_log("total com processing", total_start)

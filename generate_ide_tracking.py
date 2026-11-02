@@ -29,10 +29,14 @@ from completion_threshold_rules import (
 )
 from excel_pivot_layout import (
     EXCEL_MAX_ROW,
+    PivotAlignmentModel,
     apply_completion_icon_thresholds,
+    capture_pivot_alignments,
     completion_mode_for_row,
     completion_section_modes,
     normalize_layout_text,
+    pivot_data_column_key,
+    restore_pivot_alignments,
     resize_dynamic_pivot_section_banners,
 )
 from excel_pivot_filters import configure_pivot_cache_for_current_source
@@ -240,14 +244,6 @@ class DeliveryPivotPageFilter:
     selected_items: tuple[str, ...]
     show_all: bool
     is_page_field: bool = True
-
-
-@dataclass(frozen=True)
-class PivotAlignmentModel:
-    headers: dict[str, tuple[int, int]]
-    header_default: tuple[int, int]
-    data_columns: dict[tuple, tuple[int, int]]
-    data_defaults: dict[tuple, tuple[int, int]]
 
 
 def is_missing(value: object) -> bool:
@@ -2217,69 +2213,6 @@ def preserve_pivot_refresh_layout(worksheet) -> None:
         pivot = pivots(index)
         pivot.PreserveFormatting = True
         pivot.HasAutoFormat = False
-
-
-def pivot_data_column_key(cell) -> tuple:
-    pivot_cell = cell.PivotCell
-    field = pivot_cell.DataField
-    source = (normalize_header(field.SourceName).casefold(), int(field.Function))
-    items = pivot_cell.ColumnItems
-    return (*source, tuple(
-        (normalize_header(items(i).Parent.SourceName).casefold(), str(items(i).Name))
-        for i in range(1, int(items.Count) + 1)
-    ))
-
-
-def capture_pivot_alignments(worksheet) -> dict[str, PivotAlignmentModel]:
-    models = {}
-    for pivot in worksheet.PivotTables():
-        body = pivot.DataBodyRange
-        if body is None:
-            continue
-        region = pivot.TableRange1
-        headers = {}
-        for row in range(int(region.Row), int(body.Row)):
-            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
-                cell = worksheet.Cells(row, column)
-                if isinstance(cell.Value2, str) and cell.Value2:
-                    headers[normalize_header(cell.Value2).casefold()] = (
-                        int(cell.HorizontalAlignment), int(cell.VerticalAlignment),
-                    )
-        leaf_header = worksheet.Cells(int(body.Row) - 1, int(body.Column))
-        data_columns, data_defaults = {}, {}
-        for column in range(1, int(body.Columns.Count) + 1):
-            cell = body.Cells(1, column)
-            key = pivot_data_column_key(cell)
-            alignment = (int(cell.HorizontalAlignment), int(cell.VerticalAlignment))
-            data_columns[key] = alignment
-            data_defaults.setdefault(key[:2], alignment)
-        models[str(pivot.Name)] = PivotAlignmentModel(
-            headers, (int(leaf_header.HorizontalAlignment), int(leaf_header.VerticalAlignment)),
-            data_columns, data_defaults,
-        )
-    return models
-
-
-def restore_pivot_alignments(worksheet, models: dict[str, PivotAlignmentModel]) -> None:
-    """Restore template alignment by caption/field after Excel replaces cache items."""
-    for pivot in worksheet.PivotTables():
-        model = models.get(str(pivot.Name))
-        body = pivot.DataBodyRange
-        if model is None or body is None:
-            continue
-        region = pivot.TableRange1
-        for row in range(int(region.Row), int(body.Row)):
-            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
-                cell = worksheet.Cells(row, column)
-                if isinstance(cell.Value2, str) and cell.Value2:
-                    alignment = model.headers.get(normalize_header(cell.Value2).casefold(), model.header_default)
-                    cell.HorizontalAlignment, cell.VerticalAlignment = alignment
-        for column in range(1, int(body.Columns.Count) + 1):
-            key = pivot_data_column_key(body.Cells(1, column))
-            alignment = model.data_columns.get(key, model.data_defaults.get(key[:2]))
-            if alignment is not None:
-                region = body.Columns(column)
-                region.HorizontalAlignment, region.VerticalAlignment = alignment
 
 
 def separate_delivery_pivot_sections(worksheet, *, minimum_gap: int = 2) -> int:
