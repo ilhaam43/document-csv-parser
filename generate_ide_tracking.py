@@ -28,6 +28,7 @@ from completion_threshold_rules import (
     completion_thresholds_for,
 )
 from excel_pivot_layout import (
+    EXCEL_MAX_ROW,
     apply_completion_icon_thresholds,
     completion_mode_for_row,
     completion_section_modes,
@@ -239,6 +240,14 @@ class DeliveryPivotPageFilter:
     selected_items: tuple[str, ...]
     show_all: bool
     is_page_field: bool = True
+
+
+@dataclass(frozen=True)
+class PivotAlignmentModel:
+    headers: dict[str, tuple[int, int]]
+    header_default: tuple[int, int]
+    data_columns: dict[tuple, tuple[int, int]]
+    data_defaults: dict[tuple, tuple[int, int]]
 
 
 def is_missing(value: object) -> bool:
@@ -2210,6 +2219,106 @@ def preserve_pivot_refresh_layout(worksheet) -> None:
         pivot.HasAutoFormat = False
 
 
+def pivot_data_column_key(cell) -> tuple:
+    pivot_cell = cell.PivotCell
+    field = pivot_cell.DataField
+    source = (normalize_header(field.SourceName).casefold(), int(field.Function))
+    items = pivot_cell.ColumnItems
+    return (*source, tuple(
+        (normalize_header(items(i).Parent.SourceName).casefold(), str(items(i).Name))
+        for i in range(1, int(items.Count) + 1)
+    ))
+
+
+def capture_pivot_alignments(worksheet) -> dict[str, PivotAlignmentModel]:
+    models = {}
+    for pivot in worksheet.PivotTables():
+        body = pivot.DataBodyRange
+        if body is None:
+            continue
+        region = pivot.TableRange1
+        headers = {}
+        for row in range(int(region.Row), int(body.Row)):
+            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
+                cell = worksheet.Cells(row, column)
+                if isinstance(cell.Value2, str) and cell.Value2:
+                    headers[normalize_header(cell.Value2).casefold()] = (
+                        int(cell.HorizontalAlignment), int(cell.VerticalAlignment),
+                    )
+        leaf_header = worksheet.Cells(int(body.Row) - 1, int(body.Column))
+        data_columns, data_defaults = {}, {}
+        for column in range(1, int(body.Columns.Count) + 1):
+            cell = body.Cells(1, column)
+            key = pivot_data_column_key(cell)
+            alignment = (int(cell.HorizontalAlignment), int(cell.VerticalAlignment))
+            data_columns[key] = alignment
+            data_defaults.setdefault(key[:2], alignment)
+        models[str(pivot.Name)] = PivotAlignmentModel(
+            headers, (int(leaf_header.HorizontalAlignment), int(leaf_header.VerticalAlignment)),
+            data_columns, data_defaults,
+        )
+    return models
+
+
+def restore_pivot_alignments(worksheet, models: dict[str, PivotAlignmentModel]) -> None:
+    """Restore template alignment by caption/field after Excel replaces cache items."""
+    for pivot in worksheet.PivotTables():
+        model = models.get(str(pivot.Name))
+        body = pivot.DataBodyRange
+        if model is None or body is None:
+            continue
+        region = pivot.TableRange1
+        for row in range(int(region.Row), int(body.Row)):
+            for column in range(int(region.Column), int(region.Column + region.Columns.Count)):
+                cell = worksheet.Cells(row, column)
+                if isinstance(cell.Value2, str) and cell.Value2:
+                    alignment = model.headers.get(normalize_header(cell.Value2).casefold(), model.header_default)
+                    cell.HorizontalAlignment, cell.VerticalAlignment = alignment
+        for column in range(1, int(body.Columns.Count) + 1):
+            key = pivot_data_column_key(body.Cells(1, column))
+            alignment = model.data_columns.get(key, model.data_defaults.get(key[:2]))
+            if alignment is not None:
+                region = body.Columns(column)
+                region.HorizontalAlignment, region.VerticalAlignment = alignment
+
+
+def separate_delivery_pivot_sections(worksheet, *, minimum_gap: int = 2) -> int:
+    """Keep independent Aging and OTD sections apart without moving paired pivots."""
+    used = worksheet.UsedRange
+    titles = []
+    for row, values in enumerate(used.Value2, int(used.Row)):
+        for column, value in enumerate(values, int(used.Column)):
+            key = normalize_layout_text(value)
+            if any(key.startswith(normalize_layout_text(marker)) for marker in PIVOT_SECTION_TITLE_MARKERS):
+                titles.append((row, column, key))
+    aging = next((t for t in titles if t[2].startswith('orderagingstartfrompreinstallationstatus')), None)
+    delivery = next((t for t in titles if t[2].startswith('ontimedelivery')), None)
+    if aging is None or delivery is None or aging[0] != delivery[0]:
+        return 0
+    next_row = min((row for row, _, _ in titles if row > aging[0]), default=EXCEL_MAX_ROW)
+    regions = [pivot.TableRange2 for pivot in worksheet.PivotTables()
+               if aging[0] < int(pivot.TableRange2.Row) < next_row]
+    left = [region for region in regions if int(region.Column) < delivery[1]]
+    right = [region for region in regions if int(region.Column) >= delivery[1]]
+    if not left or not right:
+        return 0
+    left_end = max(int(region.Column + region.Columns.Count - 1) for region in left)
+    right_start = min(int(region.Column) for region in right)
+    shift = max(0, left_end + minimum_gap + 1 - right_start)
+    if shift == 0:
+        return 0
+    bottom = max(int(region.Row + region.Rows.Count - 1) for region in right)
+    end_column = max(int(region.Column + region.Columns.Count - 1) for region in right)
+    extension = worksheet.Range(worksheet.Cells(delivery[0], end_column + 1),
+                                worksheet.Cells(bottom, end_column + shift))
+    if worksheet.Application.WorksheetFunction.CountA(extension):
+        raise RuntimeError('Cannot separate Aging and OTD pivots: destination contains other content.')
+    block = worksheet.Range(worksheet.Cells(delivery[0], delivery[1]), worksheet.Cells(bottom, end_column))
+    block.Cut(Destination=worksheet.Cells(delivery[0], delivery[1] + shift))
+    worksheet.Application.CutCopyMode = False
+    return shift
+
+
 def adjust_pivot_column_widths(worksheet) -> None:
     pivot_columns: set[int] = set()
     pivot_tables = worksheet.PivotTables()
@@ -2576,6 +2685,7 @@ def update_workbook_via_com(
             raise RuntimeError("Previous workbook must contain ALL ORDER and PIVOT sheets.")
         target_filter_states = capture_target_pivot_filters(pivot_sheet)
         delivery_filter_states = capture_delivery_pivot_filters(pivot_sheet)
+        alignment_models = capture_pivot_alignments(pivot_sheet)
         if not target_filter_states:
             raise RuntimeError("Previous workbook has no target PivotTable page filters.")
         preserve_pivot_refresh_layout(pivot_sheet)
@@ -2760,6 +2870,7 @@ def update_workbook_via_com(
             percentage_blocks,
         )
         update_pivot_period_titles(pivot_sheet, report_date)
+        separate_delivery_pivot_sections(pivot_sheet)
         resize_dynamic_pivot_section_banners(
             pivot_sheet,
             title_markers=PIVOT_SECTION_TITLE_MARKERS,
@@ -2767,6 +2878,7 @@ def update_workbook_via_com(
         )
         normalize_pivot_section_row_visibility(pivot_sheet)
         adjust_pivot_column_widths(pivot_sheet)
+        restore_pivot_alignments(pivot_sheet, alignment_models)
         validate_target_complete_pivots(pivot_sheet, df)
 
         try:

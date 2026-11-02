@@ -129,6 +129,13 @@ Other pivot filters are preserved. No source rows, dates, or month members are
 added to make a completion month available.
 Every connected IDE pivot preserves cell formatting and disables automatic
 reformatting so a shared-cache refresh does not shrink fitted column widths.
+Header and numeric alignment are captured from the reference pivot and restored
+by caption and data-field/category identity after refresh, including new status
+columns. Independent Aging and On Time Delivery sections retain at least two
+blank columns between their current pivot bounds. The complete OTD block,
+including its banner and page filters, moves only when that spacing is missing;
+unrelated destination content is never overwritten. Paired summary/status pivots
+elsewhere in the sheet are not separated.
 
 The selected RFS text policy is
 `legacy-excel`, following the owner's decision to retain the manual report's
