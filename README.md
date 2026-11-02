@@ -281,6 +281,41 @@ python .\run_daily_pipeline.py `
 
 The pipeline runs the Excel COM-based steps one by one for reliability. This is intentional because running multiple Excel COM processes in parallel can cause workbook locks, failed saves, or unstable pivot refreshes.
 
+Daily Tracking copies completion-column styles by locating the actual template
+headers, so inserted rows do not break format recovery. Percentage formatting
+treats an empty table or Grand Total-only table separately from detail rows.
+After refresh, completion blocks recover a missing native traffic-light rule
+with the existing report-date thresholds. Unrelated conditional formats and
+source data are retained. Completion formulas use the refreshed phase pivot's
+body and join denominator rows by their full pivot category path, including
+subtotal and Grand Total depth. They do not assume that adjacent pivots have the
+same row numbers or order. Empty quote-count totals resolve to zero percent;
+missing category matches remain errors. Old standalone percentage blocks are
+cleared before refresh so moved or shrunken tables do not retain stale formulas.
+The final presentation pass restores template column widths and reveals pivot
+result rows without exposing intentionally hidden page-filter rows.
+Failed Excel rule updates or completion formula errors still fail the job rather
+than publishing a workbook with unchecked thresholds or broken percentages.
+Successful generation and presentation checks do not establish data parity with
+a manual reference; row values, filters and pivot cache coverage need a separate audit.
+
+The current export's recognized Phase takes precedence over historical Phase;
+Status is only a fallback when that source Phase is unavailable. Process Adjustment
+is rebuilt from the original Process when the template's target period changes:
+New Registration becomes New Reg, and other or blank source values become Non New
+Reg. Within the same target period, existing classifications are retained and only
+missing classifications are inferred. Historical display fallbacks do not change
+the original export used for period rebuilding.
+
+iPhone completion pivots are identified by their New/Non New and Phase fields,
+not arbitrary names assigned by Excel. Their caches are rebound to local source
+tables and checked against the actual table row counts; external or stale caches
+cannot silently supply report values. FAB-year filters reset to All for a new
+reporting period, including orders without a valid FAB year; daily continuation
+preserves the existing selection. Consequently, an old manual pivot still linked
+to an external historical workbook can differ intentionally: the generator uses
+the current local data, not the historical external snapshot.
+
 Optional pipeline flags:
 
 ```text

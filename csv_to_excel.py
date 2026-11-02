@@ -25,7 +25,18 @@ from excel_pivot_filters import (
     find_named_pivot_field,
     set_visible_items_exact,
 )
-from excel_pivot_layout import align_completion_threshold_legends, update_dynamic_pivot_section_titles
+from excel_pivot_layout import (
+    align_completion_threshold_legends,
+    completion_denominator_references,
+    completion_percentage_formula,
+    completion_percentage_headers,
+    completion_summary_pivot,
+    percentage_block_end_row,
+    percentage_format_row_spans,
+    pivot_row_identity,
+    restore_dashboard_pivot_presentation,
+    update_dynamic_pivot_section_titles,
+)
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -76,6 +87,7 @@ PIVOT_PHASE_ORDER = (
 )
 REPORT_ONE_PIVOT_TARGET_FILTERS = {
     "PivotTable1": "target",
+    "PivotTable2": "target",
     "PivotTable3": "target",
     "PivotTable16": "target",
     "PivotTable17": "target",
@@ -176,6 +188,7 @@ class LookupMappings:
     segment_sales_by_quo: dict[str, str]
     target_so_complete_date: dict[str, str]
     phase_header: str
+    reference_target_period: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -825,6 +838,10 @@ def load_lookup_mappings(lookup_workbook: Path) -> LookupMappings:
         segment_sales_by_quo=segment_sales_by_quo_mapping,
         target_so_complete_date=target_so_complete_date_mapping,
         phase_header=phase_lookup_header(lookup_workbook),
+        reference_target_period=next(
+            (period for column in lookup_df.columns for period in (target_header_period(str(column)),) if period is not None),
+            None,
+        ),
     )
 
 
@@ -859,47 +876,46 @@ def apply_current_status_phase_overrides(
     result: pd.DataFrame,
     phase_header: str,
     previous_status: pd.Series | None = None,
+    *,
+    source_phase: pd.Series | None = None,
 ) -> None:
     if STATUS_HEADER not in result.columns or phase_header not in result.columns:
         return
 
-    normalized_status = result[STATUS_HEADER].astype("string").str.strip().map(normalize_header_key)
-    current_phase = result[phase_header].astype("string").str.strip()
-    missing_phase = current_phase.isna() | current_phase.eq("")
     derived_phase = phase_from_status(result[STATUS_HEADER])
-    has_derived_phase = derived_phase.notna()
-    preserve_historical_so_complete = pd.Series(False, index=result.index)
-    if previous_status is not None:
-        previous_normalized_status = previous_status.astype("string").str.strip().map(normalize_header_key)
-        preserve_historical_so_complete = (
-            (normalized_status == "socomplete")
-            & (previous_normalized_status == "socomplete")
-            & ~missing_phase
-        )
+    phase_names = {
+        normalize_header_key(alias): phase
+        for phase in PIVOT_PHASE_ORDER
+        for alias in (phase, re.sub(r"^\d{2}-", "", phase))
+    }
+    current = result[phase_header] if source_phase is None else source_phase
+    explicit_phase = current.fillna("").astype("string").map(normalize_header_key).map(phase_names)
+    # Use an explicit current Phase; derive from Status only when Phase is unavailable.
+    resolved = explicit_phase.where(explicit_phase.notna(), derived_phase)
+    has_current_phase = resolved.notna()
+    result.loc[has_current_phase, phase_header] = resolved.loc[has_current_phase]
 
-    override_phase = has_derived_phase & ~preserve_historical_so_complete
-    result.loc[override_phase, phase_header] = derived_phase.loc[override_phase]
 
-
-def apply_current_month_process_adjustment_overrides(result: pd.DataFrame, reference_date: date) -> None:
-    required_columns = {PROCESS_HEADER, PROCESS_ADJUSTMENT_HEADER, FAB_UPLOAD_HEADER}
+def apply_current_month_process_adjustment_overrides(
+    result: pd.DataFrame, reference_date: date, *, source_process: pd.Series | None = None,
+    rebuild_period: bool = False,
+) -> None:
+    required_columns = {PROCESS_HEADER, PROCESS_ADJUSTMENT_HEADER}
     if not required_columns.issubset(result.columns):
         return
 
-    process_values = result[PROCESS_HEADER].astype("string").str.strip().map(normalize_header_key)
-    process_adjustment_values = result[PROCESS_ADJUSTMENT_HEADER].astype("string").str.strip().fillna("")
-    missing_process_adjustment = process_adjustment_values.eq("")
+    # Classify the export before display-only history fills a blank Process.
+    process_source = source_process if rebuild_period and source_process is not None else result[PROCESS_HEADER]
+    process_values = process_source.fillna("")
+    process_values = process_values.astype("string").str.strip().map(normalize_header_key)
     inferred_new_registration = process_values.eq("newregistration")
-    has_process = process_values.notna() & process_values.ne("")
-
-    result.loc[
-        missing_process_adjustment & has_process & inferred_new_registration,
-        PROCESS_ADJUSTMENT_HEADER,
-    ] = "New Reg"
-    result.loc[
-        missing_process_adjustment & has_process & ~inferred_new_registration,
-        PROCESS_ADJUSTMENT_HEADER,
-    ] = "Non New Reg"
+    classification = inferred_new_registration.map({True: "New Reg", False: "Non New Reg"})
+    if rebuild_period:
+        result[PROCESS_ADJUSTMENT_HEADER] = classification
+    else:
+        missing = result[PROCESS_ADJUSTMENT_HEADER].astype('string').fillna('').str.strip().eq('')
+        has_process = process_values.ne('')
+        result.loc[missing & has_process, PROCESS_ADJUSTMENT_HEADER] = classification.loc[missing & has_process]
 
 
 def fill_missing_with_quo_lookup(
@@ -1067,6 +1083,8 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
             result[SEGMENT_SALES_HEADER] = overlay_lookup(result[SEGMENT_SALES_HEADER], looked_up_segment_sales)
 
     if quo_values is not None:
+        source_phase = result.get(PHASE_HEADER_PREFIX, result.get(mappings.phase_header))
+        source_phase = None if source_phase is None else source_phase.copy()
         looked_up_phase = pd.Series(quo_values.map(mappings.phase), index=result.index, dtype="string")
         looked_up_status = pd.Series(quo_values.map(mappings.status), index=result.index, dtype="string")
         if mappings.phase_header in result.columns:
@@ -1094,7 +1112,9 @@ def apply_lookup_values(df: pd.DataFrame, mappings: LookupMappings) -> pd.DataFr
             insert_at = result.columns.get_loc(PROCESS_HEADER) + 1 if PROCESS_HEADER in result.columns else len(result.columns)
             result.insert(insert_at, PROCESS_ADJUSTMENT_HEADER, looked_up_process_adjustment)
 
-        apply_current_status_phase_overrides(result, mappings.phase_header, looked_up_status)
+        apply_current_status_phase_overrides(
+            result, mappings.phase_header, looked_up_status, source_phase=source_phase,
+        )
 
         if PRODUCT_CATEGORY_HEADER in result.columns:
             result[PRODUCT_CATEGORY_HEADER] = overlay_lookup(
@@ -1253,7 +1273,15 @@ def prepare_all_order_dataframe_for_template(
     output_df = apply_lookup_values(df, mappings)
     reference_date = reference_date_from_csv_path(csv_path)
     output_df = apply_previous_target_date_fallback(output_df, mappings, reference_date)
-    apply_current_month_process_adjustment_overrides(output_df, reference_date)
+    current_period = next(
+        (period for column in output_df.columns for period in (target_header_period(str(column)),) if period is not None),
+        None,
+    )
+    previous_period = getattr(mappings, 'reference_target_period', None)
+    apply_current_month_process_adjustment_overrides(
+        output_df, reference_date, source_process=df.get(PROCESS_HEADER),
+        rebuild_period=previous_period is not None and current_period is not None and previous_period != current_period,
+    )
     output_df = coerce_numeric_columns_for_pivots(output_df)
     target_header = next((column for column in output_df.columns if str(column).startswith("TARGET")), "")
     return add_pivot_template_compatibility_columns(
@@ -1675,25 +1703,10 @@ def resize_pivot_section_banners(pivot_sheet) -> None:
 
 
 def ensure_percentage_completion_column_widths(pivot_sheet) -> None:
-    percentage_header_key = normalize_header_key(
-        "Percentage of Completion (SO Complete, Cancel & Change Target)"
-    )
-    for header_row in (9, 114, 377):
-        for column_index in range(4, 20):
-            try:
-                header_value = pivot_sheet.Cells(header_row, column_index).Value
-            except Exception:
-                continue
-            if normalize_header_key(header_value) != percentage_header_key:
-                continue
-
-            try:
-                column = pivot_sheet.Columns(column_index)
-                if float(column.ColumnWidth) < MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH:
-                    column.ColumnWidth = MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH
-            except Exception:
-                pass
-            break
+    for _, column_index in completion_percentage_headers(pivot_sheet):
+        column = pivot_sheet.Columns(column_index)
+        if float(column.ColumnWidth) < MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH:
+            column.ColumnWidth = MIN_PIVOT_PERCENTAGE_COLUMN_WIDTH
 
 
 def add_pivot_sheet_via_com(
@@ -2940,79 +2953,84 @@ def update_template_workbook_via_com(
         percentage_format_roles = {}
         percentage_column_widths = {}
         target_after_percentage_format_sheet = None
+        completion_pivot_names = ("PivotTable3", "PivotTable17", "PivotTable11")
 
         def _capture_percentage_formats():
             nonlocal target_after_percentage_format_sheet
             if pivot_sheet is None:
                 return
 
-            normalized_header = percentage_completion_header.lower()
-            format_rows = {9: 20, 114: 124, 377: 387}
-            for header_row, last_row in format_rows.items():
-                for column_index in range(4, 15):
-                    value = pivot_sheet.Cells(header_row, column_index).Value
-                    if str(value).strip().lower() != normalized_header:
-                        continue
+            maximum_row = int(pivot_sheet.UsedRange.Row + pivot_sheet.UsedRange.Rows.Count - 1)
+            # Keep formats by pivot identity; template rows and phase columns can move.
+            for format_key, (source_header_row, column_index) in zip(
+                completion_pivot_names, completion_percentage_headers(pivot_sheet),
+            ):
+                last_row = percentage_block_end_row(
+                    pivot_sheet, source_header_row, column_index, maximum_row,
+                )
+                if last_row <= source_header_row:
+                    continue
 
-                    grand_total_row = None
-                    for row_index in range(header_row + 1, last_row + 1):
-                        if str(pivot_sheet.Cells(row_index, 1).Value).strip().lower() == "grand total":
-                            grand_total_row = row_index
-                            break
+                grand_total_row = None
+                for row_index in range(source_header_row + 1, last_row + 1):
+                    if str(pivot_sheet.Cells(row_index, 1).Value).strip().lower() == "grand total":
+                        grand_total_row = row_index
+                        break
 
-                    grand_total_relative_row = (
-                        grand_total_row - header_row + 1
-                        if grand_total_row is not None
-                        else min(last_row - header_row + 1, 3)
+                grand_total_relative_row = (
+                    grand_total_row - source_header_row + 1
+                    if grand_total_row is not None
+                    else last_row - source_header_row + 1
+                )
+                percentage_format_roles[format_key] = {
+                    "header": 1,
+                    "first_detail": 2,
+                    "middle_detail": 3 if grand_total_relative_row > 3 else 2,
+                    "last_detail": max(2, grand_total_relative_row - 1),
+                    "grand_total": grand_total_relative_row,
+                }
+                percentage_column_widths[format_key] = pivot_sheet.Columns(column_index).ColumnWidth
+                source_range = pivot_sheet.Range(
+                    pivot_sheet.Cells(source_header_row, column_index),
+                    pivot_sheet.Cells(last_row, column_index),
+                )
+                try:
+                    if target_after_percentage_format_sheet is None:
+                        target_after_percentage_format_sheet = target_wb.Worksheets.Add()
+                        target_after_percentage_format_sheet.Name = "__codex_pct_fmt"
+                        target_after_percentage_format_sheet.Visible = 0
+
+                    destination_column = len(percentage_format_sources) + 1
+                    target_range = target_after_percentage_format_sheet.Range(
+                        target_after_percentage_format_sheet.Cells(1, destination_column),
+                        target_after_percentage_format_sheet.Cells(last_row - source_header_row + 1, destination_column),
                     )
-                    percentage_format_roles[header_row] = {
-                        "header": 1,
-                        "first_detail": 2,
-                        "middle_detail": 3 if grand_total_relative_row > 3 else 2,
-                        "last_detail": max(2, grand_total_relative_row - 1),
-                        "grand_total": grand_total_relative_row,
-                    }
-                    percentage_column_widths[header_row] = pivot_sheet.Columns(column_index).ColumnWidth
-                    source_range = pivot_sheet.Range(
-                        pivot_sheet.Cells(header_row, column_index),
-                        pivot_sheet.Cells(last_row, column_index),
-                    )
-                    try:
-                        if target_after_percentage_format_sheet is None:
-                            target_after_percentage_format_sheet = target_wb.Worksheets.Add()
-                            target_after_percentage_format_sheet.Name = "__codex_pct_fmt"
-                            target_after_percentage_format_sheet.Visible = 0
-
-                        destination_column = len(percentage_format_sources) + 1
-                        target_range = target_after_percentage_format_sheet.Range(
-                            target_after_percentage_format_sheet.Cells(1, destination_column),
-                            target_after_percentage_format_sheet.Cells(last_row - header_row + 1, destination_column),
-                        )
-                        source_range.Copy()
-                        target_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
-                        xl.CutCopyMode = False
-                        percentage_format_sources[header_row] = target_range
-                    except Exception:
-                        percentage_format_sources[header_row] = source_range
-                    break
+                    source_range.Copy()
+                    target_range.PasteSpecial(Paste=-4122)  # xlPasteFormats
+                    xl.CutCopyMode = False
+                    percentage_format_sources[format_key] = target_range
+                except Exception:
+                    raise RuntimeError(f"Could not preserve percentage formats for '{format_key}'.")
+                # Clear the old standalone block before pivot refresh changes its size.
+                source_range.Clear()
 
         def _repair_completion_formula(
             pivot_table,
-            pivot_top_row: int,
-            page_field_count: int,
-            left_count_column: str,
-            mode: str,
         ) -> None:
-            if pivot_table.TableRange2.Row != pivot_top_row:
-                return
-            if int(pivot_table.TableRange1.Column) < 4:
+            format_key = str(pivot_table.Name).split('_', 1)[0]
+            if format_key not in completion_pivot_names:
                 return
 
-            header_row = pivot_table.TableRange2.Row + page_field_count + 2
-            data_row_start = header_row + 1
-            data_row_end = pivot_table.TableRange1.Row + pivot_table.TableRange1.Rows.Count - 1
+            body = pivot_table.DataBodyRange
+            if body is None:
+                return
+            data_row_start = int(body.Row)
+            header_row = data_row_start - 1
+            data_row_end = data_row_start + int(body.Rows.Count) - 1
             cancel_col = _pivot_header_column(pivot_table, header_row, "Cancel")
             so_col = _pivot_header_column(pivot_table, header_row, "SO Complete")
+            summary = completion_summary_pivot(pivot_sheet, pivot_table)
+            denominators = completion_denominator_references(summary)
 
             def _apply_percentage_presentation(format_source) -> None:
                 def _copy_format(source_row: int, target_start_row: int, target_end_row: int | None = None) -> None:
@@ -3032,16 +3050,10 @@ def update_template_workbook_via_com(
 
                 try:
                     if format_source is not None:
-                        roles = percentage_format_roles.get(header_row, {})
-                        _copy_format(roles.get("header", 1), header_row)
-                        _copy_format(roles.get("first_detail", 2), data_row_start)
-                        _copy_format(
-                            roles.get("middle_detail", 2),
-                            data_row_start + 1,
-                            max(data_row_start + 1, data_row_end - 2),
-                        )
-                        _copy_format(roles.get("last_detail", 2), data_row_end - 1)
-                        _copy_format(roles.get("grand_total", format_source.Rows.Count), data_row_end)
+                        roles = percentage_format_roles.get(format_key, {})
+                        for role, first_row, last_row in percentage_format_row_spans(header_row, data_row_end):
+                            default_row = format_source.Rows.Count if role == "grand_total" else 1 if role == "header" else 2
+                            _copy_format(roles.get(role, default_row), first_row, last_row)
                 except Exception:
                     pass
 
@@ -3056,59 +3068,40 @@ def update_template_workbook_via_com(
             formula_col = pivot_table.TableRange1.Column + pivot_table.TableRange1.Columns.Count
             formula_letter = _column_letter(formula_col)
 
-            for column_index in range(formula_col, formula_col + 6):
-                value = pivot_sheet.Cells(header_row, column_index).Value
-                if str(value).strip().lower() == percentage_completion_header.lower():
-                    pivot_sheet.Range(
-                        pivot_sheet.Cells(header_row, column_index),
-                        pivot_sheet.Cells(header_row + 20, column_index),
-                    ).Clear()
-
             pivot_sheet.Cells(header_row, formula_col).Value = percentage_completion_header
             numerator_columns = [column for column in (cancel_col, so_col) if column is not None]
             for row_index in range(data_row_start, data_row_end + 1):
-                if numerator_columns:
-                    numerator = "+".join(
-                        f"{_column_letter(column)}{row_index}" for column in numerator_columns
-                    )
-                    formula = f"=({numerator})/{left_count_column}{row_index}"
-                else:
-                    formula = "=0"
+                key = pivot_row_identity(body.Cells(row_index - data_row_start + 1, 1))
+                if key not in denominators:
+                    raise RuntimeError(f"PivotTable '{pivot_table.Name}' has no summary count for {key!r}.")
+                formula = completion_percentage_formula(
+                    [f"{_column_letter(column)}{row_index}" for column in numerator_columns], denominators[key],
+                )
                 pivot_sheet.Range(f"{formula_letter}{row_index}").Formula = formula
                 pivot_sheet.Range(f"{formula_letter}{row_index}").NumberFormat = "0.00%"
 
-            format_source = percentage_format_sources.get(header_row)
+            format_source = percentage_format_sources.get(format_key)
             _apply_percentage_presentation(format_source)
-            if header_row in percentage_column_widths:
+            if format_key in percentage_column_widths:
                 try:
-                    pivot_sheet.Columns(formula_col).ColumnWidth = percentage_column_widths[header_row]
+                    pivot_sheet.Columns(formula_col).ColumnWidth = percentage_column_widths[format_key]
                 except Exception:
                     pass
 
         def _format_percentage_completion_columns() -> None:
-            normalized_header = percentage_completion_header.lower()
-            for header_row in (9, 114, 377):
-                for column_index in range(4, 20):
-                    value = pivot_sheet.Cells(header_row, column_index).Value
-                    if str(value).strip().lower() != normalized_header:
-                        continue
-
-                    last_row = header_row
-                    for scan_row in range(header_row + 1, header_row + 101):
-                        has_count = pivot_sheet.Cells(scan_row, 3).Value is not None
-                        has_percentage = pivot_sheet.Cells(scan_row, column_index).Value is not None
-                        if has_count or has_percentage:
-                            last_row = scan_row
-                            continue
-                        if scan_row > header_row + 1:
-                            break
-
-                    if last_row > header_row:
-                        pivot_sheet.Range(
-                            pivot_sheet.Cells(header_row + 1, column_index),
-                            pivot_sheet.Cells(last_row, column_index),
-                        ).NumberFormat = "0.00%"
-                    break
+            maximum_row = int(pivot_sheet.UsedRange.Row + pivot_sheet.UsedRange.Rows.Count - 1)
+            for header_row, column_index in completion_percentage_headers(pivot_sheet):
+                last_row = percentage_block_end_row(pivot_sheet, header_row, column_index, maximum_row)
+                if last_row > header_row:
+                    percentage_range = pivot_sheet.Range(
+                        pivot_sheet.Cells(header_row + 1, column_index),
+                        pivot_sheet.Cells(last_row, column_index),
+                    )
+                    percentage_range.NumberFormat = "0.00%"
+                    percentage_range.Calculate()
+                    for cell in percentage_range:
+                        if str(cell.Text).startswith(('#REF!', '#DIV/0!', '#VALUE!', '#NAME?', '#N/A', '#NUM!')):
+                            raise RuntimeError(f"Invalid completion formula at {cell.Address}: {cell.Text}")
 
         data_sheet = _sheet_by_name(target_wb, VLOOKUP_SHEET_NAME)
         generated_data_sheet = _sheet_by_name(generated_wb, VLOOKUP_SHEET_NAME)
@@ -3118,6 +3111,13 @@ def update_template_workbook_via_com(
         if data_sheet is None or generated_data_sheet is None or pivot_sheet is None:
             raise RuntimeError("Could not find required sheets for template update.")
 
+        pivot_column_widths = {
+            column: float(pivot_sheet.Columns(column).ColumnWidth)
+            for column in range(1, int(pivot_sheet.UsedRange.Column + pivot_sheet.UsedRange.Columns.Count))
+        }
+        for pivot in pivot_sheet.PivotTables():
+            pivot.PreserveFormatting = True
+            pivot.HasAutoFormat = False
         _capture_percentage_formats()
         _profile("capture PIVOT percentage formats")
         progress_template_state = _capture_template_progress_state()
@@ -3548,9 +3548,6 @@ def update_template_workbook_via_com(
                 if _apply_dashboard_pivot_spec(pivot_table):
                     pivot_table.RefreshTable()
 
-                _repair_completion_formula(pivot_table, 4, 3, "C", "sum_cancel_so")
-                _repair_completion_formula(pivot_table, 109, 3, "C", "source_non_new")
-                _repair_completion_formula(pivot_table, 373, 2, "C", "target_after")
                 refreshed_count += 1
                 if profile_enabled:
                     print(
@@ -3597,11 +3594,10 @@ def update_template_workbook_via_com(
 
         # Refreshing another PivotTable from the shared cache can auto-fit
         # PIVOT columns again, so presentation must be the final pivot pass.
+        restore_dashboard_pivot_presentation(pivot_sheet, pivot_column_widths)
         for pivot_index in range(1, pivot_tables.Count + 1):
             pivot_table = pivot_tables(pivot_index)
-            _repair_completion_formula(pivot_table, 4, 3, "C", "sum_cancel_so")
-            _repair_completion_formula(pivot_table, 109, 3, "C", "source_non_new")
-            _repair_completion_formula(pivot_table, 373, 2, "C", "target_after")
+            _repair_completion_formula(pivot_table)
         _format_percentage_completion_columns()
         align_completion_threshold_legends(
             pivot_sheet,

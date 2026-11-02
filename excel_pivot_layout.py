@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from datetime import date
+from openpyxl.utils import get_column_letter
 
 from completion_threshold_rules import (
     CompletionThresholds,
@@ -33,6 +34,68 @@ COMPLETION_SECTION_MARKERS = (
 
 def normalize_layout_text(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def pivot_row_identity(cell) -> tuple[tuple[str, str], ...]:
+    """Identify a pivot row by categories and subtotal depth, not its position."""
+    items = cell.PivotCell.RowItems
+    return tuple(sorted(
+        (normalize_layout_text(items(i).Parent.SourceName), str(items(i).Name))
+        for i in range(1, int(items.Count) + 1)
+    ))
+
+
+def completion_denominator_references(pivot_table) -> dict[tuple, str]:
+    body = pivot_table.DataBodyRange
+    if body is None:
+        return {}
+    count_column = None
+    for column in range(1, int(body.Columns.Count) + 1):
+        field = body.Cells(1, column).PivotCell.DataField
+        if normalize_layout_text(field.SourceName) == "quo" and int(field.Function) == -4112:
+            count_column = column
+            break
+    if count_column is None:
+        raise RuntimeError(f"PivotTable '{pivot_table.Name}' has no quote-count data column.")
+    references = {}
+    for row in range(1, int(body.Rows.Count) + 1):
+        cell = body.Cells(row, count_column)
+        identity = pivot_row_identity(cell)
+        if identity in references:
+            raise RuntimeError(f"PivotTable '{pivot_table.Name}' has duplicate summary row {identity!r}.")
+        references[identity] = f"{get_column_letter(int(cell.Column))}{int(cell.Row)}"
+    return references
+
+
+def completion_percentage_formula(numerator_cells: list[str], denominator_cell: str) -> str:
+    numerator = "+".join(numerator_cells) or "0"
+    return f'=IF({denominator_cell}=0,0,({numerator})/{denominator_cell})'
+
+
+def restore_dashboard_pivot_presentation(pivot_sheet, column_widths: dict[int, float]) -> None:
+    for pivot in pivot_sheet.PivotTables():
+        pivot.PreserveFormatting = True
+        pivot.HasAutoFormat = False
+        if pivot.RowRange is not None:
+            pivot.RowRange.EntireRow.Hidden = False
+    for column, width in column_widths.items():
+        pivot_sheet.Columns(column).ColumnWidth = width
+
+
+def completion_summary_pivot(pivot_sheet, phase_pivot):
+    expected_fields = {normalize_layout_text(field.SourceName) for field in phase_pivot.RowFields}
+    candidates = []
+    for candidate in pivot_sheet.PivotTables():
+        if int(candidate.TableRange1.Column) >= int(phase_pivot.TableRange1.Column):
+            continue
+        if {normalize_layout_text(field.SourceName) for field in candidate.RowFields} != expected_fields:
+            continue
+        if not any(normalize_layout_text(f.SourceName) == "quo" and int(f.Function) == -4112 for f in candidate.DataFields):
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        raise RuntimeError(f"PivotTable '{phase_pivot.Name}' has no adjacent quote-count summary.")
+    return min(candidates, key=lambda candidate: abs(int(candidate.RowRange.Row) - int(phase_pivot.RowRange.Row)))
 
 
 def completion_legend_values(
@@ -95,6 +158,8 @@ def completion_mode_for_row(
 def apply_completion_icon_thresholds(
     target_range,
     thresholds: CompletionThresholds,
+    *,
+    create_if_missing: bool = False,
 ) -> int:
     """Update every traffic-light icon rule applied to a percentage range."""
     updated_rules = 0
@@ -104,17 +169,64 @@ def apply_completion_icon_thresholds(
         try:
             if int(condition.Type) != 6 or int(condition.IconSet.ID) != 4:
                 continue
-            criteria = condition.IconCriteria
-            criteria(2).Type = 0  # xlConditionValueNumber
-            criteria(2).Value = thresholds.yellow_percent / 100
-            criteria(2).Operator = 7  # xlGreaterEqual
-            criteria(3).Type = 0  # xlConditionValueNumber
-            criteria(3).Value = thresholds.green_percent / 100
-            criteria(3).Operator = 5  # xlGreater
-            updated_rules += 1
         except Exception:
             continue
+        _set_completion_icon_criteria(condition, thresholds)
+        updated_rules += 1
+    if updated_rules == 0 and create_if_missing:
+        # A moved or empty PivotTable can lose copied conditional formatting.
+        # Recreate only this block's icon rule; retain other conditional rules.
+        condition = format_conditions.AddIconSetCondition()
+        condition.IconSet = target_range.Worksheet.Parent.IconSets(4)
+        condition.ReverseOrder = False
+        condition.ShowIconOnly = False
+        _set_completion_icon_criteria(condition, thresholds)
+        updated_rules = 1
     return updated_rules
+
+
+def _set_completion_icon_criteria(condition, thresholds: CompletionThresholds) -> None:
+    criteria = condition.IconCriteria
+    criteria(2).Type = 0  # xlConditionValueNumber
+    criteria(2).Value = thresholds.yellow_percent / 100
+    criteria(2).Operator = 7  # xlGreaterEqual
+    criteria(3).Type = 0  # xlConditionValueNumber
+    criteria(3).Value = thresholds.green_percent / 100
+    criteria(3).Operator = 5  # xlGreater
+
+
+def completion_percentage_headers(pivot_sheet) -> list[tuple[int, int]]:
+    """Find completion columns in source order, independent of template row shifts."""
+    used = pivot_sheet.UsedRange
+    values = used.Value2
+    if values is None:
+        return []
+    if not isinstance(values, tuple):
+        values = ((values,),)
+    elif values and not isinstance(values[0], tuple):
+        values = (values,)
+    return [
+        (row, column)
+        for row, cells in enumerate(values, start=int(used.Row))
+        for column, value in enumerate(cells, start=int(used.Column))
+        if normalize_layout_text(value).startswith("percentageofcompletion")
+    ]
+
+
+def percentage_format_row_spans(header_row: int, end_row: int) -> list[tuple[str, int, int]]:
+    """Map table roles without formatting a header or blank row as detail."""
+    spans = [("header", header_row, header_row)]
+    if end_row <= header_row:
+        return spans
+    first, last = header_row + 1, end_row - 1
+    if first <= last:
+        spans.append(("first_detail", first, first))
+        if first + 1 <= last - 1:
+            spans.append(("middle_detail", first + 1, last - 1))
+        if last > first:
+            spans.append(("last_detail", last, last))
+    spans.append(("grand_total", end_row, end_row))
+    return spans
 
 
 def percentage_block_end_row(
@@ -131,8 +243,7 @@ def percentage_block_end_row(
         if formula.startswith("=") or value not in (None, ""):
             end_row = row_number
             continue
-        if end_row > header_row:
-            break
+        break
     return end_row
 
 
@@ -232,7 +343,7 @@ def align_completion_threshold_legends(
             pivot_sheet.Cells(header_row + 1, header_col),
             pivot_sheet.Cells(end_row, header_col),
         )
-        if apply_completion_icon_thresholds(percentage_range, thresholds) == 0:
+        if apply_completion_icon_thresholds(percentage_range, thresholds, create_if_missing=True) == 0:
             raise RuntimeError(
                 "No traffic-light icon rule found for percentage block "
                 f"{pivot_sheet.Cells(header_row, header_col).Address}."
