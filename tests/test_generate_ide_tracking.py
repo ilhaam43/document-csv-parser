@@ -38,8 +38,11 @@ from generate_ide_tracking import (
     parse_dashboard_field_datetime,
     normalize_pivot_section_row_visibility,
     parse_excel_datetime,
+    planned_rfs_with_completion_year,
     preserve_pivot_refresh_layout,
     read_raw_dataframe,
+    read_previous_dataframe,
+    recover_source_quote_date_years,
     reconcile_date_column,
     reconciled_date_value,
     resolve_financial_values,
@@ -84,11 +87,10 @@ class IdeDynamicColumnsTests(unittest.TestCase):
             "Pre-Installation Start Date": datetime(2026, 10, 1),
         }])
 
-    def _build(self, raw):
+    def _build(self, raw, *, report_date=date(2026, 10, 12), previous_path=Path("Daily Tracking IDE 9 October 2026.xlsx")):
         with patch("generate_ide_tracking.load_collabs_lookup", return_value={}):
             return build_all_order(
-                raw, self.previous, Path("collabs.csv"), date(2026, 10, 12),
-                Path("Daily Tracking IDE 9 October 2026.xlsx"),
+                raw, self.previous, Path("collabs.csv"), report_date, previous_path,
             ).dataframe
 
     def test_raw_additions_keep_their_values_and_existing_business_columns(self) -> None:
@@ -127,14 +129,110 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         pd.testing.assert_frame_equal(result, self._build(self.raw))
         self.assertEqual(result.columns.tolist().count("MONTH COMPLETE"), 1)
 
-    def test_build_keeps_current_dates_per_duplicate_row(self) -> None:
+    def test_new_period_keeps_current_dates_per_duplicate_row(self) -> None:
         raw = pd.concat([self.raw, self.raw], ignore_index=True)
         raw[NEW_RFS_INITIAL_HEADER] = [datetime(2026, 4, 28)] * 2
         raw[ACTUAL_RFS_DATE_HEADER] = [datetime(2026, 3, 12), "12/03/2026"]
-        result = self._build(raw)
+        result = self._build(raw, report_date=date(2026, 11, 2), previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx"))
         self.assertEqual(result[ACTUAL_RFS_DATE_HEADER].tolist(), [
             datetime(2026, 3, 12), datetime(2026, 12, 3),
         ])
+
+    def test_continuation_actual_rfs_uses_first_quote_match_but_preserves_blank(self) -> None:
+        raw = pd.concat([self.raw] * 3, ignore_index=True)
+        raw[ACTUAL_RFS_DATE_HEADER] = [datetime(2026, 4, 15), datetime(2026, 4, 18), None]
+        result = self._build(raw)
+        self.assertEqual(result[ACTUAL_RFS_DATE_HEADER].tolist()[:2], [datetime(2026, 4, 15)] * 2)
+        self.assertTrue(is_missing(result.at[2, ACTUAL_RFS_DATE_HEADER]))
+
+    def test_year_carry_distinguishes_text_from_typed_dates_in_new_period(self) -> None:
+        for value in (datetime(2025, 4, 15), "15/04/2025"):
+            raw = self.raw.copy()
+            raw[NEW_RFS_INITIAL_HEADER] = [value]
+            self.previous[NEW_RFS_INITIAL_HEADER] = [datetime(2026, 4, 15)]
+            continued = self._build(raw)
+            refreshed = self._build(raw, report_date=date(2026, 11, 2),
+                                    previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx"))
+            self.assertEqual(continued.at[0, NEW_RFS_INITIAL_HEADER], datetime(2026, 4, 15))
+            expected = datetime(2026 if isinstance(value, str) else 2025, 4, 15)
+            self.assertEqual(refreshed.at[0, NEW_RFS_INITIAL_HEADER], expected)
+
+    def test_planned_year_rule_only_runs_on_period_refresh_and_records_evidence(self) -> None:
+        raw = self.raw.copy()
+        raw[NEW_RFS_INITIAL_HEADER] = ["20/06/2025"]
+        raw["SO COMPLETION DATE"] = [datetime(2026, 6, 26)]
+        for report, previous, expected in (
+            (date(2026, 10, 13), Path("Daily Tracking IDE 12 October 2026.xlsx"), 2025),
+            (date(2026, 11, 2), Path("Daily Tracking IDE 30 October 2026.xlsx"), 2026),
+        ):
+            built = build_all_order(raw, self.previous, Path("unused.csv"), report, previous)
+            self.assertEqual(built.dataframe.at[0, NEW_RFS_INITIAL_HEADER], datetime(expected, 6, 20))
+            self.assertEqual(len(built.planned_rfs_year_rollovers), int(expected == 2026))
+            if expected == 2026:
+                self.assertEqual(built.planned_rfs_year_rollovers[0]["evidence"], "SO COMPLETION DATE")
+
+    def test_baseline_status_and_header_roll_forward_independently(self) -> None:
+        self.previous["STATUS DELIVERY 8 October 2026"] = ["#N/A"]
+        for report, previous, expected_header in (
+            (date(2026, 10, 13), Path("Daily Tracking IDE 12 October 2026.xlsx"), "STATUS DELIVERY 8 October 2026"),
+            (date(2026, 11, 2), Path("Daily Tracking IDE 30 October 2026.xlsx"), "STATUS DELIVERY 30 October 2026"),
+        ):
+            data = self._build(self.raw, report_date=report, previous_path=previous)
+            self.assertEqual(data.at[0, expected_header], "#N/A")
+            self.assertEqual(data.at[0, "STATUS DELIVERY"], "SO Complete")
+
+    def test_daily_placeholder_is_refreshed_without_resetting_genuine_history(self) -> None:
+        self.raw["STATUS DELIVERY"] = [None]
+        self.previous["STATUS DELIVERY"] = [None]
+        self.previous["Pre-Installation Start Date"] = [datetime(2026, 10, 11)]
+        row = self._build(self.raw, previous_path=Path("Daily Tracking IDE 12 October 2026.xlsx")).iloc[0]
+        self.assertEqual(row["Pre-Installation Start Date"], datetime(2026, 10, 11))
+        row = self._build(self.raw, report_date=date(2026, 10, 13),
+                          previous_path=Path("Daily Tracking IDE 12 October 2026.xlsx")).iloc[0]
+        self.assertEqual(row["Pre-Installation Start Date"], datetime(2026, 10, 12))
+        self.previous["Pre-Installation Start Date"] = [datetime(2026, 10, 1)]
+        row = self._build(self.raw).iloc[0]
+        self.assertEqual(row["Pre-Installation Start Date"], datetime(2026, 10, 1))
+
+    def test_continuation_financial_fallback_is_only_for_quotes_absent_from_snapshot(self) -> None:
+        self.previous["OTC"] = [None]
+        with patch("generate_ide_tracking.load_collabs_lookup", return_value={"NEW": (500, 700)}) as load_csv:
+            raw = pd.concat([self.raw] * 2, ignore_index=True)
+            raw[QUOTE_ID_HEADER] = ["Q-1", "NEW"]
+            built = build_all_order(raw, self.previous, Path("collabs.csv"), date(2026, 10, 13),
+                                    Path("Daily Tracking IDE 12 October 2026.xlsx"))
+        load_csv.assert_called_once_with(Path("collabs.csv"), {"NEW"})
+        self.assertEqual(built.dataframe["OTC"].tolist(), [0, 500])
+        self.assertEqual(built.dataframe["MRC"].tolist(), [200, 700])
+
+    def test_po_numeric_compatibility_preserves_leading_zero_and_long_identifiers(self) -> None:
+        raw = pd.concat([self.raw] * 4, ignore_index=True)
+        raw["NOMOR PO"] = ["1234", "001234", "1234567890123456", "0"]
+        self.assertEqual(self._build(raw)["NOMOR PO"].tolist(), [1234, "001234", "1234567890123456", 0])
+
+    def test_refresh_keeps_ancillary_native_and_text_representations(self) -> None:
+        raw = pd.concat([self.raw] * 3, ignore_index=True)
+        raw["CASH DATE"] = ["26/06/2026", datetime(2926, 6, 26), 46028]
+        result = self._build(raw, report_date=date(2026, 11, 2),
+                             previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx"))
+        self.assertEqual(result["CASH DATE"].tolist(), [
+            "26/06/2026", datetime(2926, 6, 26), datetime(2026, 1, 6),
+        ])
+
+    def test_refresh_retains_source_month_separately_but_primary_stays_calculated(self) -> None:
+        self.raw["MONTH COMPLETE"] = ["Okt"]
+        built = build_all_order(self.raw, self.previous, Path("unused.csv"), date(2026, 11, 2),
+                                Path("Daily Tracking IDE 30 October 2026.xlsx"))
+        self.assertTrue(is_missing(built.dataframe.at[0, "MONTH COMPLETE"]))
+        self.assertEqual(built.dataframe.at[0, "MONTH COMPLETE2"], "Okt")
+        self.assertEqual(built.month_complete_format, "MMM-YY")
+        self.assertEqual(built.dataframe.columns.get_loc("MONTH COMPLETE"), 32)
+
+    def test_abbreviated_month_format_is_retained_on_later_days(self) -> None:
+        self.previous["MONTH COMPLETE"] = ["Nov-26"]
+        built = build_all_order(self.raw, self.previous, Path("unused.csv"), date(2026, 11, 5),
+                                Path("Daily Tracking IDE 4 November 2026.xlsx"))
+        self.assertEqual(built.month_complete_format, "MMM-YY")
 
     def test_rfs_text_reproduces_approved_legacy_conversion_without_per_quote_rules(self) -> None:
         for text, expected in (
@@ -172,6 +270,32 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         self.assertEqual(text[NEW_RFS_INITIAL_HEADER], datetime(2026, 12, 2))
         self.assertEqual(text["TARGET  Detemined as 1 Oct 26"], "After October")
 
+    def test_reference_financial_snapshot_uses_exact_keys_and_zero_without_csv_override(self) -> None:
+        for quote in ("Q-1 ", "NEW"):
+            with self.subTest(quote=quote):
+                raw = self.raw.copy()
+                raw[QUOTE_ID_HEADER] = [quote]
+                with patch("generate_ide_tracking.load_collabs_lookup") as load_csv:
+                    result = build_all_order(
+                        raw, self.previous, Path("collabs.csv"), date(2026, 11, 2),
+                        Path("Daily Tracking IDE 30 October 2026.xlsx"),
+                    )
+                load_csv.assert_not_called()
+                self.assertEqual(result.dataframe["OTC"].tolist(), [0])
+                self.assertEqual(result.dataframe["MRC"].tolist(), [0])
+                self.assertEqual(result.financial_source_policy, "reference-snapshot")
+
+    def test_collabs_can_supply_financials_when_reference_has_no_financial_snapshot(self) -> None:
+        previous = self.previous.drop(columns=["OTC", "MRC"])
+        with patch("generate_ide_tracking.load_collabs_lookup", return_value={"Q-1": (500, 700)}):
+            result = build_all_order(
+                self.raw, previous, Path("collabs.csv"), date(2026, 10, 13),
+                Path("Daily Tracking IDE 12 October 2026.xlsx"),
+            )
+        self.assertEqual(result.dataframe["OTC"].tolist(), [500])
+        self.assertEqual(result.dataframe["MRC"].tolist(), [700])
+        self.assertEqual(result.financial_source_policy, "collabs-fallback")
+
     def test_month_formula_uses_named_column_positions_and_calculates_before_pivot_refresh(self) -> None:
         from unittest.mock import Mock
         worksheet = Mock()
@@ -186,6 +310,15 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         self.assertEqual(month_range.NumberFormat, "General")
         self.assertEqual(month_range.FormulaR1C1, '=TEXT(RC[-1],"[$-409]mmmm")')
         month_range.Calculate.assert_called_once()
+
+    def test_abbreviated_month_formula_does_not_turn_missing_completion_into_january(self) -> None:
+        from unittest.mock import Mock
+        worksheet = Mock()
+        data = pd.DataFrame({"SO COMPLETION DATE": [None], "MONTH COMPLETE": [None]})
+        apply_month_complete_formula(worksheet, data, date_format="MMM-YY")
+        self.assertEqual(worksheet.Range.return_value.FormulaR1C1,
+                         '=IF(ISNUMBER(RC[-1]),TEXT(RC[-1],"[$-409]mmm-yy"),"")')
+        worksheet.Range.return_value.Calculate.assert_called_once()
 
     def test_na_errors_use_native_formulas_without_the_windows_clipboard(self) -> None:
         from unittest.mock import Mock
@@ -311,7 +444,7 @@ class IdeDynamicColumnsTests(unittest.TestCase):
                 raw = self.raw.copy()
                 raw[QUOTE_ID_HEADER] = ["NEW"]
                 raw["STATUS DELIVERY"] = [status]
-                row = self._build(raw).iloc[0]
+                row = self._build(raw, report_date=date(2026, 11, 2), previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx")).iloc[0]
                 self.assertTrue(is_missing(row["Pre-Installation Start Date"]))
                 self.assertTrue(is_missing(row["Pre-Installation Aging"]))
                 self.assertTrue(is_missing(row["Range Aging On Pre-Installation"]))
@@ -340,13 +473,13 @@ class IdeDynamicColumnsTests(unittest.TestCase):
             with self.subTest(quote=quote):
                 raw = self.raw.copy()
                 raw[QUOTE_ID_HEADER] = [quote]
-                row = self._build(raw).iloc[0]
+                row = self._build(raw, report_date=date(2026, 11, 2), previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx")).iloc[0]
                 self.assertEqual(row[QUOTE_ID_HEADER], quote)
                 self.assertTrue(is_missing(row["Pre-Installation Start Date"]))
                 self.assertTrue(is_missing(row["Pre-Installation Aging"]))
         raw = self.raw.copy()
         raw[QUOTE_ID_HEADER] = ["q-1"]
-        self.assertEqual(self._build(raw).iloc[0]["Pre-Installation Start Date"], datetime(2026, 10, 1))
+        self.assertEqual(self._build(raw, report_date=date(2026, 11, 2), previous_path=Path("Daily Tracking IDE 30 October 2026.xlsx")).iloc[0]["Pre-Installation Start Date"], datetime(2026, 10, 1))
 
     def test_all_shared_cache_pivots_keep_formatting_and_do_not_reset_column_widths(self) -> None:
         pivots = [SimpleNamespace(PreserveFormatting=False, HasAutoFormat=True) for _ in range(3)]
@@ -462,16 +595,43 @@ class IdeDynamicColumnsTests(unittest.TestCase):
 
 
 class IdeRawDateSourceTests(unittest.TestCase):
-    def _read(self, values, source_values):
+    def test_invalid_quote_year_uses_agreeing_source_without_changing_time(self) -> None:
+        raw = pd.DataFrame({QUOTE_ID_HEADER: ["A"], "QUOTE DATE": [datetime(3036, 8, 30)]})
+        source = SimpleNamespace(iter_rows=lambda **_: iter([
+            ("quote_num", "quote_created"), ("A", "2026-08-30 00:07:05"),
+            ("A", "2026-08-30 00:07:05"),
+        ]))
+        changes = recover_source_quote_date_years(raw, source)
+        self.assertEqual(raw.at[0, "QUOTE DATE"], datetime(2026, 8, 30))
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["evidence"], "source.quote_created")
+
+    def test_quote_year_recovery_does_not_guess_from_report_year_or_conflicting_evidence(self) -> None:
+        for original, source_values in (
+            (datetime(2025, 8, 30), ["2026-08-30"]),
+            (datetime(3029, 8, 30), ["2029-08-29"]),
+            (datetime(3029, 8, 30), ["2029-08-30", "2028-08-30"]),
+            (datetime(3029, 8, 30), ["3029-08-30"]),
+            (datetime(3029, 8, 30), []),
+        ):
+            with self.subTest(original=original, source_values=source_values):
+                raw = pd.DataFrame({QUOTE_ID_HEADER: ["A"], "QUOTE DATE": [original]})
+                source = SimpleNamespace(iter_rows=lambda **_: iter([
+                    ("quote_num", "quote_created"), *[("A", value) for value in source_values],
+                ]))
+                self.assertEqual(recover_source_quote_date_years(raw, source), ())
+                self.assertEqual(raw.at[0, "QUOTE DATE"], original)
+
+    def _read(self, values, source_values, *, previous=None, continuation=True, extras=()):
         with TemporaryDirectory() as directory:
             workbook = Workbook()
             sheet = workbook.active
             sheet.title = "ICT ORDER 2026"
-            headers = IdeDynamicColumnsTests.RAW_HEADERS
+            headers = (*IdeDynamicColumnsTests.RAW_HEADERS, *extras)
             sheet.append(headers)
             sheet.append([None] * len(headers))
             for quote_id, value in values:
-                row = {QUOTE_ID_HEADER: quote_id, NEW_RFS_INITIAL_HEADER: value}
+                row = {QUOTE_ID_HEADER: quote_id, NEW_RFS_INITIAL_HEADER: value, None: "scratch"}
                 sheet.append([row.get(header) for header in headers])
             if source_values is not None:
                 source = workbook.create_sheet("source")
@@ -481,7 +641,33 @@ class IdeRawDateSourceTests(unittest.TestCase):
             path = Path(directory) / "dashboard.xlsx"
             workbook.save(path)
             workbook.close()
-            return read_raw_dataframe(path)
+            return read_raw_dataframe(path, previous=previous, reference_continuation=continuation)
+
+    def test_error_recovery_prioritizes_occurrence_history_only_for_continuation(self) -> None:
+        previous = pd.DataFrame({QUOTE_ID_HEADER: ["A", "A"],
+                                 NEW_RFS_INITIAL_HEADER: [datetime(2026, 4, 30), datetime(2026, 4, 29)]})
+        for continuation, expected in ((True, datetime(2026, 4, 29)), (False, datetime(2026, 4, 30))):
+            result = self._read([("A", "30/04/2026"), ("A", "#REF!")], None,
+                                previous=previous, continuation=continuation)
+            self.assertEqual(result.at[1, NEW_RFS_INITIAL_HEADER], expected)
+            self.assertIn(("a", 1), result.attrs["rfs_original_text_rows"][NEW_RFS_INITIAL_HEADER])
+
+    def test_unlabelled_scratch_tail_is_dropped_without_removing_named_empty_column(self) -> None:
+        result = self._read([("A", None)], None, extras=("SOURCE NOTE", None))
+        self.assertIn("SOURCE NOTE", result)
+        self.assertTrue(is_missing(result.at[0, "SOURCE NOTE"]))
+        self.assertFalse(any(str(header).startswith("Unnamed:") for header in result))
+
+    def test_previous_native_na_errors_are_not_collapsed_to_missing(self) -> None:
+        with TemporaryDirectory() as directory:
+            book = Workbook()
+            book.active.title = "ALL ORDER"
+            book.active.append([QUOTE_ID_HEADER, "STATUS DELIVERY 1 March 2027"])
+            book.active.append(["A", "#N/A"])
+            path = Path(directory) / "previous.xlsx"
+            book.save(path)
+            book.close()
+            self.assertEqual(read_previous_dataframe(path).iat[0, 1], "#N/A")
 
     def test_valid_text_typed_dates_blanks_and_zero_are_not_replaced_by_source(self) -> None:
         values = [
@@ -490,7 +676,7 @@ class IdeRawDateSourceTests(unittest.TestCase):
         ]
         result = self._read(values, [(quote, datetime(2026, 12, 1)) for quote, _ in values])
         dates = result[NEW_RFS_INITIAL_HEADER].tolist()
-        self.assertEqual(dates[:3], ["04/05/2026", "19//6/2026", datetime(2025, 4, 4)])
+        self.assertEqual(dates[:3], ["04/05/2026", datetime(2026, 6, 19), datetime(2025, 4, 4)])
         self.assertTrue(is_missing(dates[3]))
         self.assertEqual(dates[4:], ["-", 0])
 
@@ -535,6 +721,37 @@ class IdeRawDateSourceTests(unittest.TestCase):
         self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), [
             "30/04/2026", datetime(2026, 4, 30),
         ])
+
+
+class IdePlannedRfsYearTests(unittest.TestCase):
+    def test_text_year_uses_completion_year_before_report_cutoff(self) -> None:
+        value, changed = planned_rfs_with_completion_year(
+            "20/06/2025", datetime(2026, 6, 26), date(2026, 11, 2), is_text_source=True,
+        )
+        self.assertEqual(value, datetime(2026, 6, 20))
+        self.assertTrue(changed)
+
+    def test_typed_dates_future_candidates_missing_evidence_and_leap_days_are_unchanged(self) -> None:
+        for initial, complete, is_text in (
+            (datetime(2025, 6, 20), datetime(2026, 6, 26), False),
+            ("23/12/2025", datetime(2026, 6, 26), True),
+            ("20/06/2025", None, True),
+            ("20/06/2027", datetime(2026, 6, 26), True),
+            ("29/02/2024", datetime(2025, 6, 26), True),
+        ):
+            with self.subTest(initial=initial, complete=complete, is_text=is_text):
+                self.assertEqual(planned_rfs_with_completion_year(
+                    initial, complete, date(2026, 11, 2), is_text_source=is_text,
+                ), (initial, False))
+
+    def test_cutoff_includes_report_day_and_is_not_hardcoded_to_a_year(self) -> None:
+        initial = "02/03/2028"
+        self.assertEqual(planned_rfs_with_completion_year(
+            initial, datetime(2029, 1, 15), date(2029, 2, 3), is_text_source=True,
+        ), (datetime(2029, 2, 3), True))
+        self.assertEqual(planned_rfs_with_completion_year(
+            initial, datetime(2029, 1, 15), date(2029, 2, 2), is_text_source=True,
+        ), (initial, False))
 
 
 class FakeRangeDimension:
@@ -996,7 +1213,7 @@ class IdeDateParsingTests(unittest.TestCase):
         self.assertTrue(is_missing(value))
         self.assertFalse(used_fallback)
 
-    def test_valid_year_difference_does_not_replace_current_actual_rfs(self) -> None:
+    def test_reference_year_is_retained_only_for_a_matching_historical_occurrence(self) -> None:
         current = pd.DataFrame(
             {
                 QUOTE_ID_HEADER: ["Q-1", "Q-1"],
@@ -1020,8 +1237,8 @@ class IdeDateParsingTests(unittest.TestCase):
             date(2026, 8, 14),
         )
 
-        self.assertEqual(list(values), [datetime(2025, 12, 16)] * 2)
-        self.assertEqual(fallback_count, 0)
+        self.assertEqual(list(values), [datetime(2026, 12, 16), datetime(2025, 12, 16)])
+        self.assertEqual(fallback_count, 1)
 
     def test_month_opening_does_not_override_valid_current_rfs_dates(self) -> None:
         current = pd.DataFrame(

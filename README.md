@@ -103,10 +103,16 @@ python .\generate_ide_tracking.py .\input-ide `
   -o .\output-ide
 ```
 
-Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and falls back to collabs before zero when historical financial values are unavailable. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
+Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, and uses the previous workbook for historical fields and OTC/MRC. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
 
 IDE output columns follow the raw dashboard alongside the generator's calculated fields. Validation checks required input headers, output header order, the Excel table range, and refreshed pivot cache fields rather than requiring a fixed 61-column output.
-`MONTH COMPLETE` is always calculated from `SO COMPLETION DATE` and placed immediately after it (AG in the standard layout). A dashboard column with that name is discarded and replaced by the same English month formula used when the column is absent. The formula follows the manual report's `TEXT` behavior, including January for empty completion dates.
+`MONTH COMPLETE` is always calculated from `SO COMPLETION DATE` and placed
+immediately after it (AG in the standard layout). Existing full-month templates
+retain `TEXT(...,"MMMM")`, including January for empty dates. A new-period
+rebuild uses `MMM-YY`, blank for missing completion dates; subsequent daily runs
+retain that format. In this format, an existing dashboard month column is kept
+separately as `MONTH COMPLETE2`, never used as the calculated primary month.
+Unlabelled scratch columns after the last declared source header are excluded.
 Report 4 still requires only the dashboard, previous daily workbook, and collabs
 CSV. No date-correction form or extra review upload is required.
 Within an existing business period, the delivery pivots retain the previous
@@ -124,36 +130,59 @@ added to make a completion month available.
 Every connected IDE pivot preserves cell formatting and disables automatic
 reformatting so a shared-cache refresh does not shrink fitted column widths.
 
-Valid typed dates in each dashboard row are authoritative, including duplicate
-quotes and the first report of a month. The selected RFS text policy is
+The selected RFS text policy is
 `legacy-excel`, following the owner's decision to retain the manual report's
 historical conversions. Ambiguous RFS text is month-first (`11/05/2026` becomes
 5 November), with day-first fallback for unambiguous values such as
 `26/02/2026`. This is an explicit compatibility policy, not a claim that mixed
 regional conversion is a canonical date standard. Strict day-first parsing is
 tested separately but is not the active generator default. ISO/year-first and
-typed Excel dates retain their meaning. Output RFS columns display dates as
+typed Excel dates are not regionally reparsed. Output RFS columns display dates as
 `dd/mm/yyyy` to make the selected meaning visible, with time retained if present.
 The generation metadata records `rfs_text_date_policy`. The supplied FAB column
 also contains mixed legacy text; its existing handling is unchanged.
-Unreadable `NEW RFS INITIAL` values first use agreeing valid current dates for
-the same quote, then the `source` sheet. Neither replaces valid date text or blank
-current values. Remaining unreadable dates fall back to the same
-quote occurrence in the previous report. Blank current dates stay blank, and a
-different year alone does not justify replacing a valid current date. These
-rules can differ from older manually carried-forward historical values.
-Missing pre-installation starts are initialized only for observed
-Pre-Installation or Installation statuses, not just because a quote is new.
-Historical starts and their aging remain available even if the current status
-is missing. Their lookup preserves the original quote identifier, including
-whitespace, like Excel's exact VLOOKUP; unmatched history is not manufactured.
-Identifiers are preserved in the output. Other normalized lookups and CSV
-financial fallbacks keep their existing behavior. Valid starts are not reset.
+
+The manual samples use two different preparation workflows, selected from the
+previous and current business periods rather than from specific months or quote
+IDs. These are explicit legacy-compatibility rules, not a universal date policy:
+
+- **Continuation within a period:** preserve reference identifiers and the
+  existing historical status header. Nonblank duplicate ACTUAL RFS dates follow
+  the first quote match. Unreadable NEW RFS dates prefer the same previous quote
+  occurrence before agreeing current peers and `source`. Year-only date changes
+  retain the matching reference year. Existing financial snapshot values,
+  including missing values resolved to zero, are retained; collabs can supply
+  newly added quotes. The daily pre-installation placeholder advances only when
+  recognized as the previous daily placeholder; genuine older starts remain.
+- **New-period rebuild:** retain each source row's identifier and typed RFS
+  date. Broken NEW RFS lookups prefer agreeing current peers and `source` before
+  historical recovery. Legacy text can retain a matching reference year.
+  Historical NEW RFS originating as text may use SO completion year under the
+  approved rule, but never when that creates a date after the report cutoff;
+  missing evidence, native dates and invalid leap-day conversions are unchanged.
+  OTC/MRC follow exact reference keys, missing values becoming zero without a
+  newer CSV overriding that snapshot. New pre-installation starts require an
+  observed Pre-Installation or Installation status. Ancillary date text stays
+  text; numeric Excel date serials become typed dates.
+
+Historical status values come from the existing historical baseline, not the
+current status column. A period rebuild relabels that baseline with the prior
+report date. Intentional historical `#N/A` values remain native errors.
+When no reference financial snapshot exists, collabs remains the fallback.
+Blank current RFS dates stay blank. No duplicate rows are removed.
+
+An out-of-range `QUOTE DATE` year is corrected only when `source.quote_created`
+has one agreeing calendar date for the quote with the same month and day. The
+original time is retained; the current/report year is never guessed. Other
+invalid years without this evidence are retained and reported, not silently
+rewritten. Metadata records `reference_workflow`, `financial_source_policy`,
+`historical_status_source`, `month_complete_format`, `source_date_corrections`
+and `planned_rfs_year_rollovers`.
 Editing and committing text in Excel can trigger locale-dependent conversion;
 merely selecting a cell does not change its stored date. Such conversion does
 not prove the intended business date. A date already converted into an Excel
-numeric date is preserved: the generator cannot infer that someone previously
-swapped its month and day. No per-quote exception or date-correction form is used.
+numeric date cannot be diagnosed as a previous month/day swap from its display
+alone. No per-quote exception or date-correction form is used.
 Intentional `#N/A` sentinels use native `=NA()` formulas, avoiding a clipboard
 copy/paste step while retaining real Excel errors for pivot filtering.
 
@@ -180,14 +209,35 @@ generation or pivot-only comparison. Original and manual workbooks were not
 modified by the validation.
 
 The November three-file API run with that normalized dashboard completed with
-2,048 rows and ten native PivotTables. Independent native Excel comparison found
-zero numeric differences in all ten pivots against the unchanged manual report.
-The October regression run completed with 2,004 rows and also matched all ten
-manual pivot value sets without any input normalization.
+2,048 rows and 63 columns. The strict `ALL ORDER` audit found zero cell differences,
+including date versus text representation and column order. Independent native
+Excel comparison also found zero numeric differences in all ten pivots.
 This is explicitly **normalized-input parity**, not parity from an unchanged
-dashboard and not full `ALL ORDER` equality. Remaining detail differences include
-legacy carried-forward years, text versus dates, historical status, and financial
-fallback values; they do not change the compared pivot values in this fixture.
+or subsequently edited dashboard. The one ambiguous input cell remains a
+source-data limitation, not an automatic quote-specific correction.
+
+The October regression uses the original dashboard and has 2,004 rows and
+62 columns. Its one approved detail deviation is `QUOTE DATE` for quote
+`2-833355577463`: source-confirmed 2026 replaces the manual's remaining 3036.
+That correction is deliberately reported as a difference, not suppressed to
+claim literal equality. Both reports use the same source-evidenced correction.
+All ten native October pivot value sets match the manual as well. Both API
+jobs successfully produced downloadable workbooks, and Excel checks found no
+hidden pivot body rows or numeric `####` truncation. Validation left source and
+manual files unchanged, and all artifacts remain outside the repository.
+
+Run a read-only detail audit separately from the native pivot check:
+
+```powershell
+python .\ide_reference_audit.py --manual .\manual.xlsx `
+  --generated .\generated.xlsx --output .\comparison.json
+```
+
+The command checks the entire declared `ALL ORDER` schema, row order and cached
+values. It exits nonzero on any detail difference, including approved corrections;
+it never changes either workbook. `exact_value_matches` is distinct from
+`semantic_value_matches` (for example, text versus typed dates). Neither result
+proves formula-text, formatting or native PivotTable equality.
 
 ## Run Full Daily Pipeline
 
