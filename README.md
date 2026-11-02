@@ -103,11 +103,91 @@ python .\generate_ide_tracking.py .\input-ide `
   -o .\output-ide
 ```
 
-Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and writes zero when the previous workbook has no valid OTC/MRC value. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
+Use `--report-date YYYY-MM-DD` when the report date cannot be inferred from the raw IDE dashboard filename. The generator keeps every raw row with a nonblank `QUOTE ID`, preserves duplicates, uses the previous workbook for historical fields and OTC/MRC, and falls back to collabs before zero when historical financial values are unavailable. Microsoft Excel and `pywin32` are required because the copied IDE PivotTables are refreshed through Excel COM.
 
 IDE output columns follow the raw dashboard alongside the generator's calculated fields. Validation checks required input headers, output header order, the Excel table range, and refreshed pivot cache fields rather than requiring a fixed 61-column output.
 `MONTH COMPLETE` is always calculated from `SO COMPLETION DATE` and placed immediately after it (AG in the standard layout). A dashboard column with that name is discarded and replaced by the same English month formula used when the column is absent. The formula follows the manual report's `TEXT` behavior, including January for empty completion dates.
-The On Time Delivery pivot is filtered to the report's completion month, matching the 13 October manual reference; unrelated pivots keep their template filters.
+Report 4 still requires only the dashboard, previous daily workbook, and collabs
+CSV. No date-correction form or extra review upload is required.
+Within an existing business period, the delivery pivots retain the previous
+workbook's effective month and status selections, including hidden checkboxes.
+Legacy templates with no completion-month page field retain the old generator's
+monthly scope when the report month is available, otherwise all months.
+On a new business period, On Time Delivery uses all completion months and all
+delivery statuses with populated OTD results. RFS aging includes open statuses,
+including Waiting AOS, and excludes SO Complete and Cancel. This avoids carrying
+the old period's restrictive filters into a new period. The first calendar day
+still closes the prior period, like the existing target-bucket rule. The previous
+report date comes from its filename; if unavailable, cumulative defaults apply.
+Other pivot filters are preserved. No source rows, dates, or month members are
+added to make a completion month available.
+Every connected IDE pivot preserves cell formatting and disables automatic
+reformatting so a shared-cache refresh does not shrink fitted column widths.
+
+Valid typed dates in each dashboard row are authoritative, including duplicate
+quotes and the first report of a month. The selected RFS text policy is
+`legacy-excel`, following the owner's decision to retain the manual report's
+historical conversions. Ambiguous RFS text is month-first (`11/05/2026` becomes
+5 November), with day-first fallback for unambiguous values such as
+`26/02/2026`. This is an explicit compatibility policy, not a claim that mixed
+regional conversion is a canonical date standard. Strict day-first parsing is
+tested separately but is not the active generator default. ISO/year-first and
+typed Excel dates retain their meaning. Output RFS columns display dates as
+`dd/mm/yyyy` to make the selected meaning visible, with time retained if present.
+The generation metadata records `rfs_text_date_policy`. The supplied FAB column
+also contains mixed legacy text; its existing handling is unchanged.
+Unreadable `NEW RFS INITIAL` values first use agreeing valid current dates for
+the same quote, then the `source` sheet. Neither replaces valid date text or blank
+current values. Remaining unreadable dates fall back to the same
+quote occurrence in the previous report. Blank current dates stay blank, and a
+different year alone does not justify replacing a valid current date. These
+rules can differ from older manually carried-forward historical values.
+Missing pre-installation starts are initialized only for observed
+Pre-Installation or Installation statuses, not just because a quote is new.
+Historical starts and their aging remain available even if the current status
+is missing. Their lookup preserves the original quote identifier, including
+whitespace, like Excel's exact VLOOKUP; unmatched history is not manufactured.
+Identifiers are preserved in the output. Other normalized lookups and CSV
+financial fallbacks keep their existing behavior. Valid starts are not reset.
+Editing and committing text in Excel can trigger locale-dependent conversion;
+merely selecting a cell does not change its stored date. Such conversion does
+not prove the intended business date. A date already converted into an Excel
+numeric date is preserved: the generator cannot infer that someone previously
+swapped its month and day. No per-quote exception or date-correction form is used.
+Intentional `#N/A` sentinels use native `=NA()` formulas, avoiding a clipboard
+copy/paste step while retaining real Excel errors for pivot filtering.
+
+### Manual Parity Scope
+
+Source snapshots matter: the live November dashboard was changed during date
+inspection, while the original upload snapshot still contains date text at that
+cell. The original November dashboard and manual reference also disagree on one
+ambiguous RFS text interpretation. No single global conversion policy reproduces
+that exception automatically.
+
+For reference validation, an input copy was prepared using the owner-approved
+manual date to convert only that ambiguous text cell into a typed Excel date.
+All other input cells and workbook parts were preserved. This is documented
+input normalization, not a hidden generator correction. The production generator
+does not read the final manual workbook, infer a date from desired pivot totals,
+or contain a quote-specific exception. The reference-validation input copy must
+be used to reproduce that run; uploading the unnormalized or subsequently edited
+dashboard is not guaranteed to reproduce the same historical results.
+
+The web workflow still needs only three files. Full `ALL ORDER` equality is
+separate from numeric PivotTable parity and must not be implied by a successful
+generation or pivot-only comparison. Original and manual workbooks were not
+modified by the validation.
+
+The November three-file API run with that normalized dashboard completed with
+2,048 rows and ten native PivotTables. Independent native Excel comparison found
+zero numeric differences in all ten pivots against the unchanged manual report.
+The October regression run completed with 2,004 rows and also matched all ten
+manual pivot value sets without any input normalization.
+This is explicitly **normalized-input parity**, not parity from an unchanged
+dashboard and not full `ALL ORDER` equality. Remaining detail differences include
+legacy carried-forward years, text versus dates, historical status, and financial
+fallback values; they do not change the compared pivot values in this fixture.
 
 ## Run Full Daily Pipeline
 

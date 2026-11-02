@@ -17,24 +17,29 @@ from generate_ide_tracking import (
     QUOTE_ID_HEADER,
     TargetPivotPageFilter,
     build_all_order,
-    apply_current_date_first_match,
     apply_date_formats,
     apply_month_complete_formula,
+    apply_na_errors,
     apply_previous_field_fallbacks,
     apply_text_formats,
     completion_thresholds,
     date_from_filename,
     financial_value_or_zero,
-    filter_ontime_delivery_completion_month,
+    capture_delivery_pivot_filters,
+    configure_delivery_pivot_filters,
+    delivery_pivot_policy,
     has_expected_all_order_freeze_panes,
     hidden_row_ranges_between_sections,
     identify_target_complete_pivots,
     is_missing,
     load_collabs_lookup,
     load_source_new_rfs_lookup,
-    normalize_month_first_dashboard_dates,
+    normalize_dashboard_text_dates,
+    parse_dashboard_field_datetime,
     normalize_pivot_section_row_visibility,
     parse_excel_datetime,
+    preserve_pivot_refresh_layout,
+    read_raw_dataframe,
     reconcile_date_column,
     reconciled_date_value,
     resolve_financial_values,
@@ -122,6 +127,51 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         pd.testing.assert_frame_equal(result, self._build(self.raw))
         self.assertEqual(result.columns.tolist().count("MONTH COMPLETE"), 1)
 
+    def test_build_keeps_current_dates_per_duplicate_row(self) -> None:
+        raw = pd.concat([self.raw, self.raw], ignore_index=True)
+        raw[NEW_RFS_INITIAL_HEADER] = [datetime(2026, 4, 28)] * 2
+        raw[ACTUAL_RFS_DATE_HEADER] = [datetime(2026, 3, 12), "12/03/2026"]
+        result = self._build(raw)
+        self.assertEqual(result[ACTUAL_RFS_DATE_HEADER].tolist(), [
+            datetime(2026, 3, 12), datetime(2026, 12, 3),
+        ])
+
+    def test_rfs_text_reproduces_approved_legacy_conversion_without_per_quote_rules(self) -> None:
+        for text, expected in (
+            ("12/02/2026", datetime(2026, 12, 2)),
+            ("03/04/2027", datetime(2027, 3, 4)),
+            ("26/02/2026", datetime(2026, 2, 26)),
+        ):
+            with self.subTest(text=text):
+                raw = self.raw.copy()
+                raw[NEW_RFS_INITIAL_HEADER] = [text]
+                raw[ACTUAL_RFS_DATE_HEADER] = [text]
+                result = self._build(raw)
+                self.assertEqual(result.at[0, NEW_RFS_INITIAL_HEADER], expected)
+                self.assertEqual(result.at[0, ACTUAL_RFS_DATE_HEADER], expected)
+
+    def test_legacy_rfs_conversion_is_applied_consistently_in_metrics(self) -> None:
+        raw = self.raw.copy()
+        raw[QUOTE_ID_HEADER] = ["NEW"]
+        raw[NEW_RFS_INITIAL_HEADER] = ["02/26/2026"]
+        raw[ACTUAL_RFS_DATE_HEADER] = ["02/26/2026"]
+        row = self._build(raw).iloc[0]
+        self.assertEqual(row[NEW_RFS_INITIAL_HEADER], datetime(2026, 2, 26))
+        self.assertEqual(row[ACTUAL_RFS_DATE_HEADER], datetime(2026, 2, 26))
+        self.assertEqual(row["TARGET  Detemined as 1 Oct 26"], "Before October")
+        self.assertEqual(row["Aging Of RFS"], (date(2026, 10, 12) - date(2026, 2, 26)).days)
+
+    def test_reviewed_typed_input_is_not_flipped_to_match_legacy_text(self) -> None:
+        raw = self.raw.copy()
+        raw[NEW_RFS_INITIAL_HEADER] = [datetime(2026, 2, 12)]
+        typed = self._build(raw).iloc[0]
+        self.assertEqual(typed[NEW_RFS_INITIAL_HEADER], datetime(2026, 2, 12))
+        self.assertEqual(typed["TARGET  Detemined as 1 Oct 26"], "Before October")
+        raw[NEW_RFS_INITIAL_HEADER] = ["12/02/2026"]
+        text = self._build(raw).iloc[0]
+        self.assertEqual(text[NEW_RFS_INITIAL_HEADER], datetime(2026, 12, 2))
+        self.assertEqual(text["TARGET  Detemined as 1 Oct 26"], "After October")
+
     def test_month_formula_uses_named_column_positions_and_calculates_before_pivot_refresh(self) -> None:
         from unittest.mock import Mock
         worksheet = Mock()
@@ -137,28 +187,173 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         self.assertEqual(month_range.FormulaR1C1, '=TEXT(RC[-1],"[$-409]mmmm")')
         month_range.Calculate.assert_called_once()
 
-    def test_ontime_pivot_month_filter_follows_report_month_and_accepts_source_abbreviations(self) -> None:
+    def test_na_errors_use_native_formulas_without_the_windows_clipboard(self) -> None:
         from unittest.mock import Mock
-        for month_name, month_number in (("October", 10), ("Okt", 10), ("November", 11)):
-            with self.subTest(month=month_name):
-                field = Mock()
-                field.Name = "MONTH  COMPLETE"
-                field.Position = 1
-                field.PivotItems.return_value = [SimpleNamespace(Name="January"), SimpleNamespace(Name=month_name)]
-                pivot = Mock()
-                pivot.ColumnFields = [SimpleNamespace(Name="ON TIME DELIVERY")]
-                pivot.PivotFields.return_value = [field]
-                pivot.PageFields.Count = 4
-                unrelated = Mock()
-                unrelated.ColumnFields = [SimpleNamespace(Name="STATUS DELIVERY")]
-                worksheet = FakePivotWorksheet([unrelated, pivot])
-                filter_ontime_delivery_completion_month(worksheet, date(2026, month_number, 13))
-                self.assertEqual(field.Orientation, 3)
+        excel = Mock()
+        excel.AutoCorrect = SimpleNamespace(AutoFillFormulasInLists=True)
+        sheet = Mock()
+        data = pd.DataFrame({"STATUS": ["#N/A", "SO Complete", "#N/A"]})
+        apply_na_errors(excel, sheet, data)
+        target = sheet.Range.return_value
+        self.assertEqual(target.Formula, "=NA()")
+        self.assertEqual(target.Calculate.call_count, 2)
+        target.Copy.assert_not_called()
+        target.PasteSpecial.assert_not_called()
+        self.assertTrue(excel.AutoCorrect.AutoFillFormulasInLists)
+
+    def _delivery_pivot(self, column, fields):
+        from unittest.mock import Mock
+        pivot = Mock()
+        pivot.Name = column
+        pivot.ColumnFields = [SimpleNamespace(Name=column)]
+        pivot.PivotFields.return_value = fields
+        pivot.PageFields.Count = 4
+        return pivot
+
+    def _delivery_field(self, name, items, selected=None):
+        from unittest.mock import Mock
+        field = Mock()
+        field.Name = name
+        field.Position = 1
+        field.Orientation = 3
+        field.CurrentPage = "(All)"
+        field.EnableMultiplePageItems = True
+        values = [SimpleNamespace(Name=item, Visible=selected is None or item in selected) for item in items]
+        field.PivotItems.return_value = values
+        field.ClearAllFilters.side_effect = lambda: [setattr(item, "Visible", True) for item in values]
+        return field
+
+    def test_ontime_cumulative_clears_both_month_and_status_checkboxes(self) -> None:
+        for month_names in (("January", "October"), ("Okt",), ("November",), ()):
+            with self.subTest(months=month_names):
+                field = self._delivery_field("MONTH  COMPLETE", month_names, ["October"])
+                status = self._delivery_field("STATUS DELIVERY", ["SO Complete", "06-Installation"], ["SO Complete"])
+                pivot = self._delivery_pivot("ON TIME DELIVERY", [status, field])
+                worksheet = FakePivotWorksheet([pivot])
+                configure_delivery_pivot_filters(worksheet, (), "cumulative-active", date(2027, 3, 2))
                 self.assertEqual(field.Position, 3)
-                self.assertEqual(field.CurrentPage, month_name)
-                field.ClearAllFilters.assert_called_once()
+                self.assertTrue(all(item.Visible for item in field.PivotItems()))
+                self.assertTrue(all(item.Visible for item in status.PivotItems()))
                 pivot.RefreshTable.assert_called_once()
-                unrelated.PivotFields.assert_not_called()
+
+    def test_existing_period_keeps_effective_checkbox_filters_not_just_all_caption(self) -> None:
+        month = self._delivery_field("MONTH COMPLETE", ["February", "March"], ["March"])
+        status = self._delivery_field("STATUS DELIVERY", ["SO Complete", "06-Installation"], ["SO Complete"])
+        pivot = self._delivery_pivot("ON TIME DELIVERY", [month, status])
+        sheet = FakePivotWorksheet([pivot])
+        states = capture_delivery_pivot_filters(sheet)
+        self.assertEqual(states[0].selected_items, ("March",))
+        self.assertFalse(states[0].show_all)
+        for item in month.PivotItems():
+            item.Visible = True
+        configure_delivery_pivot_filters(sheet, states, "existing-period", date(2027, 3, 2))
+        self.assertEqual([item.Name for item in month.PivotItems() if item.Visible], ["March"])
+        self.assertEqual([item.Name for item in status.PivotItems() if item.Visible], ["SO Complete"])
+
+    def test_single_current_page_is_captured_even_if_all_items_report_visible(self) -> None:
+        month = self._delivery_field("MONTH COMPLETE", ["February", "March"])
+        month.CurrentPage = "March"
+        month.EnableMultiplePageItems = False
+        status = self._delivery_field("STATUS DELIVERY", ["SO Complete"])
+        sheet = FakePivotWorksheet([self._delivery_pivot("ON TIME DELIVERY", [month, status])])
+        self.assertEqual(capture_delivery_pivot_filters(sheet)[0].selected_items, ("March",))
+
+    def test_single_all_page_does_not_misread_excel_hidden_item_flags(self) -> None:
+        month = self._delivery_field("MONTH COMPLETE", ["February", "March"], [])
+        month.EnableMultiplePageItems = False
+        status = self._delivery_field("STATUS DELIVERY", ["SO Complete"])
+        sheet = FakePivotWorksheet([self._delivery_pivot("ON TIME DELIVERY", [month, status])])
+        state = capture_delivery_pivot_filters(sheet)[0]
+        self.assertTrue(state.show_all)
+        self.assertEqual(state.selected_items, ("February", "March"))
+
+    def test_new_period_aging_includes_waiting_aos_but_not_closed_orders(self) -> None:
+        status = self._delivery_field("STATUS DELIVERY", [
+            "04-Pre-Installation", "07-Waiting AOS/UAT On Hold", "SO Complete", "Cancel", "(blank)",
+        ], ["04-Pre-Installation"])
+        pivot = self._delivery_pivot("STATUS ORDER", [status])
+        configure_delivery_pivot_filters(FakePivotWorksheet([pivot]), (), "cumulative-active", date(2027, 3, 2))
+        self.assertEqual([item.Name for item in status.PivotItems() if item.Visible], [
+            "04-Pre-Installation", "07-Waiting AOS/UAT On Hold", "(blank)",
+        ])
+
+    def test_policy_uses_report_period_not_missing_month_items(self) -> None:
+        self.assertEqual(delivery_pivot_policy(date(2027, 2, 26), date(2027, 2, 27)), "existing-period")
+        self.assertEqual(delivery_pivot_policy(date(2027, 2, 28), date(2027, 3, 1)), "existing-period")
+        self.assertEqual(delivery_pivot_policy(date(2027, 2, 28), date(2027, 3, 2)), "cumulative-active")
+        self.assertEqual(delivery_pivot_policy(date(2026, 12, 31), date(2027, 1, 2)), "cumulative-active")
+        self.assertEqual(delivery_pivot_policy(None, date(2027, 1, 2)), "cumulative-active")
+
+    def test_ontime_pivot_missing_month_field_remains_an_error(self) -> None:
+        from unittest.mock import Mock
+        pivot = Mock()
+        pivot.Name = "OnTime"
+        pivot.ColumnFields = [SimpleNamespace(Name="ON TIME DELIVERY")]
+        pivot.PivotFields.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "OnTime.*MONTH COMPLETE"):
+            configure_delivery_pivot_filters(FakePivotWorksheet([pivot]), (), "cumulative-active", date(2027, 3, 2))
+
+    def test_legacy_template_without_month_page_uses_report_month_when_available(self) -> None:
+        for month_names, expected in ((["January", "March"], ["March"]), (["January"], ["January"])):
+            with self.subTest(months=month_names):
+                month = self._delivery_field("MONTH COMPLETE", month_names)
+                month.Orientation = 0
+                status = self._delivery_field("STATUS DELIVERY", ["SO Complete"])
+                sheet = FakePivotWorksheet([self._delivery_pivot("ON TIME DELIVERY", [month, status])])
+                states = capture_delivery_pivot_filters(sheet)
+                self.assertFalse(states[0].is_page_field)
+                configure_delivery_pivot_filters(sheet, states, "existing-period", date(2027, 3, 8))
+                self.assertEqual([item.Name for item in month.PivotItems() if item.Visible], expected)
+
+    def test_preinstallation_does_not_invent_start_for_new_unknown_or_closed_status(self) -> None:
+        for status in (None, "SO Complete", "Cancel", "Waiting AOS"):
+            with self.subTest(status=status):
+                raw = self.raw.copy()
+                raw[QUOTE_ID_HEADER] = ["NEW"]
+                raw["STATUS DELIVERY"] = [status]
+                row = self._build(raw).iloc[0]
+                self.assertTrue(is_missing(row["Pre-Installation Start Date"]))
+                self.assertTrue(is_missing(row["Pre-Installation Aging"]))
+                self.assertTrue(is_missing(row["Range Aging On Pre-Installation"]))
+
+    def test_preinstallation_starts_for_observed_preinstallation_or_installation(self) -> None:
+        for status in ("Pre-Installation", "Installation"):
+            with self.subTest(status=status):
+                raw = self.raw.copy()
+                raw[QUOTE_ID_HEADER] = ["NEW"]
+                raw["STATUS DELIVERY"] = [status]
+                row = self._build(raw).iloc[0]
+                self.assertEqual(row["Pre-Installation Start Date"], datetime(2026, 10, 11))
+                self.assertEqual(row["Pre-Installation Aging"], 1)
+
+    def test_unknown_status_does_not_erase_known_historical_aging(self) -> None:
+        raw = self.raw.copy()
+        raw["STATUS DELIVERY"] = [None]
+        self.previous["STATUS DELIVERY"] = [None]
+        row = self._build(raw).iloc[0]
+        self.assertEqual(row["Pre-Installation Start Date"], datetime(2026, 10, 1))
+        self.assertEqual(row["Pre-Installation Aging"], 11)
+        self.assertEqual(row["Range Aging On Pre-Installation"], "1-7 Days")
+
+    def test_preinstallation_history_uses_original_quote_key_like_excel(self) -> None:
+        for quote in ("Q-1 ", "Q-1\n"):
+            with self.subTest(quote=quote):
+                raw = self.raw.copy()
+                raw[QUOTE_ID_HEADER] = [quote]
+                row = self._build(raw).iloc[0]
+                self.assertEqual(row[QUOTE_ID_HEADER], quote)
+                self.assertTrue(is_missing(row["Pre-Installation Start Date"]))
+                self.assertTrue(is_missing(row["Pre-Installation Aging"]))
+        raw = self.raw.copy()
+        raw[QUOTE_ID_HEADER] = ["q-1"]
+        self.assertEqual(self._build(raw).iloc[0]["Pre-Installation Start Date"], datetime(2026, 10, 1))
+
+    def test_all_shared_cache_pivots_keep_formatting_and_do_not_reset_column_widths(self) -> None:
+        pivots = [SimpleNamespace(PreserveFormatting=False, HasAutoFormat=True) for _ in range(3)]
+        preserve_pivot_refresh_layout(FakePivotWorksheet(pivots))
+        for pivot in pivots:
+            self.assertTrue(pivot.PreserveFormatting)
+            self.assertFalse(pivot.HasAutoFormat)
 
     def test_missing_required_column_has_a_specific_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required columns: PARTNERS"):
@@ -188,6 +383,26 @@ class IdeDynamicColumnsTests(unittest.TestCase):
         self.assertEqual(ranges["B2:B3"].NumberFormat, "@")
         self.assertEqual(ranges["B5:B5"].NumberFormat, "@")
         self.assertFalse(any(address.startswith("C") for address in ranges))
+
+    def test_rfs_display_is_day_first_without_reformatting_other_date_columns(self) -> None:
+        ranges = {}
+
+        class Worksheet:
+            def Range(self, address):
+                return ranges.setdefault(address, SimpleNamespace(NumberFormat="General"))
+
+        data = pd.DataFrame({
+            NEW_RFS_INITIAL_HEADER: [datetime(2026, 2, 12), datetime(2026, 12, 2, 8, 30)],
+            ACTUAL_RFS_DATE_HEADER: [datetime(2026, 2, 26), datetime(2026, 3, 2, 9, 15)],
+            "FAB UPLOAD DATE": [datetime(2026, 2, 10), datetime(2026, 2, 10, 7, 30)],
+        })
+        apply_date_formats(Worksheet(), data)
+        self.assertEqual(ranges["A2:A2"].NumberFormat, "dd/mm/yyyy")
+        self.assertEqual(ranges["A3:A3"].NumberFormat, "dd/mm/yyyy h:mm AM/PM")
+        self.assertEqual(ranges["B2:B2"].NumberFormat, "dd/mm/yyyy")
+        self.assertEqual(ranges["B3:B3"].NumberFormat, "dd/mm/yyyy h:mm AM/PM")
+        self.assertEqual(ranges["C2:C2"].NumberFormat, "mm/dd/yy")
+        self.assertEqual(ranges["C3:C3"].NumberFormat, "mm/dd/yy h:mm AM/PM")
 
     def _output_workbook(self, directory):
         headers = ["QUOTE ID", "OTC", "MRC", "YEAR FAB UPLOAD"]
@@ -244,6 +459,82 @@ class IdeDynamicColumnsTests(unittest.TestCase):
             with patch("generate_ide_tracking.load_workbook", return_value=workbook):
                 with self.assertRaisesRegex(ValueError, "StalePivot.*source columns"):
                     validate_output(path, ["Q-1"], 1, expected_headers=headers)
+
+
+class IdeRawDateSourceTests(unittest.TestCase):
+    def _read(self, values, source_values):
+        with TemporaryDirectory() as directory:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "ICT ORDER 2026"
+            headers = IdeDynamicColumnsTests.RAW_HEADERS
+            sheet.append(headers)
+            sheet.append([None] * len(headers))
+            for quote_id, value in values:
+                row = {QUOTE_ID_HEADER: quote_id, NEW_RFS_INITIAL_HEADER: value}
+                sheet.append([row.get(header) for header in headers])
+            if source_values is not None:
+                source = workbook.create_sheet("source")
+                for row_number, (quote_id, value) in enumerate(source_values, start=1):
+                    source.cell(row_number, 4, quote_id)
+                    source.cell(row_number, 38, value)
+            path = Path(directory) / "dashboard.xlsx"
+            workbook.save(path)
+            workbook.close()
+            return read_raw_dataframe(path)
+
+    def test_valid_text_typed_dates_blanks_and_zero_are_not_replaced_by_source(self) -> None:
+        values = [
+            ("A", "04/05/2026"), ("B", "19//6/2026"),
+            ("C", datetime(2025, 4, 4)), ("D", None), ("E", "-"), ("F", 0),
+        ]
+        result = self._read(values, [(quote, datetime(2026, 12, 1)) for quote, _ in values])
+        dates = result[NEW_RFS_INITIAL_HEADER].tolist()
+        self.assertEqual(dates[:3], ["04/05/2026", "19//6/2026", datetime(2025, 4, 4)])
+        self.assertTrue(is_missing(dates[3]))
+        self.assertEqual(dates[4:], ["-", 0])
+
+    def test_original_quote_key_is_preserved_while_empty_quotes_are_filtered(self) -> None:
+        result = self._read([("Q-1 ", None), ("Q-2\n", None), ("   ", None)], None)
+        self.assertEqual(result[QUOTE_ID_HEADER].tolist(), ["Q-1 ", "Q-2\n"])
+
+    def test_unreadable_dates_are_recovered_from_source_when_it_has_a_valid_date(self) -> None:
+        result = self._read(
+            [("A", "#REF!"), ("B", "24/26/2026")],
+            [("A", "08-06-2026 20:19:55"), ("B", datetime(2026, 6, 19))],
+        )
+        self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), [
+            datetime(2026, 8, 6), datetime(2026, 6, 19),
+        ])
+
+    def test_invalid_source_does_not_erase_the_error_or_use_a_later_duplicate(self) -> None:
+        result = self._read(
+            [("A", "#REF!")], [("A", None), ("A", datetime(2026, 8, 6))],
+        )
+        self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), ["#REF!"])
+
+    def test_broken_quote_lookup_prefers_agreeing_current_dates_before_source(self) -> None:
+        result = self._read(
+            [("A", "30/04/2026"), ("A", "#REF!"), ("A", datetime(2026, 4, 30))],
+            [("A", datetime(2026, 4, 29))],
+        )
+        self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), [
+            "30/04/2026", datetime(2026, 4, 30), datetime(2026, 4, 30),
+        ])
+
+    def test_conflicting_current_dates_do_not_invent_a_first_match_recovery(self) -> None:
+        result = self._read(
+            [("A", "15/04/2026"), ("A", "30/04/2026"), ("A", "#REF!")], [],
+        )
+        self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), [
+            "15/04/2026", "30/04/2026", "#REF!",
+        ])
+
+    def test_agreeing_current_dates_can_recover_a_lookup_without_a_source_sheet(self) -> None:
+        result = self._read([("A", "30/04/2026"), ("A", "#REF!")], None)
+        self.assertEqual(result[NEW_RFS_INITIAL_HEADER].tolist(), [
+            "30/04/2026", datetime(2026, 4, 30),
+        ])
 
 
 class FakeRangeDimension:
@@ -356,6 +647,9 @@ class FakePivotCollection:
 
     def __call__(self, index):
         return self._pivots[index - 1]
+
+    def __iter__(self):
+        return iter(self._pivots)
 
 
 class FakePivotWorksheet:
@@ -594,20 +888,64 @@ class IdeDateParsingTests(unittest.TestCase):
             datetime(2026, 6, 22),
         )
 
-    def test_region_sensitive_dashboard_dates_are_normalized_month_first(self) -> None:
+    def test_dashboard_rfs_uses_legacy_reference_profile_and_fab_keeps_its_policy(self) -> None:
         dataframe = pd.DataFrame(
             {
                 NEW_RFS_INITIAL_HEADER: ["08/06/2026"],
                 ACTUAL_RFS_DATE_HEADER: ["11/05/2026"],
+                "FAB UPLOAD DATE": ["5/20/2026"],
             }
         )
 
-        normalize_month_first_dashboard_dates(dataframe)
+        normalize_dashboard_text_dates(dataframe)
 
         self.assertEqual(dataframe.at[0, NEW_RFS_INITIAL_HEADER], datetime(2026, 8, 6))
         self.assertEqual(dataframe.at[0, ACTUAL_RFS_DATE_HEADER], datetime(2026, 11, 5))
+        self.assertEqual(dataframe.at[0, "FAB UPLOAD DATE"], datetime(2026, 5, 20))
 
-    def test_duplicate_first_match_does_not_fill_an_empty_current_row(self) -> None:
+    def test_strict_rfs_contract_covers_day_boundary_and_preserves_typed_dates(self) -> None:
+        for header in (NEW_RFS_INITIAL_HEADER, ACTUAL_RFS_DATE_HEADER):
+            for value, expected in (
+                ("11/02/2026", datetime(2026, 2, 11)),
+                ("12/02/2026", datetime(2026, 2, 12)),
+                ("13/02/2026", datetime(2026, 2, 13)),
+                ("26/02/2026", datetime(2026, 2, 26)),
+                ("12-02-2026 07:30:00", datetime(2026, 2, 12, 7, 30)),
+                ("29/02/2028", datetime(2028, 2, 29)),
+                ("29/02/2026", None),
+                ("02/26/2026", None),
+                ("02/26/26", None),
+                ("2026-12-02 07:30:00", datetime(2026, 12, 2, 7, 30)),
+                ("2026-12-02T07:30:00.123", datetime(2026, 12, 2, 7, 30, 0, 123000)),
+                ("2026/12/02", datetime(2026, 12, 2)),
+                ("2026-26-02", None),
+                (datetime(2026, 12, 2), datetime(2026, 12, 2)),
+                (None, None),
+            ):
+                with self.subTest(header=header, value=value):
+                    self.assertEqual(
+                        parse_dashboard_field_datetime(value, header, rfs_text_policy="day-first"),
+                        expected,
+                    )
+
+    def test_rfs_profiles_do_not_guess_from_kpis_and_never_flip_typed_dates(self) -> None:
+        self.assertEqual(
+            parse_dashboard_field_datetime("11/05/2026", NEW_RFS_INITIAL_HEADER),
+            datetime(2026, 11, 5),
+        )
+        self.assertEqual(
+            parse_dashboard_field_datetime("11/05/2026", NEW_RFS_INITIAL_HEADER, rfs_text_policy="day-first"),
+            datetime(2026, 5, 11),
+        )
+        for policy in ("legacy-excel", "day-first"):
+            self.assertEqual(
+                parse_dashboard_field_datetime(datetime(2026, 2, 12), NEW_RFS_INITIAL_HEADER, rfs_text_policy=policy),
+                datetime(2026, 2, 12),
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown RFS text date policy"):
+            parse_dashboard_field_datetime("11/05/2026", NEW_RFS_INITIAL_HEADER, rfs_text_policy="guess")
+
+    def test_duplicate_dates_keep_their_own_values_and_do_not_fill_empty_rows(self) -> None:
         dataframe = pd.DataFrame(
             {
                 QUOTE_ID_HEADER: ["A", "A", "B", "B"],
@@ -626,14 +964,15 @@ class IdeDateParsingTests(unittest.TestCase):
             }
         )
 
-        apply_current_date_first_match(dataframe)
+        previous = dataframe.copy()
+        previous[NEW_RFS_INITIAL_HEADER] = datetime(2026, 1, 1)
+        previous[ACTUAL_RFS_DATE_HEADER] = datetime(2026, 1, 1)
+        for header in (NEW_RFS_INITIAL_HEADER, ACTUAL_RFS_DATE_HEADER):
+            values, count = reconcile_date_column(dataframe, previous, header, date(2026, 11, 2))
+            pd.testing.assert_series_equal(values, dataframe[header], check_names=False)
+            self.assertEqual(count, 0)
 
-        self.assertEqual(dataframe.at[1, NEW_RFS_INITIAL_HEADER], datetime(2026, 4, 30))
-        self.assertEqual(dataframe.at[1, ACTUAL_RFS_DATE_HEADER], datetime(2026, 4, 15))
-        self.assertTrue(is_missing(dataframe.at[3, NEW_RFS_INITIAL_HEADER]))
-        self.assertTrue(is_missing(dataframe.at[3, ACTUAL_RFS_DATE_HEADER]))
-
-    def test_source_new_rfs_lookup_uses_first_match_and_us_date_parsing(self) -> None:
+    def test_source_new_rfs_lookup_uses_first_match_and_legacy_date_parsing(self) -> None:
         class WorksheetStub:
             def iter_rows(self, **_kwargs):
                 return iter(
@@ -657,7 +996,7 @@ class IdeDateParsingTests(unittest.TestCase):
         self.assertTrue(is_missing(value))
         self.assertFalse(used_fallback)
 
-    def test_actual_rfs_reconciliation_uses_first_quote_lookup_key(self) -> None:
+    def test_valid_year_difference_does_not_replace_current_actual_rfs(self) -> None:
         current = pd.DataFrame(
             {
                 QUOTE_ID_HEADER: ["Q-1", "Q-1"],
@@ -681,10 +1020,10 @@ class IdeDateParsingTests(unittest.TestCase):
             date(2026, 8, 14),
         )
 
-        self.assertEqual(list(values), [datetime(2026, 12, 16)] * 2)
-        self.assertEqual(fallback_count, 2)
+        self.assertEqual(list(values), [datetime(2025, 12, 16)] * 2)
+        self.assertEqual(fallback_count, 0)
 
-    def test_month_opening_carries_previous_rfs_dates(self) -> None:
+    def test_month_opening_does_not_override_valid_current_rfs_dates(self) -> None:
         current = pd.DataFrame(
             {
                 QUOTE_ID_HEADER: ["Q-1"],
@@ -705,8 +1044,8 @@ class IdeDateParsingTests(unittest.TestCase):
             date(2026, 9, 1),
         )
 
-        self.assertEqual(list(values), [datetime(2026, 9, 8)])
-        self.assertEqual(fallback_count, 1)
+        self.assertEqual(list(values), [datetime(2026, 8, 9)])
+        self.assertEqual(fallback_count, 0)
 
     def test_non_opening_day_keeps_current_rfs_date(self) -> None:
         current = pd.DataFrame(
@@ -732,7 +1071,7 @@ class IdeDateParsingTests(unittest.TestCase):
         self.assertEqual(list(values), [datetime(2026, 8, 9)])
         self.assertEqual(fallback_count, 0)
 
-    def test_month_opening_matches_duplicate_actual_rfs_by_occurrence(self) -> None:
+    def test_month_opening_preserves_each_duplicate_current_actual_rfs(self) -> None:
         current = pd.DataFrame(
             {
                 QUOTE_ID_HEADER: ["Q-1", "Q-1"],
@@ -761,9 +1100,26 @@ class IdeDateParsingTests(unittest.TestCase):
 
         self.assertEqual(
             list(values),
-            [datetime(2026, 4, 15), datetime(2026, 4, 30)],
+            [datetime(2026, 4, 15), datetime(2026, 4, 15)],
         )
-        self.assertEqual(fallback_count, 1)
+        self.assertEqual(fallback_count, 0)
+
+    def test_unreadable_duplicate_dates_fall_back_by_occurrence_not_first_quote(self) -> None:
+        current = pd.DataFrame({
+            QUOTE_ID_HEADER: ["Q-1", "Q-1"], ACTUAL_RFS_DATE_HEADER: ["#REF!", "#REF!"],
+        })
+        previous = pd.DataFrame({
+            QUOTE_ID_HEADER: ["Q-1", "Q-1"],
+            ACTUAL_RFS_DATE_HEADER: [datetime(2026, 4, 15), datetime(2026, 4, 30)],
+        })
+        values, count = reconcile_date_column(current, previous, ACTUAL_RFS_DATE_HEADER, date(2026, 11, 2))
+        self.assertEqual(values.tolist(), previous[ACTUAL_RFS_DATE_HEADER].tolist())
+        self.assertEqual(count, 2)
+
+    def test_unreadable_date_without_valid_history_is_reported_not_invented(self) -> None:
+        value, used_fallback = reconciled_date_value("24/26/2026", None, date(2026, 11, 2))
+        self.assertEqual(value, "24/26/2026")
+        self.assertFalse(used_fallback)
 
     def test_previous_field_fallback_uses_first_quote_match_and_preserves_na_error(self) -> None:
         current = pd.DataFrame(
@@ -790,9 +1146,11 @@ class IdeDateParsingTests(unittest.TestCase):
 
     def test_target_bucket_uses_parsed_calendar_month(self) -> None:
         report_date = date(2026, 8, 13)
-        self.assertEqual(target_value("10/01/2026", report_date), "Before August")
+        self.assertEqual(target_value(datetime(2026, 1, 10), report_date), "Before August")
         self.assertEqual(target_value("13/08/2026", report_date), "Target August")
-        self.assertEqual(target_value("01/09/2026", report_date), "After August")
+        self.assertEqual(target_value(datetime(2026, 9, 1), report_date), "After August")
+        self.assertEqual(target_value("10/01/2026", report_date), "After August")
+        self.assertEqual(target_value("01/09/2026", report_date), "Before August")
 
     def test_first_calendar_day_closes_the_previous_target_month(self) -> None:
         self.assertEqual(target_period(date(2026, 9, 1)), date(2026, 8, 31))
