@@ -79,6 +79,25 @@ The standalone scripts keep their original folders and commands. Use these when 
 
 ## Run IDE Tracking
 
+Two formats are detected from workbook content:
+
+- New `IDE-list-YYYY-MM-DD.xlsx` exports: upload the `List` workbook and a
+  new-format previous IDE workbook (`Table1`). No GCP/Collabs CSV is used.
+  Revenue is copied directly from the raw export. See
+  [IDE List format rules](docs/ide-list-format.md).
+- Legacy `IDE DASHBOARD` exports: retain the existing three-file workflow,
+  including the Collabs OTC/MRC CSV.
+
+New-format example:
+
+```powershell
+python .\generate_ide_tracking.py .\input-ide\IDE-list-2026-11-17.xlsx `
+  -r ".\vlookup-ide\Daily Tracking IDE 16 November 2026.xlsx" `
+  -o .\output-ide
+```
+
+The following dashboard-specific rules and folders describe the legacy format.
+
 Required local folders:
 
 ```text

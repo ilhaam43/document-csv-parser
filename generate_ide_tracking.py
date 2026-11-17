@@ -196,7 +196,7 @@ STATUS_NORMALIZATION = {
 class InputFiles:
     raw: Path
     previous: Path
-    collabs: Path
+    collabs: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +304,12 @@ def parse_report_date(value: str) -> date:
 
 
 def date_from_filename(path: Path) -> date | None:
+    iso_match = re.search(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)", path.stem)
+    if iso_match:
+        try:
+            return date.fromisoformat(iso_match.group(1))
+        except ValueError:
+            pass
     numeric_match = re.search(r"(?<!\d)(20\d{6})(?!\d)", path.stem)
     if numeric_match:
         try:
@@ -346,12 +352,12 @@ def determine_report_date(explicit_date: date | None, raw: Path) -> date:
         return explicit_date
 
     raw_date = date_from_filename(raw)
-    if raw_date is not None and raw.stem.casefold().startswith("ide dashboard"):
+    if raw_date is not None and raw.stem.casefold().startswith(("ide dashboard", "ide-list-")):
         return raw_date
 
     raise ValueError(
         "Raw workbook filename must include the report date, for example: "
-        "'IDE DASHBOARD 15 August 2026.xlsx'."
+        "'IDE DASHBOARD 15 August 2026.xlsx' or 'IDE-list-2026-11-16.xlsx'."
     )
 
 
@@ -380,10 +386,15 @@ def resolve_single_file(path: Path, suffix: str, description: str) -> Path:
 
 
 def resolve_inputs(args: argparse.Namespace) -> InputFiles:
+    from ide_list_format import is_list_export
+
+    raw = resolve_single_file(args.input, ".xlsx", "IDE raw workbook")
     return InputFiles(
-        raw=resolve_single_file(args.input, ".xlsx", "IDE raw workbook"),
+        raw=raw,
         previous=resolve_single_file(args.reference, ".xlsx", "previous IDE workbook"),
-        collabs=resolve_single_file(args.collabs, ".csv", "collabs fallback"),
+        collabs=None if is_list_export(raw) else resolve_single_file(
+            args.collabs or Path(DEFAULT_COLLABS_DIR), ".csv", "collabs fallback"
+        ),
     )
 
 
@@ -2986,6 +2997,12 @@ def generate_ide_tracking(
     output_path: Path,
     report_date: date,
 ) -> dict[str, object]:
+    from ide_list_format import generate as generate_list, is_list_export
+
+    if is_list_export(files.raw):
+        return generate_list(files.raw, files.previous, output_path, report_date)
+    if files.collabs is None:
+        raise ValueError("Legacy IDE Dashboard requires the Collabs OTC/MRC CSV. IDE List exports do not.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     previous = read_previous_dataframe(files.previous)
     raw = read_raw_dataframe(
@@ -3099,7 +3116,8 @@ def main(argv: list[str] | None = None) -> int:
         output_path = resolve_output_path(args.output, report_date)
         print(f"[1/5] Reading raw data: {files.raw.name}")
         print(f"[2/5] Loading previous mapping: {files.previous.name}")
-        print(f"[3/5] Loading OTC/MRC fallback: {files.collabs.name}")
+        print(f"[3/5] Loading OTC/MRC fallback: {files.collabs.name}" if files.collabs else
+              "[3/5] Using Revenue from the IDE List export (no GCP CSV)")
         print("[4/5] Updating ALL ORDER and refreshing PivotTables in Excel")
         result = generate_ide_tracking(files, output_path, report_date)
         print("[5/5] Validating output")
@@ -3115,10 +3133,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         duplicate_quote_ids = result["duplicate_quote_ids"]
         if duplicate_quote_ids:
+            lookup_policy = "first-quote reference match" if result.get("format_profile") == "ide-list" else "occurrence match"
             print(
                 f"Preserved {result['duplicate_rows_preserved']} repeated rows across "
-                f"{len(duplicate_quote_ids)} Quote IDs; lookups are matched by occurrence."
+                f"{len(duplicate_quote_ids)} Quote IDs; historical lookups use {lookup_policy}."
             )
+        for warning in result.get("source_warnings", []):
+            print(f"[warn] Preserved source date: {warning['key']} | {warning['field']} | {warning['value']}", file=sys.stderr)
         invalid_dates = result["invalid_dates"]
         if invalid_dates:
             print("[warn] Invalid source date values were preserved as text:", file=sys.stderr)

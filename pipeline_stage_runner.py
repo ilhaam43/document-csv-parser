@@ -280,7 +280,7 @@ def run_iphone_stage(
 def run_ide_stage(
     raw_workbook: Path,
     previous_workbook: Path,
-    collabs_csv: Path,
+    collabs_csv: Path | None,
     output_path: Path,
     report_date: date,
     timeout_seconds: int = DEFAULT_STAGE_TIMEOUT_SECONDS,
@@ -295,8 +295,7 @@ def run_ide_stage(
                 str(raw_workbook.resolve()),
                 "--reference",
                 str(previous_workbook.resolve()),
-                "--collabs",
-                str(collabs_csv.resolve()),
+                *(["--collabs", str(collabs_csv.resolve())] if collabs_csv is not None else []),
                 "--report-date",
                 report_date.isoformat(),
                 "--output",
@@ -407,7 +406,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ide = subparsers.add_parser("ide")
     ide.add_argument("--raw", type=Path, required=True)
     ide.add_argument("--reference", type=Path, required=True)
-    ide.add_argument("--collabs", type=Path, required=True)
+    ide.add_argument("--collabs", type=Path)
     ide.add_argument("--report-date", type=lambda value: datetime.strptime(value, "%Y-%m-%d").date(), required=True)
     ide.add_argument("--output", type=Path, required=True)
     ide.add_argument("--metadata-output", type=Path, required=True)

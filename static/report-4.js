@@ -27,7 +27,7 @@ function processingStage(seconds) {
     return "Mapping data from the previous workbook";
   }
   if (seconds < 60) {
-    return "Applying collabs OTC/MRC fallback";
+    return "Preparing report values";
   }
   if (seconds < 90) {
     return "Updating ALL ORDER";

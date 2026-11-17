@@ -10,6 +10,43 @@ import app as app_module
 
 
 class ReportJobPathTests(unittest.TestCase):
+    def test_report_4_list_export_queues_without_collabs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_id = uuid.uuid4().hex
+            with patch.object(app_module, "API_WORK_DIR", Path(temp_dir)), \
+                 patch.object(app_module.REPORT_4_EXECUTOR, "submit") as submit, \
+                 patch("ide_list_format.is_list_export", return_value=True):
+                response = TestClient(app_module.app).post(
+                    "/convert/report-4/upload/jobs",
+                    files={"raw_ide_workbook": ("IDE-list-2026-11-17.xlsx", b"raw", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                           "previous_ide_workbook": ("reference.xlsx", b"reference", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    data={"job_id": job_id},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIsNone(response.json()["collabs_csv_filename"])
+            self.assertIsNone(submit.call_args.args[4])
+            self.assertEqual(submit.call_args.args[5].name, "Daily Tracking IDE 17 November 2026.xlsx")
+            with app_module.REPORT_4_JOBS_LOCK:
+                app_module.REPORT_4_JOBS.pop(job_id, None)
+
+    def test_report_4_legacy_without_collabs_returns_clear_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            job_id = uuid.uuid4().hex
+            with patch.object(app_module, "API_WORK_DIR", Path(temp_dir)), \
+                 patch.object(app_module.REPORT_4_EXECUTOR, "submit") as submit, \
+                 patch("ide_list_format.is_list_export", return_value=False):
+                response = TestClient(app_module.app).post(
+                    "/convert/report-4/upload/jobs",
+                    files={"raw_ide_workbook": ("IDE DASHBOARD 17 November 2026.xlsx", b"raw", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                           "previous_ide_workbook": ("reference.xlsx", b"reference", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    data={"job_id": job_id},
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("requires the Collabs", response.json()["detail"])
+            submit.assert_not_called()
+            with app_module.REPORT_4_JOBS_LOCK:
+                app_module.REPORT_4_JOBS.pop(job_id, None)
+
     def test_report_1_uses_job_local_input_and_output_paths(self) -> None:
         with TemporaryDirectory() as temp_dir:
             api_work_dir = Path(temp_dir).resolve()

@@ -780,7 +780,7 @@ def _run_report_4_upload_job(
     job_id: str,
     raw_workbook_path: Path,
     previous_workbook_path: Path,
-    collabs_csv_path: Path,
+    collabs_csv_path: Path | None,
     output_path: Path,
     report_date: date,
 ) -> None:
@@ -827,6 +827,9 @@ def _run_report_4_upload_job(
         pivot_tables=result["pivot_tables"],
         collabs_fallback_rows=result["collabs_fallback_rows"],
         zero_fallback_rows=result["zero_fallback_rows"],
+        format_profile=result.get("format_profile", "legacy-dashboard"),
+        financial_source_policy=result.get("financial_source_policy"),
+        source_warnings=result.get("source_warnings", []),
         stdout=result.get("stdout", ""),
         stderr=result.get("stderr", ""),
     )
@@ -1245,6 +1248,9 @@ def report_4_job_status(request: Request, job_id: str) -> dict[str, object]:
         "pivot_tables": job.get("pivot_tables"),
         "collabs_fallback_rows": job.get("collabs_fallback_rows"),
         "zero_fallback_rows": job.get("zero_fallback_rows"),
+        "format_profile": job.get("format_profile"),
+        "financial_source_policy": job.get("financial_source_policy"),
+        "source_warnings": job.get("source_warnings", []),
         "elapsed_seconds": job.get("elapsed_seconds"),
         "error": job.get("error"),
         "downloaded": job.get("downloaded", False),
@@ -1773,14 +1779,14 @@ async def start_report_4_upload_job(
     request: Request,
     raw_ide_workbook: UploadFile = File(...),
     previous_ide_workbook: UploadFile = File(...),
-    collabs_csv: UploadFile = File(...),
+    collabs_csv: UploadFile | None = File(default=None),
     job_id: str | None = Form(default=None),
 ) -> dict[str, object]:
     if not raw_ide_workbook.filename or not raw_ide_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="raw_ide_workbook must be a .xlsx file.")
     if not previous_ide_workbook.filename or not previous_ide_workbook.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="previous_ide_workbook must be a .xlsx file.")
-    if not collabs_csv.filename or not collabs_csv.filename.lower().endswith(".csv"):
+    if collabs_csv is not None and collabs_csv.filename and not collabs_csv.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="collabs_csv must be a .csv file.")
     job_id = _normalize_upload_job_id(job_id)
     with REPORT_4_JOBS_LOCK:
@@ -1796,12 +1802,18 @@ async def start_report_4_upload_job(
     job_dir.mkdir(parents=True, exist_ok=True)
     raw_path = _job_input_path(job_dir, "raw-ide", raw_ide_workbook.filename)
     previous_path = _job_input_path(job_dir, "ide-reference", previous_ide_workbook.filename)
-    collabs_path = _job_input_path(job_dir, "collabs", collabs_csv.filename)
+    collabs_path = _job_input_path(job_dir, "collabs", collabs_csv.filename) if collabs_csv is not None and collabs_csv.filename else None
 
     try:
         await _save_upload_file(raw_ide_workbook, raw_path)
         await _save_upload_file(previous_ide_workbook, previous_path)
-        await _save_upload_file(collabs_csv, collabs_path)
+        if collabs_path is not None:
+            await _save_upload_file(collabs_csv, collabs_path)
+        if collabs_path is None:
+            from ide_list_format import is_list_export
+
+            if not is_list_export(raw_path):
+                raise ValueError("Legacy IDE Dashboard requires the Collabs OTC/MRC CSV. IDE List exports do not.")
         resolved_report_date = determine_ide_report_date(None, raw_path)
     except Exception as exc:
         logger.exception("Report 4 upload save failed for job %s", job_id)
@@ -1821,7 +1833,7 @@ async def start_report_4_upload_job(
             "updated_at": _now_seconds(),
             "raw_ide_workbook_filename": raw_path.name,
             "previous_ide_workbook_filename": previous_path.name,
-            "collabs_csv_filename": collabs_path.name,
+            "collabs_csv_filename": collabs_path.name if collabs_path is not None else None,
             "report_date": resolved_report_date.isoformat(),
             "filename": output_path.name,
         })
@@ -1846,7 +1858,7 @@ async def start_report_4_upload_job(
         "report_date": resolved_report_date.isoformat(),
         "raw_ide_workbook_filename": raw_path.name,
         "previous_ide_workbook_filename": previous_path.name,
-        "collabs_csv_filename": collabs_path.name,
+        "collabs_csv_filename": collabs_path.name if collabs_path is not None else None,
     }
 
 
