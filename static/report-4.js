@@ -21,7 +21,7 @@ function processingStage(seconds) {
     return "Uploading IDE files";
   }
   if (seconds < 20) {
-    return "Reading IDE dashboard";
+    return "Reading IDE List";
   }
   if (seconds < 40) {
     return "Mapping data from the previous workbook";

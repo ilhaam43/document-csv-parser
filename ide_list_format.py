@@ -3,21 +3,32 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import math
 import os
 import re
 import shutil
 import tempfile
 from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
+from time import perf_counter
+from types import SimpleNamespace
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles.numbers import BUILTIN_FORMATS
 
-from excel_pivot_layout import capture_pivot_alignments, pivot_row_identity, restore_pivot_alignments
+from ide_pivot_presentation import pivot_row_identity
 from excel_pivot_filters import is_dynamic_target_header
+from ide_workbook_package import conditional_formats, validate_table_and_caches, worksheet_part
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 STATUS = {
@@ -43,6 +54,141 @@ PREFIX = (
 DATE_FIELDS = {"Target RFS", "Actual RFS Date", "Updated", "Resolved", "Created", "FAB Sign Date",
                "FAB Upload Date", "Cash Date", "SO Date", "Service Ready Date", "AOS Sent Date",
                "AOS Sign Date", "SO Completion Date", "Nodin Date"}
+FINANCIAL_FIELDS = {
+    "Revenue", "Revenue Upside", "Penalty BC", "CoS Actual", "Risk Actual", "CoS BC",
+    "Risk BC", "Penalty Actual", "Cost Planned", "Actual Cost", "Revenue (Juta)",
+}
+PROGRESS_BAR_COLOR = 0xCAD37F  # Excel OLE color for the manual's #7FD3CA.
+
+
+@dataclass(frozen=True)
+class ColumnPresentation:
+    number_format: str = "General"
+    alignment: tuple = (None, "top", False, False, 0, 0)
+    header_alignment: tuple = ("center", "center", True, False, 0, 0)
+    font_name: str | None = None
+    font_size: float | None = None
+
+
+def presentation_key(name: str, *, raw: bool = False) -> str:
+    name = header(name).casefold()
+    if is_dynamic_target_header(name):
+        return "__monthly_target__"
+    if re.fullmatch(r"month complete\d+", name) or (raw and name == "month complete"):
+        return "__source_month_complete__"
+    return name
+
+
+def read_column_presentations(path: Path, sheet_name: str, *, records: list[dict] | None = None) -> dict[str, ColumnPresentation]:
+    """Use populated cells, not row 2: sparse Progress/date columns start blank."""
+    book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if records is not None and sheet_name not in book.sheetnames:
+            raise ValueError(f"Workbook {path.name!r} must contain worksheet {sheet_name!r}.")
+        rows = book[sheet_name].iter_rows()
+        headings = next(rows)
+        names = [header(cell.value) for cell in headings]
+        nonblank = [name.casefold() for name in names if name]
+        if len(nonblank) != len(set(nonblank)):
+            raise ValueError(f"Worksheet {sheet_name!r} contains duplicate column headers.")
+        formats = [Counter() for _ in headings]
+        alignments = [Counter() for _ in headings]
+
+        def alignment(cell):
+            value = cell.alignment
+            return (value.horizontal, value.vertical, bool(value.wrapText),
+                    bool(value.shrinkToFit), value.indent, value.textRotation)
+
+        for row in rows:
+            if records is not None:
+                values = [cell.value for cell in row]
+                if any(value is not None for value in values):
+                    records.append(dict(zip(names, values)))
+            for index, cell in enumerate(row[:len(headings)]):
+                if cell.value is not None:
+                    formats[index][cell.number_format] += 1
+                    alignments[index][alignment(cell)] += 1
+        result = {}
+        for index, cell in enumerate(headings):
+            if cell.value is None:
+                continue
+            result[presentation_key(str(cell.value), raw=sheet_name == "List")] = ColumnPresentation(
+                formats[index].most_common(1)[0][0] if formats[index] else "General",
+                alignments[index].most_common(1)[0][0] if alignments[index] else ColumnPresentation().alignment,
+                alignment(cell),
+                getattr(getattr(cell, "font", None), "name", None),
+                getattr(getattr(cell, "font", None), "sz", None),
+            )
+        return result
+    finally:
+        book.close()
+
+
+def column_presentations(
+    columns, reference: dict[str, ColumnPresentation], source: dict[str, ColumnPresentation],
+) -> dict[str, ColumnPresentation]:
+    result = {}
+    financial_format = reference.get("revenue", ColumnPresentation()).number_format
+    if financial_format in {"General", "@"}:
+        financial_format = BUILTIN_FORMATS[44]
+    for name in columns:
+        key = presentation_key(name)
+        fallback = reference.get("status") if key == "yesterday status" else None
+        model = reference.get(key, source.get(key, fallback or ColumnPresentation()))
+        if name == "Progress":
+            model = replace(model, number_format="0.0%")
+        elif name == "Aging Of RFS":
+            model = replace(model, number_format="0")
+        elif name in FINANCIAL_FIELDS:
+            model = replace(model, number_format=financial_format)
+        elif name in DATE_FIELDS:
+            model = replace(model, number_format=r"d\ mmm\ yyyy")
+        if name in {"Aging Of RFS", "STATUS ORDER", "ON TIME DELIVERY", "MONTH COMPLETE"}:
+            values = list(model.alignment)
+            values[2] = False
+            model = replace(model, alignment=tuple(values))
+        elif name in {"ORDER TYPE", "PROCESS"}:
+            values = list(model.alignment)
+            values[2] = True
+            model = replace(model, alignment=tuple(values))
+        heading = list(model.header_alignment)
+        heading[:2] = ["center", "center"]
+        heading[4] = 0
+        result[name] = replace(model, header_alignment=tuple(heading))
+    return result
+
+
+def apply_column_alignment(target, values: tuple) -> None:
+    horizontal, vertical, wrap, shrink, indent, rotation = values
+    horizontal_value = {
+        None: 1, "general": 1, "left": -4131, "center": -4108, "right": -4152,
+        "fill": 5, "justify": -4130, "centerContinuous": 7, "distributed": -4117,
+    }[horizontal]
+    vertical_value = {
+        None: -4107, "bottom": -4107, "top": -4160, "center": -4108,
+        "justify": -4130, "distributed": -4117,
+    }[vertical]
+    for name, value in {
+        "HorizontalAlignment": horizontal_value, "VerticalAlignment": vertical_value,
+        "WrapText": wrap, "ShrinkToFit": shrink, "IndentLevel": int(indent or 0),
+        "Orientation": -4166 if rotation == 255 else int(rotation or 0),
+    }.items():
+        if getattr(target, name, None) != value:
+            setattr(target, name, value)
+
+
+def fit_unwrapped_text_columns(worksheet, body, frame: pd.DataFrame, presentations: dict) -> None:
+    """Keep reference widths as a minimum; fit long names without growing unbounded."""
+    for index, name in enumerate(frame.columns, 1):
+        if presentations[name].alignment[2]:
+            continue
+        width = float(worksheet.Columns(index).ColumnWidth)
+        longest = max((len(value) for value in frame[name] if isinstance(value, str)), default=0)
+        if longest <= width:
+            continue
+        body.Columns(index).AutoFit()
+        fitted = float(worksheet.Columns(index).ColumnWidth)
+        worksheet.Columns(index).ColumnWidth = max(width, min(48, fitted))
 
 
 def header(value: object) -> str:
@@ -53,7 +199,11 @@ def blank(value: object) -> bool:
     return value is None or value is pd.NA or (isinstance(value, float) and math.isnan(value))
 
 
-def read_records(path: Path, sheet: str) -> list[dict]:
+def read_records(path: Path, sheet: str, *, presentations: dict | None = None) -> list[dict]:
+    if presentations is not None:
+        records = []
+        presentations.update(read_column_presentations(path, sheet, records=records))
+        return records
     book = load_workbook(path, read_only=True, data_only=True)
     try:
         if sheet not in book.sheetnames:
@@ -203,12 +353,82 @@ def _capture_filters(sheet) -> dict:
     return states
 
 
+def capture_progress_bar(table):
+    progress = table.ListColumns("Progress").DataBodyRange
+    for rule in progress.FormatConditions:
+        if int(rule.Type) == 4:  # xlDataBar
+            return rule
+    # Older generated references left this 0-100% bar on a date column when
+    # Progress moved. Recover only that recognizable rule, not unrelated CF.
+    for rule in table.DataBodyRange.FormatConditions:
+        if int(rule.Type) != 4:
+            continue
+        area = rule.AppliesTo
+        index = int(area.Column) - int(table.Range.Column) + 1
+        if (int(area.Columns.Count) == 1 and 1 <= index <= int(table.ListColumns.Count)
+                and str(table.ListColumns(index).Name) in DATE_FIELDS
+                and int(rule.MinPoint.Type) == int(rule.MaxPoint.Type) == 0
+                and float(rule.MinPoint.Value) == 0 and float(rule.MaxPoint.Value) == 1
+                and int(rule.BarColor.Color) == PROGRESS_BAR_COLOR):
+            return rule
+    return None
+
+
+def restore_progress_bar(table, rule) -> None:
+    progress = table.ListColumns("Progress").DataBodyRange
+    if rule is None:
+        rule = progress.FormatConditions.AddDatabar()
+        rule.BarColor.Color = PROGRESS_BAR_COLOR
+        rule.BarFillType = 0  # xlDataBarFillSolid
+    else:
+        rule.ModifyAppliesToRange(progress)
+    rule.MinPoint.Modify(0, 0)  # xlConditionValueNumber, fixed 0-100% scale.
+    rule.MaxPoint.Modify(0, 1)
+    rule.PercentMin, rule.PercentMax, rule.ShowValue = 0, 100, True
+
+
+def validate_progress_bar(sheet, column: int, row_count: int) -> None:
+    expected = f"{get_column_letter(column)}2:{get_column_letter(column)}{row_count + 1}"
+    rules = [(area, rule) for area in sheet.conditional_formatting
+             for rule in sheet.conditional_formatting[area] if rule.type == "dataBar"
+             and any(region.min_col <= column <= region.max_col for region in area.sqref.ranges)]
+    if len(rules) != 1 or str(rules[0][0].sqref) != expected:
+        raise RuntimeError(f"Saved IDE List Progress data bar must cover {expected} exactly.")
+    points = rules[0][1].dataBar.cfvo
+    if len(points) != 2 or [(point.type, point.val) for point in points] != [("num", 0), ("num", 1)]:
+        raise RuntimeError("Saved IDE List Progress data bar must use a fixed 0-100% scale.")
+
+
+def is_target_after_filter(fields: dict) -> bool:
+    from generate_ide_tracking import target_item_kind
+
+    return any(is_dynamic_target_header(name) and selected
+               and {target_item_kind(value) for value in selected} == {"after"}
+               for name, selected in fields.items())
+
+
+def percentage_helper_formula(status_cells: dict[str, list[str]], denominator: str, *,
+                              target_after: bool = False) -> str:
+    complete = status_cells.get("5.SO Complete", [])
+    cancel = status_cells.get("6.Cancel", [])
+    if target_after:
+        # Target After intentionally follows the confirmed manual precedence.
+        completed = f'SUM({",".join(complete)})' if complete else "0"
+        cancelled = f'SUM({",".join(cancel)})' if cancel else "0"
+        expression = f"{completed}+{cancelled}/{denominator}"
+    else:
+        expression = f'({"+".join(complete + cancel) or "0"})/{denominator}'
+    return f"=IF({denominator}=0,0,{expression})"
+
+
 def _restore_percentages(sheet, scratch, blocks) -> None:
     from generate_ide_tracking import restore_pivot_percentage_blocks
 
     restore_pivot_percentage_blocks(sheet, scratch, blocks)
+    filters = _capture_filters(sheet)
     for block in blocks:
         phase = sheet.PivotTables(block.pivot_name)
+        target_after = is_target_after_filter(filters[str(phase.Name)])
         region = phase.TableRange1
         summaries = [p for p in sheet.PivotTables() if int(p.TableRange1.Column) < int(region.Column)
                      and {str(f.SourceName) for f in p.RowFields} == {str(f.SourceName) for f in phase.RowFields}
@@ -217,10 +437,11 @@ def _restore_percentages(sheet, scratch, blocks) -> None:
             raise RuntimeError(f"No quote-count summary for {phase.Name}.")
         summary = min(summaries, key=lambda p: abs(int(p.TableRange1.Row) - int(region.Row)))
         denominators = {}
+        summary_fields, phase_fields = {}, {}
         for row in summary.DataBodyRange.Rows:
             for cell in row.Cells:
                 if str(cell.PivotCell.DataField.SourceName) == "Quote ID":
-                    denominators[pivot_row_identity(cell)] = cell.Address
+                    denominators[pivot_row_identity(cell, field_names=summary_fields)] = cell.Address
         body = phase.DataBodyRange
         percentage_column = int(region.Column + region.Columns.Count)
         if body is None:
@@ -228,19 +449,26 @@ def _restore_percentages(sheet, scratch, blocks) -> None:
             target.Formula = "=0"
             target.NumberFormat = "0.00%"
             continue
+        status_columns = None
         for row in body.Rows:
-            numerator = []
-            identity = pivot_row_identity(row.Cells(1, 1))
-            for cell in row.Cells:
-                items = cell.PivotCell.ColumnItems
-                statuses = [str(items(i).Name) for i in range(1, int(items.Count) + 1)]
-                if any(value in {"5.SO Complete", "6.Cancel"} for value in statuses):
-                    numerator.append(str(cell.Address))
+            if status_columns is None:
+                status_columns = {}
+                for cell in row.Cells:
+                    items = cell.PivotCell.ColumnItems
+                    statuses = [str(items(i).Name) for i in range(1, int(items.Count) + 1)]
+                    for status in ("5.SO Complete", "6.Cancel"):
+                        if status in statuses:
+                            status_columns.setdefault(status, []).append(int(cell.Column))
+            row_number = int(row.Row)
+            status_cells = {status: [f"${get_column_letter(column)}${row_number}" for column in columns]
+                            for status, columns in status_columns.items()}
+            identity = pivot_row_identity(row.Cells(1, 1), field_names=phase_fields)
             denominator = denominators.get(identity)
             if denominator is None:
                 raise RuntimeError(f"Missing percentage denominator for {phase.Name}: {identity!r}")
             target = sheet.Cells(int(row.Row), percentage_column)
-            target.Formula = f'=IF({denominator}=0,0,({"+".join(numerator) or "0"})/{denominator})'
+            target.Formula = percentage_helper_formula(
+                status_cells, denominator, target_after=target_after)
             target.NumberFormat = "0.00%"
 
 
@@ -286,14 +514,35 @@ def _validate_pivot_totals(sheet, frame: pd.DataFrame) -> None:
                 raise RuntimeError(f"Pivot {pivot.Name} count {actual} differs from source count {len(selected)}.")
 
 
-def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
+def _write_native(path: Path, frame: pd.DataFrame, report_date: date, *, raw_path: Path | None = None,
+                  reference_presentations: dict | None = None, source_presentations: dict | None = None,
+                  timings: dict | None = None) -> int:
     import pythoncom
     import win32com.client
     from generate_ide_tracking import (
         capture_pivot_percentage_blocks, com_value, contiguous_row_ranges, normalize_pivot_section_row_visibility,
-        update_pivot_period_titles, target_header,
+        update_pivot_period_titles, target_header, normalize_pivot_percentage_borders,
     )
+    from excel_pivot_layout import resize_dynamic_pivot_section_banners
+    from ide_pivot_presentation import read_presentation_grid, capture_presentation, restore_presentation
 
+    stage_start = perf_counter()
+
+    def mark_stage(name):
+        nonlocal stage_start
+        now = perf_counter()
+        if timings is not None:
+            timings[name] = now - stage_start
+        stage_start = now
+
+    if reference_presentations is None:
+        reference_presentations = read_column_presentations(path, "ALL ORDER")
+    if source_presentations is None:
+        source_presentations = read_column_presentations(raw_path, "List") if raw_path is not None else {}
+    presentations = column_presentations(frame.columns, reference_presentations, source_presentations)
+    report_font = source_presentations.get("key", reference_presentations.get("key", ColumnPresentation()))
+    pivot_grid, pivot_rows = read_presentation_grid(path)
+    mark_stage("read_pivot_presentation")
     pythoncom.CoInitialize()
     excel = book = anchor = None
     try:
@@ -302,15 +551,22 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
         anchor = excel.Workbooks.Add()
         excel.Calculation = -4135
         book = excel.Workbooks.Open(str(path.resolve()), UpdateLinks=0, ReadOnly=False)
+        mark_stage("open_excel")
         data, sheet = book.Worksheets("ALL ORDER"), book.Worksheets("PIVOT")
         if not data.ListObjects.Count or str(data.ListObjects(1).Name) != "Table1":
             raise ValueError("The new IDE format requires a reference with Excel table Table1.")
         table = data.ListObjects("Table1")
+        progress_bar = capture_progress_bar(table)
         filters = _capture_filters(sheet)
-        alignments = capture_pivot_alignments(sheet)
+        pivot_presentation = capture_presentation(sheet, pivot_grid, pivot_rows)
         widths = {i: float(sheet.Columns(i).ColumnWidth) for i in range(1, int(sheet.UsedRange.Columns.Count) + 1)}
         scratch, blocks = capture_pivot_percentage_blocks(book, sheet)
+        mark_stage("capture_reference")
         old_headers = [str(cell.Value2) for cell in table.HeaderRowRange.Cells]
+        header_styles = {
+            presentation_key(str(cell.Value2)): (cell.Interior.Color, cell.Font.Color, cell.Font.Bold)
+            for cell in table.HeaderRowRange.Cells
+        }
         old_target = next(name for name in old_headers if is_dynamic_target_header(name))
         new_target = target_header(report_date)
         # Bind by field name before renaming the monthly field. Reusing positional
@@ -318,7 +574,8 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
         write_headers = [old_target if name == new_target else name for name in frame.columns]
         migration_headers = [name for name in old_headers if name not in write_headers]
         cache_headers = write_headers + migration_headers
-        styles = {name: data.Cells(1, i).EntireColumn.ColumnWidth for i, name in enumerate(old_headers, 1)}
+        styles = {presentation_key(name): data.Cells(1, i).EntireColumn.ColumnWidth
+                  for i, name in enumerate(old_headers, 1)}
         data.Range(data.Cells(2, 1), data.Cells(max(int(table.Range.Rows.Count), len(frame) + 1),
                                              max(len(old_headers), len(frame.columns)))).ClearContents()
         table.Resize(data.Range(data.Cells(1, 1), data.Cells(len(frame) + 1, len(cache_headers))))
@@ -331,7 +588,9 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
                 column.NumberFormat = "@"
             elif name in DATE_FIELDS:
                 column.NumberFormat = "dd/mm/yyyy hh:mm" if name in {"Updated", "Resolved", "Created"} else "dd/mm/yyyy"
-            data.Columns(i).ColumnWidth = styles.get(name, 18)
+            key = presentation_key(name)
+            fallback_width = styles.get("month complete", 18) if key == "yesterday status" else 18
+            data.Columns(i).ColumnWidth = styles.get(key, fallback_width)
         body.Value2 = tuple(tuple(com_value(value) for value in row) + (None,) * len(migration_headers)
                             for row in frame.itertuples(index=False, name=None))
         col = {name: i for i, name in enumerate(frame.columns, 1)}
@@ -355,7 +614,36 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
             missing_rows = [i for i, value in enumerate(frame[name], 2) if blank(value)]
             for start, end in contiguous_row_ranges(missing_rows):
                 data.Range(data.Cells(start, col[name]), data.Cells(end, col[name])).ClearContents()
+        # Text protection is only for ingestion. Restore display formats after
+        # writing so General/month labels cannot trigger Excel's date conversion.
+        for name, presentation in presentations.items():
+            column = body.Columns(col[name])
+            column.NumberFormat = presentation.number_format
+            apply_column_alignment(column, presentation.alignment)
+            header_cell = data.Cells(1, col[name])
+            apply_column_alignment(header_cell, presentation.header_alignment)
+            header_cell_font = header_cell.Font
+            key = presentation_key(name)
+            style = header_styles.get(key)
+            if style is None:
+                style = header_styles.get("month complete" if key == "yesterday status" else "key")
+            if style is not None:
+                header_cell.Interior.Color, header_cell_font.Color, header_cell_font.Bold = style
+            header_font = source_presentations.get(key)
+            if header_font is None:
+                header_font = report_font if key == "yesterday status" else reference_presentations.get(key)
+            if header_font is not None:
+                if header_font.font_name and header_cell_font.Name != header_font.font_name:
+                    header_cell_font.Name = header_font.font_name
+                if header_font.font_size and header_cell_font.Size != header_font.font_size:
+                    header_cell_font.Size = header_font.font_size
+        if report_font.font_name and body.Font.Name != report_font.font_name:
+            body.Font.Name = report_font.font_name
+        if report_font.font_size and body.Font.Size != report_font.font_size:
+            body.Font.Size = report_font.font_size
+        fit_unwrapped_text_columns(data, body, frame, presentations)
         data.Calculate()
+        mark_stage("write_data_and_formats")
         for pivot in sheet.PivotTables():
             pivot.PreserveFormatting, pivot.HasAutoFormat = True, False
             pivot.ManualUpdate = True
@@ -376,6 +664,7 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
                        data.Cells(len(frame) + 1, len(cache_headers))).Clear()
         if old_target != new_target:
             table.ListColumns(old_target).Name = new_target
+        restore_progress_bar(table, progress_bar)
         cache.Refresh()
         for pivot in sheet.PivotTables():
             for old_name, selected in filters[str(pivot.Name)].items():
@@ -386,8 +675,19 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
                 _select(pivot.PivotFields(name), selected)
             pivot.ManualUpdate = False
             pivot.RefreshTable()
+        mark_stage("refresh_pivots")
         _validate_pivot_totals(sheet, frame)
         _restore_percentages(sheet, scratch, blocks)
+        mark_stage("validate_pivots_and_percentages")
+        normalize_pivot_percentage_borders(sheet, blocks)
+        for block in blocks:
+            pivot = sheet.PivotTables(block.pivot_name)
+            region = pivot.TableRange2
+            header_row = int(region.Row) + block.header_row_offset
+            percentage_column = int(region.Column + region.Columns.Count)
+            sheet.Cells(header_row, percentage_column).Borders(9).LineStyle = -4142
+            border = sheet.Cells(header_row+1, percentage_column).Borders(8)
+            border.LineStyle, border.Weight, border.Color = 1, -4138, 255
         scratch.Visible = -1
         scratch.Delete()
         update_pivot_period_titles(sheet, report_date)
@@ -400,9 +700,14 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
         normalize_pivot_section_row_visibility(sheet)
         for i, width in widths.items():
             sheet.Columns(i).ColumnWidth = width
-        restore_pivot_alignments(sheet, alignments)
-        for pivot in sheet.PivotTables():
-            pivot.TableRange1.EntireRow.Hidden = False
+        restore_presentation(sheet, pivot_presentation)
+        resize_dynamic_pivot_section_banners(
+            sheet,
+            title_markers=("target complete", "target rfs order aging", "ontime delivery",
+                           "delay completion", "target after", "target not inputted"),
+            side_header_markers=("percentage of completion",),
+        )
+        mark_stage("restore_layout")
         book.Activate()
         window = book.Windows(1)
         window.Activate()
@@ -419,6 +724,7 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
             raise RuntimeError(f"IDE List PIVOT contains formula errors: {errors.Address}")
         count = int(sheet.PivotTables().Count)
         book.Save()
+        mark_stage("calculate_and_save")
         return count
     finally:
         for owned_book in (book, anchor):
@@ -433,6 +739,7 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date) -> int:
             except Exception:
                 pass
         pythoncom.CoUninitialize()
+        mark_stage("close_excel")
 
 
 def validate_saved(path: Path, frame: pd.DataFrame, pivot_count: int) -> dict:
@@ -450,24 +757,33 @@ def validate_saved(path: Path, frame: pd.DataFrame, pivot_count: int) -> dict:
                 equal = value == actual
             if not equal:
                 raise RuntimeError(f"Saved IDE List mismatch at {get_column_letter(frame.columns.get_loc(name)+1)}{index} ({name}): {actual!r} != {value!r}")
-    book = load_workbook(path, data_only=True)
+    book = load_workbook(path, read_only=True, data_only=True)
     try:
-        table = book["ALL ORDER"].tables["Table1"]
-        if table.ref != f"A1:{get_column_letter(len(frame.columns))}{len(frame)+1}":
-            raise RuntimeError("Saved IDE List table range differs from records.")
-        pivots = book["PIVOT"]._pivots
-        if len(pivots) != pivot_count or not pivots:
-            raise RuntimeError("IDE List pivots were lost during generation.")
-        for pivot in pivots:
-            if pivot.cache.cacheSource.worksheetSource.name != "Table1" or pivot.cache.recordCount != len(frame):
-                raise RuntimeError(f"Pivot {pivot.name} is not bound to current Table1 records.")
+        from ide_pivot_presentation import validate_centered_header
+
+        for cell in book["ALL ORDER"][1][:len(frame.columns)]:
+            validate_centered_header(cell)
     finally:
         book.close()
+    with ZipFile(path) as archive:
+        data_part = worksheet_part(archive, "ALL ORDER")
+        data_root = ET.fromstring(archive.read(data_part))
+        validate_progress_bar(SimpleNamespace(conditional_formatting=conditional_formats(data_root)),
+                              frame.columns.get_loc("Progress") + 1, len(frame))
+        validate_table_and_caches(archive, data_root, data_part,
+                                  f"A1:{get_column_letter(len(frame.columns))}{len(frame)+1}", len(frame), pivot_count)
     return {"rows": len(rows), "columns": len(frame.columns), "pivot_tables": pivot_count}
 
 
 def generate(raw_path: Path, reference: Path, output: Path, report_date: date) -> dict:
-    frame, warnings = build_rows(read_records(raw_path, "List"), read_records(reference, "ALL ORDER"), report_date)
+    started = perf_counter()
+    raw_presentations, reference_presentations, timings = {}, {}, {}
+    raw = read_records(raw_path, "List", presentations=raw_presentations)
+    previous = read_records(reference, "ALL ORDER", presentations=reference_presentations)
+    timings["read_inputs"] = perf_counter() - started
+    stage_start = perf_counter()
+    frame, warnings = build_rows(raw, previous, report_date)
+    timings["build_rows"] = perf_counter() - stage_start
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.resolve() in {raw_path.resolve(), reference.resolve()}:
         raise ValueError("Output must not overwrite the raw or reference workbook.")
@@ -476,15 +792,21 @@ def generate(raw_path: Path, reference: Path, output: Path, report_date: date) -
         with tempfile.NamedTemporaryFile(dir=output.parent, prefix="ide_list_", suffix=".xlsx", delete=False) as handle:
             temporary = Path(handle.name)
         shutil.copy2(reference, temporary)
-        count = _write_native(temporary, frame, report_date)
+        count = _write_native(temporary, frame, report_date, raw_path=raw_path,
+                              reference_presentations=reference_presentations, source_presentations=raw_presentations,
+                              timings=timings)
+        stage_start = perf_counter()
         validation = validate_saved(temporary, frame, count)
+        timings["validate_saved"] = perf_counter() - stage_start
         os.replace(temporary, output)
         temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
     quotes = Counter(frame["Quote ID"])
-    return {**validation, "format_profile": "ide-list", "refreshed_pivots": count,
+    timings["total"] = perf_counter() - started
+    LOGGER.info("IDE List stage timings (seconds): %s", timings)
+    return {**validation, "format_profile": "ide-list", "refreshed_pivots": count, "timings_seconds": timings,
             "financial_source_policy": "raw-revenue", "source_warnings": warnings,
             "collabs_fallback_rows": 0, "zero_fallback_rows": 0, "date_fallback_rows": 0,
             "field_fallback_rows": 0, "invalid_dates": {},

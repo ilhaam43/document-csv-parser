@@ -1,5 +1,6 @@
 import unittest
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -10,6 +11,26 @@ import app as app_module
 
 
 class ReportJobPathTests(unittest.TestCase):
+    def test_report_4_public_form_only_offers_the_two_excel_uploads(self) -> None:
+        class Inputs(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.files = []
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == "input" and attributes.get("type") == "file":
+                    self.files.append(attributes)
+        response = TestClient(app_module.app).get("/report-4")
+        self.assertEqual(response.status_code, 200)
+        parser = Inputs()
+        parser.feed(response.text)
+        self.assertEqual([field["name"] for field in parser.files],
+                         ["raw_ide_workbook", "previous_ide_workbook"])
+        self.assertTrue(all("required" in field for field in parser.files))
+        self.assertNotIn("collabs_csv", response.text)
+        self.assertNotIn("Collabs", response.text)
+        self.assertIn("IDE List Excel", response.text)
+
     def test_report_4_list_export_queues_without_collabs(self) -> None:
         with TemporaryDirectory() as temp_dir:
             job_id = uuid.uuid4().hex

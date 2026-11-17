@@ -6,7 +6,99 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from generate_ide_tracking import InputFiles, determine_report_date, generate_ide_tracking, target_header
-from ide_list_format import REQUIRED, build_rows, generate, is_list_export, normalize_status, read_records, target_bucket
+from ide_list_format import (
+    REQUIRED, ColumnPresentation, apply_column_alignment, build_rows, column_presentations,
+    generate, is_list_export, normalize_status, presentation_key, read_column_presentations,
+    read_records, target_bucket, fit_unwrapped_text_columns, is_target_after_filter,
+    percentage_helper_formula, _restore_percentages,
+)
+
+
+class IdeListPercentageTests(unittest.TestCase):
+    def test_target_after_filter_follows_bucket_not_month_or_pivot_name(self):
+        for period in (date(2026, 11, 17), date(2026, 12, 1), date(2027, 1, 1)):
+            with self.subTest(period=period):
+                self.assertTrue(is_target_after_filter({target_header(period): {"After " + period.strftime("%B")}}))
+
+    def test_other_or_mixed_filters_do_not_change_formula_policy(self):
+        name = target_header(date(2026, 11, 17))
+        for fields in ({}, {name: None}, {name: set()}, {name: {"Target November"}},
+                       {name: {"Before November"}}, {name: {"Target Not Yet Inputted"}},
+                       {name: {"After November", "Target November"}},
+                       {"Department": {"After November"}}):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_target_after_filter(fields))
+
+    def test_target_after_uses_manual_precedence(self):
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$356"],
+                                                   "6.Cancel": ["$K$356"]}, "$C$356", target_after=True),
+                         "=IF($C$356=0,0,SUM($I$356)+SUM($K$356)/$C$356)")
+
+    def test_missing_status_is_zero_not_a_neighbouring_column(self):
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$355"]}, "$C$355", target_after=True),
+                         "=IF($C$355=0,0,SUM($I$355)+0/$C$355)")
+        self.assertEqual(percentage_helper_formula({"6.Cancel": ["$G$42"]}, "$C$42", target_after=True),
+                         "=IF($C$42=0,0,0+SUM($G$42)/$C$42)")
+        self.assertEqual(percentage_helper_formula({}, "$D$18", target_after=True),
+                         "=IF($D$18=0,0,0+0/$D$18)")
+
+    def test_split_status_cells_are_summed_before_division(self):
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$Q$8", "$R$8"],
+                                                   "6.Cancel": ["$S$8", "$T$8"]}, "$F$8", target_after=True),
+                         "=IF($F$8=0,0,SUM($Q$8,$R$8)+SUM($S$8,$T$8)/$F$8)")
+
+    def test_other_completion_blocks_keep_the_existing_ratio(self):
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$31"]}, "$C$31"),
+                         "=IF($C$31=0,0,($I$31)/$C$31)")
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$31"],
+                                                   "6.Cancel": ["$K$31"]}, "$C$31"),
+                         "=IF($C$31=0,0,($I$31+$K$31)/$C$31)")
+
+    def test_restore_chooses_policy_from_filter_and_matches_summary_row_identity(self):
+        class Cells(list):
+            def __call__(self, row, column):
+                return self[column - 1]
+
+        class Items(list):
+            @property
+            def Count(self):
+                return len(self)
+
+            def __call__(self, index):
+                return self[index - 1]
+
+        def phase_cell(address, status=None):
+            items = Items([SimpleNamespace(Name=status)] if status else [])
+            from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+            column = column_index_from_string(coordinate_from_string(address)[0])
+            return SimpleNamespace(Address=address, Column=column, identity="department", PivotCell=SimpleNamespace(ColumnItems=items))
+
+        phase_row = SimpleNamespace(Row=48, Cells=Cells([
+            phase_cell("$G$48", "6.Cancel"), phase_cell("$H$48", "5.SO Complete"), phase_cell("$I$48"),
+        ]))
+        count_cell = SimpleNamespace(Address="$C$42", identity="department",
+                                     PivotCell=SimpleNamespace(DataField=SimpleNamespace(SourceName="Quote ID")))
+        fields = [SimpleNamespace(SourceName="Department")]
+        summary = SimpleNamespace(Name="summary", RowFields=fields,
+                                  DataFields=[SimpleNamespace(SourceName="Quote ID", Function=-4112)],
+                                  TableRange1=SimpleNamespace(Column=1, Row=40),
+                                  DataBodyRange=SimpleNamespace(Rows=[SimpleNamespace(Cells=[count_cell])]))
+        phase = SimpleNamespace(Name="arbitrary-name", RowFields=fields,
+                                TableRange1=SimpleNamespace(Column=7, Row=45, Columns=SimpleNamespace(Count=3)),
+                                DataBodyRange=SimpleNamespace(Rows=[phase_row]))
+        output = SimpleNamespace()
+        sheet = SimpleNamespace(PivotTables=lambda name=None: phase if name else [summary, phase],
+                                Cells=lambda row, column: output)
+        name = target_header(date(2026, 11, 17))
+        for selection, expected in [("After November", "SUM($H$48)+SUM($G$48)/$C$42"),
+                                    ("Target November", "($H$48+$G$48)/$C$42")]:
+            with self.subTest(selection=selection), \
+                 patch("generate_ide_tracking.restore_pivot_percentage_blocks"), \
+                 patch("ide_list_format._capture_filters", return_value={phase.Name: {name: {selection}}}), \
+                 patch("ide_list_format.pivot_row_identity", side_effect=lambda cell, **kwargs: cell.identity):
+                _restore_percentages(sheet, None, [SimpleNamespace(pivot_name=phase.Name)])
+                self.assertEqual(output.Formula, f"=IF($C$42=0,0,{expected})")
+                self.assertEqual(output.NumberFormat, "0.00%")
 
 
 class IdeListRulesTests(unittest.TestCase):
@@ -129,6 +221,134 @@ class IdeListRulesTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"existing-output")
             self.assertEqual(reference.read_bytes(), b"template")
             self.assertFalse(list(root.glob("ide_list_*.xlsx")))
+
+
+class IdeListPresentationTests(unittest.TestCase):
+    def test_number_formats_change_display_not_values(self):
+        frame, _ = build_rows([IdeListRulesTests().raw(Progress=.5, **{"Revenue": 1234.5})],
+                              [IdeListRulesTests().reference()], date(2026, 11, 17))
+        formats = column_presentations(frame.columns, {}, {})
+        self.assertEqual(formats["Progress"].number_format, "0.0%")
+        self.assertEqual(formats["Aging Of RFS"].number_format, "0")
+        self.assertIn("#,##0.00", formats["Revenue"].number_format)
+        self.assertEqual(frame.iloc[0]["Progress"], .5)
+        self.assertEqual(frame.iloc[0]["Revenue"], 1234.5)
+
+    def test_dates_keep_timestamps_but_use_manual_display_format(self):
+        models = column_presentations(["Updated", "SO Completion Date"], {
+            "updated": ColumnPresentation("dd/mm/yyyy hh:mm"),
+        }, {})
+        self.assertEqual(models["Updated"].number_format, r"d\ mmm\ yyyy")
+        self.assertEqual(models["SO Completion Date"].number_format, r"d\ mmm\ yyyy")
+
+    def test_reference_alignment_is_bound_by_header_and_history_alias(self):
+        alignment = ("center", "top", False, False, 0, 0)
+        model = ColumnPresentation("General", alignment)
+        models = column_presentations(["Progress status", "Yesterday Status "],
+                                       {"status": model, "progress status": model}, {})
+        self.assertEqual(models["Progress status"].alignment, alignment)
+        self.assertEqual(models["Yesterday Status "].alignment, alignment)
+        self.assertEqual(presentation_key("Month Complete3"), presentation_key("Month Complete2"))
+        self.assertEqual(presentation_key("Month Complete", raw=True), presentation_key("Month Complete2"))
+        self.assertNotEqual(presentation_key("MONTH COMPLETE"), presentation_key("Month Complete2"))
+        self.assertEqual(presentation_key("TARGET  Detemined as 1 Nov 26"),
+                         presentation_key("TARGET  Detemined as 1 Dec 26"))
+
+    def test_unknown_columns_inherit_raw_presentation(self):
+        source = ColumnPresentation("0.00%", ("right", "top", True, False, 0, 0))
+        model = column_presentations(["Future Rate"], {}, {"future rate": source})["Future Rate"]
+        self.assertEqual(model, source)
+
+    def test_sparse_progress_ignores_unformatted_blank_first_rows(self):
+        alignment = SimpleNamespace(horizontal=None, vertical="top", wrapText=None,
+                                    shrinkToFit=None, indent=0, textRotation=0)
+        def cell(value, fmt="General"):
+            return SimpleNamespace(value=value, number_format=fmt, alignment=alignment)
+        sheet = SimpleNamespace(iter_rows=lambda: iter([
+            [cell("Progress")], [cell(None)], [cell(.5, "0.0%")], [cell(.75, "0.0%")],
+        ]))
+        class Book:
+            def __getitem__(self, name):
+                return sheet
+            def close(self):
+                pass
+        with patch("ide_list_format.load_workbook", return_value=Book()):
+            model = read_column_presentations(Path("reference.xlsx"), "ALL ORDER")["progress"]
+        self.assertEqual(model.number_format, "0.0%")
+
+    def test_financial_columns_use_consistent_reference_accounting_format(self):
+        financial = ColumnPresentation('_(* #,##0.00_);_(@_)')
+        models = column_presentations(["Revenue", "Revenue (Juta)", "Actual Cost", "CEI"],
+                                       {"revenue": financial, "revenue (juta)": ColumnPresentation()}, {})
+        self.assertEqual(models["Revenue (Juta)"].number_format, financial.number_format)
+        self.assertEqual(models["Actual Cost"].number_format, financial.number_format)
+        self.assertEqual(models["CEI"].number_format, "General")
+
+    def test_native_alignment_maps_excel_constants(self):
+        target = SimpleNamespace()
+        apply_column_alignment(target, ("center", "top", True, False, 0, 0))
+        self.assertEqual(target.HorizontalAlignment, -4108)
+        self.assertEqual(target.VerticalAlignment, -4160)
+        self.assertTrue(target.WrapText)
+
+    def test_correct_alignment_does_not_trigger_repeated_excel_layout_updates(self):
+        class Target:
+            def __init__(self):
+                object.__setattr__(self, "writes", [])
+                for name, value in {"HorizontalAlignment": 1, "VerticalAlignment": -4160,
+                                    "WrapText": True, "ShrinkToFit": False, "IndentLevel": 0,
+                                    "Orientation": 0}.items():
+                    object.__setattr__(self, name, value)
+            def __setattr__(self, name, value):
+                self.writes.append(name)
+                object.__setattr__(self, name, value)
+        target = Target()
+        apply_column_alignment(target, (None, "top", True, False, 0, 0))
+        self.assertEqual(target.writes, [])
+
+    def test_generated_helper_wrap_matches_both_manual_samples(self):
+        wrapped = ColumnPresentation(alignment=(None, "top", True, False, 0, 0))
+        models = column_presentations(["Aging Of RFS", "STATUS ORDER", "ON TIME DELIVERY",
+                                       "MONTH COMPLETE", "ORDER TYPE", "PROCESS"],
+                                      {presentation_key(name): wrapped for name in
+                                       ("Aging Of RFS", "STATUS ORDER", "ON TIME DELIVERY", "MONTH COMPLETE")}, {})
+        for name in ("Aging Of RFS", "STATUS ORDER", "ON TIME DELIVERY", "MONTH COMPLETE"):
+            self.assertFalse(models[name].alignment[2])
+        self.assertTrue(models["ORDER TYPE"].alignment[2])
+        self.assertTrue(models["PROCESS"].alignment[2])
+
+    def test_long_unwrapped_names_expand_without_changing_wrapped_columns(self):
+        import pandas as pd
+        columns = {1: SimpleNamespace(ColumnWidth=12), 2: SimpleNamespace(ColumnWidth=20)}
+        sheet = SimpleNamespace(Columns=lambda index: columns[index])
+        body = SimpleNamespace(Columns=lambda index: SimpleNamespace(
+            AutoFit=lambda: setattr(columns[index], "ColumnWidth", 26)))
+        frame = pd.DataFrame({"PM": ["Muhammad Mahdi Ramadhan"], "Quote Name": ["a" * 100]})
+        models = {"PM": ColumnPresentation(),
+                  "Quote Name": ColumnPresentation(alignment=(None, "top", True, False, 0, 0))}
+        fit_unwrapped_text_columns(sheet, body, frame, models)
+        self.assertEqual(columns[1].ColumnWidth, 26)
+        self.assertEqual(columns[2].ColumnWidth, 20)
+
+    def test_autofit_never_shrinks_reference_width(self):
+        import pandas as pd
+        column = SimpleNamespace(ColumnWidth=20)
+        sheet = SimpleNamespace(Columns=lambda index: column)
+        body = SimpleNamespace(Columns=lambda index: SimpleNamespace(
+            AutoFit=lambda: setattr(column, "ColumnWidth", 15)))
+        frame = pd.DataFrame({"PM": ["a" * 30]})
+        fit_unwrapped_text_columns(sheet, body, frame, {"PM": ColumnPresentation()})
+        self.assertEqual(column.ColumnWidth, 20)
+
+    def test_all_order_headers_center_without_changing_body_alignment(self):
+        body = ("left", "top", True, False, 0, 0)
+        heading = ("left", "top", True, False, 2, 0)
+        reference = ColumnPresentation(alignment=body, header_alignment=heading)
+        models = column_presentations(["Quote ID", "Future Field"],
+                                       {"quote id": reference}, {"future field": reference})
+        for model in models.values():
+            self.assertEqual(model.header_alignment, ("center", "center", True, False, 0, 0))
+            self.assertEqual(model.alignment, body)
 
 
 if __name__ == "__main__":
