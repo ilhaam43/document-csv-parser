@@ -1319,24 +1319,39 @@ def align_ongoing_progress_pivots(progress_sheet) -> None:
             pass
 
 
-def restore_on_progress_filter_caption_layout(progress_sheet) -> None:
-    """Restore the visible page-field caption order used by the ongoing template."""
-    caption_cells = {
-        "A2": YEAR_FAB_UPLOAD_HEADER,
-        "A3": PROCESS_ADJUSTMENT_HEADER,
-        "A4": PHASE_HEADER_PREFIX,
-        "D1": YEAR_FAB_UPLOAD_HEADER,
-        "D2": PROCESS_ADJUSTMENT_HEADER,
-        "D3": PHASE_HEADER_PREFIX,
-        "A15": YEAR_FAB_UPLOAD_HEADER,
-        "A16": PROCESS_ADJUSTMENT_HEADER,
-        "A17": PHASE_HEADER_PREFIX,
-    }
-    for cell_address, value in caption_cells.items():
-        try:
-            progress_sheet.Range(cell_address).Value = value
-        except Exception:
-            pass
+def restore_on_progress_filter_caption_layout(progress_sheet) -> int:
+    """Bind captions to live page fields and remove nearby orphaned captions."""
+    pivots = list(progress_sheet.PivotTables())
+    regions = []
+    candidates = set()
+    captions = {normalize_header_key(value): value for value in
+                (YEAR_FAB_UPLOAD_HEADER, PROCESS_ADJUSTMENT_HEADER, PHASE_HEADER_PREFIX)}
+    for pivot in pivots:
+        region = pivot.TableRange2
+        top, left = int(region.Row), int(region.Column)
+        regions.append((top, left, top + int(region.Rows.Count) - 1, left + int(region.Columns.Count) - 1))
+        fields = list(pivot.PageFields)
+        for field in fields:
+            key = normalize_header_key(field.SourceName)
+            if key.startswith(normalize_header_key(PHASE_HEADER_PREFIX)):
+                key = normalize_header_key(PHASE_HEADER_PREFIX)
+            caption = captions.get(key)
+            if caption is None:
+                continue
+            label = field.LabelRange
+            if label.Value != caption:
+                label.Value = caption
+            for row in range(max(1, top - len(fields)), top):
+                candidates.add((row, int(label.Column)))
+    removed = 0
+    for row, column in sorted(candidates):
+        if any(top <= row <= bottom and left <= column <= right for top, left, bottom, right in regions):
+            continue
+        cell = progress_sheet.Cells(row, column)
+        if not cell.HasFormula and normalize_header_key(cell.Value) in captions:
+            cell.ClearContents()
+            removed += 1
+    return removed
 
 
 def find_contiguous_percentage_block_last_row(pivot_sheet, header_row: int, header_col: int) -> int:
