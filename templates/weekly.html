@@ -125,31 +125,13 @@
               </div>
               <p id="review-empty" class="weekly-review-empty" hidden>No matching quotes.</p>
             </div>
-            <details class="weekly-review-options">
-              <summary>File upload and optional corrections</summary>
-              <a class="weekly-review-csv-link" id="review-link" href="#">Download Review CSV</a>
+            <div class="weekly-review-options">
+              <a class="weekly-review-csv-link" id="review-link" href="#" hidden>Download Review CSV</a>
               <div class="field">
-                <label for="catalyst_review">Reviewed CSV or Catalyst workbook (instead of the list above)</label>
+                <label for="catalyst_review">Reviewed CSV or Catalyst workbook</label>
                 <input id="catalyst_review" name="catalyst_review" type="file" accept=".csv,.xlsx">
               </div>
-              <a class="weekly-review-csv-link" id="source-review-link" href="#" hidden>Download BQ Status Differences CSV</a>
-              <div class="field" id="source-review-file-field" hidden>
-                <label for="source_review">Approved BQ status overrides CSV (optional; exact order used by default)</label>
-                <input id="source_review" name="source_review" type="file" accept=".csv">
-              </div>
-              <div class="field">
-                <label for="slide_review">Slide summary review CSV (optional)</label>
-                <input id="slide_review" name="slide_review" type="file" accept=".csv">
-              </div>
-              <div class="field">
-                <label for="pivot_review">Pivot filter review CSV (optional)</label>
-                <input id="pivot_review" name="pivot_review" type="file" accept=".csv">
-              </div>
-              <div class="field">
-                <label for="presentation_review">Presentation chart review CSV (optional)</label>
-                <input id="presentation_review" name="presentation_review" type="file" accept=".csv">
-              </div>
-            </details>
+            </div>
             <button id="review-button" type="submit">Generate Weekly Reports</button>
           </form>
         </section>
@@ -164,6 +146,6 @@
       </aside>
     </div>
   </main>
-  <script src="/static/weekly.js?v=20261102-carryover"></script>
+  <script src="/static/weekly.js?v=20261118-inline-processing-time"></script>
 </body>
 </html>

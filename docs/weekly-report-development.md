@@ -30,15 +30,26 @@ not required or submitted. The Master always includes all three services.
 The page preserves the
 job ID when navigating away and back.
 
+The status message includes elapsed processing time in minutes and seconds,
+for example `Generating Master workbook... 55 detik`, rather than a separate
+timer below the status box. It runs
+during upload, queueing, preparation, and generation, pauses while waiting for
+Catalyst review, and stops on completion or failure. The server saves cumulative
+processing time across review submission and retries, so refreshing the page
+does not count time spent manually reviewing Catalyst. Completed legacy jobs
+without saved timing do not display an invented duration.
+
 After preparation, the page lists only Master rows that need Catalyst review.
 Search by quote or customer, query each quote in Catalyst, and select its
 returned status. The Generate button becomes available after every listed row
 has a status. Selections are kept in this browser for the current job when
 navigating away and back. Download `draft-master-data.csv` if the refreshed
-Master needs inspection. For the older workflow, expand **File upload and
-optional corrections**, download `catalyst-review.csv`, fill its
-`reviewed_status` column, and upload it instead. The reviewed `ALL DATA`
-workbook remains accepted as a legacy checkpoint. The server always uses its
+Master needs inspection. Alternatively, use **Download Review CSV**, fill its
+`reviewed_status` column, and upload it through **Reviewed CSV or Catalyst
+workbook**. A reviewed `ALL DATA` workbook is accepted through the same field
+instead of selecting statuses in the list. This is the only review-file upload
+exposed on the web page; optional correction CSVs remain available through the
+API and CLI, not as web controls. The server always uses its
 prepared `master_row` and quote/order identity for direct page submissions.
 
 Jobs prepared before the focused Catalyst checkpoint may contain the entire
@@ -236,10 +247,10 @@ checkpoint can restore `fab_upload` seconds for uniquely matched new rows.
 The Master and Mobile `No.` columns are both regenerated as consecutive integers
 starting at 1; the prior Master's fractional numbering is not retained.
 The web applies the closed-order/active-quote lifecycle rule automatically, so only Catalyst status
-review is required. BQ quote-first differences remain downloadable under
-optional corrections. For an owner-approved exception, fill `reviewed_source`
+review is required. BQ quote-first differences remain available through the API.
+For an owner-approved exception submitted through the API or CLI, fill `reviewed_source`
 with `quote` (or `order`) on only the affected rows in `source-review.csv` and
-upload it; blank rows retain the default. The API also accepts a sparse
+submit it; blank rows retain the default. The API also accepts a sparse
 `reviewed_sources` JSON object keyed by `master_row`. Finalization validates
 the identity of every supplied override and writes the effective choice and
 method for every conflict to the server-side `output/bq-source-decisions.csv`.

@@ -32,6 +32,10 @@ JOB_ROOT = Path(__file__).resolve().parents[1] / "generated" / "weekly" / "api-j
 MAX_UPLOAD_BYTES = 300 * 1024 * 1024
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weekly")
 STATE_LOCK = threading.RLock()
+PROCESSING_STATUSES = frozenset({
+    "uploading", "queued", "preparing", "refreshing_review", "uploading_review",
+    "queued_finalization", "finalizing", "generating",
+})
 router = APIRouter(prefix="/api/weekly", tags=["Weekly"])
 
 
@@ -71,7 +75,17 @@ def _write_state(job_id: str, state: dict) -> None:
 def _update_state(job_id: str, **updates: object) -> dict:
     with STATE_LOCK:
         state = _read_state(job_id)
-        state.update(updates, updated_at=time.time())
+        now = time.time()
+        started = state.get("processing_started_at")
+        elapsed = state.get("processing_elapsed_seconds", 0.0)
+        processing = updates.get("status", state["status"]) in PROCESSING_STATUSES
+        if started is not None and not processing:
+            elapsed += max(0.0, now - started)
+            started = None
+        elif started is None and processing:
+            started = now
+        state.update(updates, updated_at=now, processing_started_at=started,
+                     processing_elapsed_seconds=elapsed)
         _write_state(job_id, state)
         return state
 
@@ -457,6 +471,7 @@ async def start_weekly_job(
     with STATE_LOCK:
         if (job_dir / "job.json").exists():
             raise HTTPException(status_code=409, detail="Weekly job already exists.")
+        now = time.time()
         _write_state(normalized_id, {
             "job_id": normalized_id,
             "report_date": report_date,
@@ -465,8 +480,10 @@ async def start_weekly_job(
             "output_services": output_services,
             "status": "uploading",
             "stage": "Uploading files",
-            "created_at": time.time(),
-            "updated_at": time.time(),
+            "created_at": now,
+            "updated_at": now,
+            "processing_started_at": now,
+            "processing_elapsed_seconds": 0.0,
         })
     try:
         for upload, name in (
@@ -495,6 +512,11 @@ async def start_weekly_job(
 def weekly_job_status(job_id: str) -> dict:
     state = _read_state(job_id)
     response = dict(state)
+    if "processing_elapsed_seconds" in state:
+        elapsed = state["processing_elapsed_seconds"]
+        if state.get("processing_started_at") is not None:
+            elapsed += max(0.0, time.time() - state["processing_started_at"])
+        response["elapsed_seconds"] = round(elapsed, 3)
     if state["status"] in {"waiting_review", "refreshing_review", "uploading_review", "queued_finalization", "finalizing", "generating", "review_failed", "succeeded"}:
         response["review_url"] = f"/api/weekly/jobs/{job_id}/review"
         response["review_data_url"] = f"/api/weekly/jobs/{job_id}/review-data"

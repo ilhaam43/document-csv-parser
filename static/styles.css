@@ -405,17 +405,6 @@ code {
   padding-top: 13px;
 }
 
-.weekly-review-options summary {
-  margin-bottom: 12px;
-  color: var(--accent-hover);
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.weekly-review-options:not([open]) summary {
-  margin-bottom: 0;
-}
-
 .weekly-review-csv-link {
   display: inline-block;
   margin-bottom: 14px;

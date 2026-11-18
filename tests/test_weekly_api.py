@@ -4,6 +4,7 @@ import io
 import unittest
 import uuid
 import zipfile
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -25,6 +26,109 @@ class WeeklyApiTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = TestClient(app)
+
+    def test_review_form_retains_review_csv_and_only_catalyst_review_upload(self) -> None:
+        class ReviewForm(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.in_review_form = False
+                self.files = []
+                self.ids = set()
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == "form":
+                    self.in_review_form = attributes.get("id") == "review-form"
+                if not self.in_review_form:
+                    return
+                if attributes.get("id"):
+                    self.ids.add(attributes["id"])
+                if tag == "input" and attributes.get("type") == "file":
+                    self.files.append(attributes)
+
+            def handle_endtag(self, tag):
+                if tag == "form":
+                    self.in_review_form = False
+
+        response = self.client.get("/weekly")
+        self.assertEqual(response.status_code, 200)
+        parser = ReviewForm()
+        parser.feed(response.text)
+        self.assertEqual([field["name"] for field in parser.files], ["catalyst_review"])
+        self.assertEqual(parser.files[0]["accept"], ".csv,.xlsx")
+        self.assertNotIn("required", parser.files[0])
+        self.assertIn("review-direct", parser.ids)
+        self.assertIn("review-rows", parser.ids)
+        self.assertIn("review-link", parser.ids)
+        self.assertIn("Download Review CSV", response.text)
+        for removed_id in ("source-review-link", "source_review",
+                           "slide_review", "pivot_review", "presentation_review"):
+            self.assertNotIn(removed_id, parser.ids)
+        self.assertNotIn("optional corrections", response.text)
+        self.assertIn('id="status-box"', response.text)
+        self.assertNotIn('id="processing-time"', response.text)
+
+    def test_processing_time_excludes_catalyst_wait_and_survives_status_reads(self) -> None:
+        with patch.object(weekly_api.JOB_EXECUTOR, "submit"), \
+             patch.object(weekly_api.time, "time", return_value=100):
+            job_id = self._start().json()["job_id"]
+        self.assertEqual(weekly_api._read_state(job_id)["processing_started_at"], 100)
+        with patch.object(weekly_api.time, "time", return_value=120):
+            weekly_api._update_state(job_id, status="preparing")
+        with patch.object(weekly_api.time, "time", return_value=130):
+            active = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+        self.assertEqual(active["elapsed_seconds"], 30)
+        self.assertEqual(weekly_api._read_state(job_id)["processing_elapsed_seconds"], 0)
+        with patch.object(weekly_api.time, "time", return_value=140):
+            weekly_api._update_state(job_id, status="waiting_review")
+        with patch.object(weekly_api.time, "time", return_value=1000):
+            paused = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+            weekly_api._update_state(job_id, status="uploading_review")
+        self.assertEqual(paused["elapsed_seconds"], 40)
+        with patch.object(weekly_api.time, "time", return_value=1010):
+            weekly_api._update_state(job_id, status="queued_finalization")
+        with patch.object(weekly_api.time, "time", return_value=1020):
+            weekly_api._update_state(job_id, status="generating")
+            weekly_api._update_state(job_id, stage="Saving presentation")
+        with patch.object(weekly_api.time, "time", return_value=1030):
+            weekly_api._update_state(job_id, status="succeeded", output_files=[])
+        with patch.object(weekly_api.time, "time", return_value=2000):
+            completed = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+        self.assertEqual(completed["elapsed_seconds"], 70)
+        self.assertIsNone(completed["processing_started_at"])
+
+    def test_processing_time_stops_on_failure_and_resumes_on_retry(self) -> None:
+        with patch.object(weekly_api.JOB_EXECUTOR, "submit"), \
+             patch.object(weekly_api.time, "time", return_value=100):
+            job_id = self._start().json()["job_id"]
+        with patch.object(weekly_api.time, "time", return_value=110):
+            weekly_api._update_state(job_id, status="review_failed")
+        with patch.object(weekly_api.time, "time", return_value=1000):
+            failed = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+            weekly_api._update_state(job_id, status="refreshing_review")
+        self.assertEqual(failed["elapsed_seconds"], 10)
+        with patch.object(weekly_api.time, "time", return_value=1020):
+            weekly_api._update_state(job_id, status="waiting_review")
+        with patch.object(weekly_api.time, "time", return_value=2000):
+            refreshed = self.client.get(f"/api/weekly/jobs/{job_id}").json()
+        self.assertEqual(refreshed["elapsed_seconds"], 30)
+
+    def test_legacy_job_without_timing_does_not_invent_elapsed_time(self) -> None:
+        job_id = uuid.uuid4().hex
+        weekly_api._write_state(job_id, {"status": "failed", "created_at": 100})
+        response = self.client.get(f"/api/weekly/jobs/{job_id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("elapsed_seconds", response.json())
+
+    def test_processing_time_cannot_be_negative_after_clock_adjustment(self) -> None:
+        with patch.object(weekly_api.JOB_EXECUTOR, "submit"), \
+             patch.object(weekly_api.time, "time", return_value=100):
+            job_id = self._start().json()["job_id"]
+        with patch.object(weekly_api.time, "time", return_value=90):
+            response = self.client.get(f"/api/weekly/jobs/{job_id}")
+            weekly_api._update_state(job_id, status="failed")
+        self.assertEqual(response.json()["elapsed_seconds"], 0)
+        self.assertEqual(weekly_api._read_state(job_id)["processing_elapsed_seconds"], 0)
 
     def _start(self, job_id: str | None = None, *, with_ppt: bool = False,
                report_month: str | None = None, output_services: str = "mobile"):

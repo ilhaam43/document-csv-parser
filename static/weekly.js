@@ -19,9 +19,6 @@ const reviewUnchecked = document.getElementById("review-unchecked");
 const reviewEmpty = document.getElementById("review-empty");
 const reviewFile = document.getElementById("catalyst_review");
 const reviewButton = document.getElementById("review-button");
-const sourceReviewLink = document.getElementById("source-review-link");
-const sourceReviewFileField = document.getElementById("source-review-file-field");
-const sourceReviewFile = document.getElementById("source_review");
 const includeMobile = document.getElementById("include_mobile");
 const includeM2m = document.getElementById("include_m2m");
 let activeJobId = null;
@@ -33,6 +30,59 @@ let reviewSelections = {};
 let reviewEditable = false;
 let currentJobStatus = null;
 let historicalBackfillRows = 0;
+const processingStatuses = new Set([
+  "uploading", "queued", "preparing", "refreshing_review", "uploading_review",
+  "queued_finalization", "finalizing", "generating",
+]);
+let progressTimer = null;
+let elapsedSeconds = 0;
+let progressStartedAt = null;
+let showProcessingTime = false;
+let statusMessage = statusBox.textContent;
+
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  return minutes === 0 ? `${seconds} detik` : `${minutes} menit ${seconds % 60} detik`;
+}
+
+function currentElapsedSeconds() {
+  return elapsedSeconds + (progressStartedAt === null ? 0 : (performance.now() - progressStartedAt) / 1000);
+}
+
+function renderProcessingTime() {
+  if (!showProcessingTime) {
+    statusBox.textContent = statusMessage;
+    return;
+  }
+  const duration = formatDuration(currentElapsedSeconds());
+  statusBox.textContent = progressStartedAt === null
+    ? `${statusMessage} Waktu proses: ${duration}.`
+    : `${statusMessage.replace(/\.+$/, "")}... ${duration}`;
+}
+
+function stopProgressTimer() {
+  elapsedSeconds = currentElapsedSeconds();
+  progressStartedAt = null;
+  if (progressTimer !== null) window.clearInterval(progressTimer);
+  progressTimer = null;
+}
+
+function syncProcessingTime(job) {
+  stopProgressTimer();
+  const hasTiming = Number.isFinite(job.elapsed_seconds) && job.elapsed_seconds >= 0;
+  if (hasTiming) elapsedSeconds = job.elapsed_seconds;
+  if (processingStatuses.has(job.status)) {
+    progressStartedAt = performance.now();
+    progressTimer = window.setInterval(renderProcessingTime, 1000);
+    showProcessingTime = true;
+  } else if (hasTiming) {
+    showProcessingTime = true;
+  }
+  renderProcessingTime();
+}
+
+window.addEventListener("pagehide", stopProgressTimer);
 
 function backfillNote() {
   return historicalBackfillRows > 0 ? ` ${historicalBackfillRows} prior-month order rows included.` : "";
@@ -180,7 +230,8 @@ async function loadReviewData(job) {
 
 function setStatus(message, kind = "") {
   statusBox.className = `status-box${kind ? ` ${kind}` : ""}`;
-  statusBox.textContent = message;
+  statusMessage = message;
+  renderProcessingTime();
 }
 
 function setFormDisabled(form, disabled) {
@@ -193,6 +244,10 @@ function rememberJob(jobId) {
 }
 
 function forgetJob() {
+  stopProgressTimer();
+  elapsedSeconds = 0;
+  showProcessingTime = false;
+  renderProcessingTime();
   if (activeJobId) {
     try { window.localStorage.removeItem(reviewStorageKey(activeJobId)); } catch (_error) { /* storage optional */ }
   }
@@ -232,6 +287,7 @@ async function requestJson(url, options = {}) {
 }
 
 function renderJob(job) {
+  syncProcessingTime(job);
   const status = job.status;
   currentJobStatus = status;
   const backfill = job.final_audit?.historical_backfill_rows ?? job.preparation_audit?.historical_backfill_rows;
@@ -245,9 +301,7 @@ function renderJob(job) {
   if (job.review_refresh_url) refreshReviewButton.dataset.url = job.review_refresh_url;
   reviewDirect.hidden = Boolean(job.review_refresh_url) || status === "refreshing_review";
   reviewLink.href = job.review_url || "#";
-  sourceReviewLink.href = job.source_review_url || "#";
-  sourceReviewLink.hidden = !job.source_review_url;
-  sourceReviewFileField.hidden = !job.source_review_url;
+  reviewLink.hidden = !job.review_url;
   draftLink.href = job.draft_url || "#";
   draftLink.hidden = !job.draft_url;
   setFormDisabled(reviewForm, !["waiting_review", "review_failed"].includes(status));
@@ -307,6 +361,7 @@ prepareForm.addEventListener("submit", async (event) => {
   const jobId = window.crypto.randomUUID();
   data.set("job_id", jobId);
   rememberJob(jobId);
+  syncProcessingTime({ status: "uploading", elapsed_seconds: 0 });
   try {
     await requestJson("/api/weekly/jobs", { method: "POST", body: data });
     await pollJob();
@@ -331,6 +386,7 @@ refreshReviewButton.addEventListener("click", async () => {
   requestPending = true;
   refreshReviewButton.disabled = true;
   setStatus("Refreshing Catalyst review from saved inputs...");
+  syncProcessingTime({ status: "refreshing_review" });
   try {
     await requestJson(refreshReviewButton.dataset.url, { method: "POST" });
     await pollJob();
@@ -355,12 +411,9 @@ reviewForm.addEventListener("submit", async (event) => {
     data.delete("catalyst_review");
     data.set("reviewed_statuses", JSON.stringify(reviewSelections));
   }
-  if (!sourceReviewFile.files.length) data.delete("source_review");
-  if (!document.getElementById("slide_review").files.length) data.delete("slide_review");
-  if (!document.getElementById("pivot_review").files.length) data.delete("pivot_review");
-  if (!document.getElementById("presentation_review").files.length) data.delete("presentation_review");
   setFormDisabled(reviewForm, true);
   setStatus("Submitting Catalyst review...");
+  syncProcessingTime({ status: "uploading_review" });
   try {
     await requestJson(`/api/weekly/jobs/${activeJobId}/finalize`, { method: "POST", body: data });
     await pollJob();
@@ -385,7 +438,6 @@ reviewRowsElement.addEventListener("change", (event) => {
 reviewSearch.addEventListener("input", filterReviewRows);
 reviewUnchecked.addEventListener("change", filterReviewRows);
 reviewFile.addEventListener("change", updateReviewProgress);
-sourceReviewFile.addEventListener("change", updateReviewProgress);
 
 newJobButton.addEventListener("click", () => {
   stopPolling();
