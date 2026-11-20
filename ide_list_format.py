@@ -59,6 +59,7 @@ FINANCIAL_FIELDS = {
     "Risk BC", "Penalty Actual", "Cost Planned", "Actual Cost", "Revenue (Juta)",
 }
 PROGRESS_BAR_COLOR = 0xCAD37F  # Excel OLE color for the manual's #7FD3CA.
+RAW_ORDER_TYPE = "Order Type (Raw)"
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class ColumnPresentation:
 
 def presentation_key(name: str, *, raw: bool = False) -> str:
     name = header(name).casefold()
+    if raw and name == "order type":
+        return RAW_ORDER_TYPE.casefold()
     if is_dynamic_target_header(name):
         return "__monthly_target__"
     if re.fullmatch(r"month complete\d+", name) or (raw and name == "month complete"):
@@ -272,7 +275,20 @@ def build_rows(raw: list[dict], previous: list[dict], report_date: date) -> tupl
             history.setdefault(quote, row)
     columns = [name.format(target=target_header(report_date)) for name in PREFIX]
     copied = set(columns) | {"Month Complete"}
-    columns.extend(name for name in raw[0] if name and name not in copied)
+    additional_columns = []
+    for name in raw[0]:
+        if name.casefold() == "order type":
+            # Excel Table1 treats this raw header as the same as report ORDER TYPE.
+            additional_columns.append((RAW_ORDER_TYPE, name))
+        elif name and name not in copied:
+            additional_columns.append((name, name))
+    used_headers = {header(name).casefold() for name in columns}
+    for name, _ in additional_columns:
+        key = header(name).casefold()
+        if key in used_headers:
+            raise ValueError(f"IDE List column {name!r} conflicts with an ALL ORDER column name.")
+        used_headers.add(key)
+        columns.append(name)
     records, warnings = [], []
     for index, source in enumerate(raw, 2):
         row = dict(source)
@@ -306,6 +322,7 @@ def build_rows(raw: list[dict], previous: list[dict], report_date: date) -> tupl
             "MONTH COMPLETE": "Jan-00" if blank(source.get("SO Completion Date")) else source["SO Completion Date"].strftime("%b-%y"),
             "Month Complete2": source.get("Month Complete"),
         })
+        row.update({name: source.get(source_name) for name, source_name in additional_columns})
         records.append({name: row.get(name) for name in columns})
     return pd.DataFrame(records, columns=columns, dtype=object), warnings
 
@@ -572,7 +589,8 @@ def _write_native(path: Path, frame: pd.DataFrame, report_date: date, *, raw_pat
         # Bind by field name before renaming the monthly field. Reusing positional
         # cache indices would attach pivots to different columns after reordering.
         write_headers = [old_target if name == new_target else name for name in frame.columns]
-        migration_headers = [name for name in old_headers if name not in write_headers]
+        write_header_keys = {header(name).casefold() for name in write_headers}
+        migration_headers = [name for name in old_headers if header(name).casefold() not in write_header_keys]
         cache_headers = write_headers + migration_headers
         styles = {presentation_key(name): data.Cells(1, i).EntireColumn.ColumnWidth
                   for i, name in enumerate(old_headers, 1)}

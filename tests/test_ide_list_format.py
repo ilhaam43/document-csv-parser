@@ -159,6 +159,23 @@ class IdeListRulesTests(unittest.TestCase):
         self.assertEqual(row["MONTH COMPLETE"], "Oct-26")
         self.assertEqual(row["Future Field"], "kept")
 
+    def test_raw_order_type_and_sd_note_append_without_changing_report_fields(self):
+        baseline = self.build([self.raw(), self.raw(Key="IDE-2")])
+        for raw_header in ("order type", "ORDER TYPE", "Order Type"):
+            with self.subTest(raw_header=raw_header):
+                frame = self.build([
+                    self.raw(**{raw_header: "New-reg", "SD Note": "Raw note"}),
+                    self.raw(Key="IDE-2", **{raw_header: None, "SD Note": None}),
+                ])
+                self.assertEqual(list(frame.columns), list(baseline.columns) + ["Order Type (Raw)", "SD Note"])
+                self.assertTrue(frame[baseline.columns].equals(baseline))
+                self.assertEqual(frame["Order Type (Raw)"].tolist(), ["New-reg", None])
+                self.assertEqual(frame["SD Note"].tolist(), ["Raw note", None])
+
+    def test_duplicate_output_header_fails_before_excel_can_rename_it(self):
+        with self.assertRaisesRegex(ValueError, "Order Type \\(Raw\\).*conflicts"):
+            self.build([self.raw(**{"order type": "New-reg", "Order Type (Raw)": "different"})])
+
     def test_unusual_source_year_is_reported_not_guessed(self):
         frame, warnings = build_rows([self.raw(**{"FAB Upload Date": datetime(2926, 7, 28)})],
                                      [self.reference()], date(2026, 11, 17))
@@ -224,6 +241,13 @@ class IdeListRulesTests(unittest.TestCase):
 
 
 class IdeListPresentationTests(unittest.TestCase):
+    def test_raw_order_type_presentation_is_separate_from_report_order_type(self):
+        raw_key = presentation_key("order type", raw=True)
+        source = {raw_key: ColumnPresentation("@")}
+        models = column_presentations(["ORDER TYPE", "Order Type (Raw)"], {}, source)
+        self.assertEqual(models["ORDER TYPE"].number_format, "General")
+        self.assertEqual(models["Order Type (Raw)"].number_format, "@")
+
     def test_number_formats_change_display_not_values(self):
         frame, _ = build_rows([IdeListRulesTests().raw(Progress=.5, **{"Revenue": 1234.5})],
                               [IdeListRulesTests().reference()], date(2026, 11, 17))

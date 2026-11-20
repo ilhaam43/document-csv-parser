@@ -27,6 +27,7 @@ point as the CLI. Weekly and Reports 1-3 are not changed.
 | Status | Current raw status, prefixed as 1.Quotation, 2.Pra-Delivery, 3.Delivery, 4.Waiting AOS, 5.SO Complete, 6.Cancel. Unknown statuses fail explicitly. |
 | Yesterday Status | First matching Quote ID's current Status in the previous workbook. Missing quote produces intentional Excel `#N/A` only here. |
 | ORDER TYPE | Keep the first matching quote's historical ORDER TYPE. For unmatched quotes, a word starting RENEW in Quote Name gives Renewal; otherwise New Registration. This includes the observed RENEWEL spelling. |
+| Order Type (Raw), SD Note | Append when present in the List export; retain original values and blanks. The raw `order type` uses a distinct heading because Excel table headings are case-insensitive. Neither field replaces `ORDER TYPE` or changes pivot rules. |
 | PROCESS | New Registration gives New Reg; other preserved order types give Non New Reg. |
 | Monthly target | Compare Target RFS month/year to the calendar report month. Missing Target RFS gives Target Not Yet Inputted. Missing FAB or Actual RFS does not erase a valid target. |
 | Aging Of RFS | Report date minus Target RFS date. Missing target remains truly empty. The formula uses the report date, not volatile NOW, so reruns are reproducible. |
