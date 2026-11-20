@@ -27,7 +27,7 @@ point as the CLI. Weekly and Reports 1-3 are not changed.
 | Status | Current raw status, prefixed as 1.Quotation, 2.Pra-Delivery, 3.Delivery, 4.Waiting AOS, 5.SO Complete, 6.Cancel. Unknown statuses fail explicitly. |
 | Yesterday Status | First matching Quote ID's current Status in the previous workbook. Missing quote produces intentional Excel `#N/A` only here. |
 | ORDER TYPE | Keep the first matching quote's historical ORDER TYPE. For unmatched quotes, a word starting RENEW in Quote Name gives Renewal; otherwise New Registration. This includes the observed RENEWEL spelling. |
-| Order Type (Raw), SD Note | Append when present in the List export; retain original values and blanks. The raw `order type` uses a distinct heading because Excel table headings are case-insensitive. Neither field replaces `ORDER TYPE` or changes pivot rules. |
+| Raw `order type`, `SD Note` | Accepted in the List input but omitted from the report, following the 20 November manual workbook. Raw `order type` does not replace the report-derived `ORDER TYPE`. |
 | PROCESS | New Registration gives New Reg; other preserved order types give Non New Reg. |
 | Monthly target | Compare Target RFS month/year to the calendar report month. Missing Target RFS gives Target Not Yet Inputted. Missing FAB or Actual RFS does not erase a valid target. |
 | Aging Of RFS | Report date minus Target RFS date. Missing target remains truly empty. The formula uses the report date, not volatile NOW, so reruns are reproducible. |
@@ -35,7 +35,7 @@ point as the CLI. Weekly and Reports 1-3 are not changed.
 | ON TIME DELIVERY | Actual RFS greater than Target RFS gives DELAY, otherwise ONTIME. Both dates are required. Raw OTD remains a separate source column. |
 | YEAR FAB UPLOAD | TEXT(FAB Upload Date,"yyyy"), including the reference's 1900 placeholder for a missing date. |
 | MONTH COMPLETE | TEXT(SO Completion Date,"MMM-YY"), including the reference's Jan-00 placeholder for a missing date. Raw Month Complete is kept separately as Month Complete2. |
-| Other fields | Preserve source values and timestamps; additional declared source columns are appended. |
+| Other fields | Preserve source values and timestamps; additional declared source columns are appended unless explicitly raw-only. |
 
 The standard sample layout contains 67 columns. Required fields are validated;
 it is not a fixed column-count gate. Text cells are explicitly written as text
@@ -65,13 +65,10 @@ read back from the saved workbook and checked by field and row, along with the
 Table1 range and every pivot's current cache record count. Publication is
 atomic: a failed generation does not replace an existing output.
 
-Target After percentage helpers follow the confirmed manual rule:
-`SO Complete + Cancel / quote count`, with division performed before addition.
-This intentionally permits results above 100%; for example, 8 Complete and no
-Cancel gives 800%, not 8 divided by the quote count. Only pivots whose monthly
-target filter selects exclusively the After bucket use this rule, regardless of
-month, pivot name, or row position. Other completion blocks retain
-`(SO Complete + Cancel) / quote count`.
+All completion percentage helpers, including Target After, use
+`(SO Complete + Cancel) / quote count`, following the confirmed 20 November
+manual workbook. For example, 9 Complete and 1 Cancel out of 39 quotes gives
+25.64%.
 Rows are matched by category identity, and status columns by status name rather
 than fixed coordinates. Missing status categories contribute zero; a zero
 denominator gives zero. Native styles, widths, header/data alignment, and
@@ -226,10 +223,10 @@ the repository under `D:\SECM\ide-list-implementation-validation-20261117`.
 | Independent source/filter total checks | 11 / 11 pass | 11 / 11 pass |
 
 Native grid comparisons use each PivotTable's TableRange1, not the entire PIVOT
-worksheet. After the Target After-only formula confirmation, a separate full
-PIVOT value comparison also verified every adjacent percentage-helper value
-against both manuals. The only remaining PIVOT value difference is the leading
-space in the manual's title at A1; native grid and helper numbers match.
+worksheet. A historical full-sheet comparison under the then-current
+Target After formula also verified every adjacent percentage-helper value
+against those manuals. The only PIVOT value difference in that run was the
+leading space in the manual's title at A1.
 Compared with the prior generated outputs, only 11 Target After helper values
 change per sample, and populated PIVOT cell styles remain unchanged. Fresh
 outputs and audit results are stored outside the repository under
@@ -249,10 +246,10 @@ Known manual inconsistencies are not implemented as quote-specific overrides:
 - Jan-00/1900 placeholders and unusual years remain source/reference-compatible;
   preserving them does not certify the source dates as correct.
 
-The earlier Target After helper discrepancy (29.63% / 26.67% versus the
-manual's 800%) was a formula-policy difference, not a count or Revenue mismatch.
-The confirmed Target After-only precedence above replaces that earlier policy;
-New Registration and other completion blocks do not inherit it.
+The 16/17 November manuals used a different Target After formula, giving 800%
+where the completion ratio gives 29.63% / 26.67%. The 20 November manual and
+confirmed rule supersede that special case. Rerunning the older samples can
+therefore differ in those helper values, not in the underlying counts or Revenue.
 
 The Renewal-name classifier and reference filter selections are evidenced by
 these two samples, not a claim that every future business type/filter policy

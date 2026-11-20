@@ -59,7 +59,7 @@ FINANCIAL_FIELDS = {
     "Risk BC", "Penalty Actual", "Cost Planned", "Actual Cost", "Revenue (Juta)",
 }
 PROGRESS_BAR_COLOR = 0xCAD37F  # Excel OLE color for the manual's #7FD3CA.
-RAW_ORDER_TYPE = "Order Type (Raw)"
+RAW_ONLY_FIELDS = {"order type", "sd note"}
 
 
 @dataclass(frozen=True)
@@ -73,8 +73,6 @@ class ColumnPresentation:
 
 def presentation_key(name: str, *, raw: bool = False) -> str:
     name = header(name).casefold()
-    if raw and name == "order type":
-        return RAW_ORDER_TYPE.casefold()
     if is_dynamic_target_header(name):
         return "__monthly_target__"
     if re.fullmatch(r"month complete\d+", name) or (raw and name == "month complete"):
@@ -113,7 +111,7 @@ def read_column_presentations(path: Path, sheet_name: str, *, records: list[dict
                     alignments[index][alignment(cell)] += 1
         result = {}
         for index, cell in enumerate(headings):
-            if cell.value is None:
+            if cell.value is None or (sheet_name == "List" and names[index].casefold() in RAW_ONLY_FIELDS):
                 continue
             result[presentation_key(str(cell.value), raw=sheet_name == "List")] = ColumnPresentation(
                 formats[index].most_common(1)[0][0] if formats[index] else "General",
@@ -275,16 +273,11 @@ def build_rows(raw: list[dict], previous: list[dict], report_date: date) -> tupl
             history.setdefault(quote, row)
     columns = [name.format(target=target_header(report_date)) for name in PREFIX]
     copied = set(columns) | {"Month Complete"}
-    additional_columns = []
-    for name in raw[0]:
-        if name.casefold() == "order type":
-            # Excel Table1 treats this raw header as the same as report ORDER TYPE.
-            additional_columns.append((RAW_ORDER_TYPE, name))
-        elif name and name not in copied:
-            additional_columns.append((name, name))
     used_headers = {header(name).casefold() for name in columns}
-    for name, _ in additional_columns:
+    for name in raw[0]:
         key = header(name).casefold()
+        if not key or name in copied or key in RAW_ONLY_FIELDS:
+            continue
         if key in used_headers:
             raise ValueError(f"IDE List column {name!r} conflicts with an ALL ORDER column name.")
         used_headers.add(key)
@@ -322,7 +315,6 @@ def build_rows(raw: list[dict], previous: list[dict], report_date: date) -> tupl
             "MONTH COMPLETE": "Jan-00" if blank(source.get("SO Completion Date")) else source["SO Completion Date"].strftime("%b-%y"),
             "Month Complete2": source.get("Month Complete"),
         })
-        row.update({name: source.get(source_name) for name, source_name in additional_columns})
         records.append({name: row.get(name) for name in columns})
     return pd.DataFrame(records, columns=columns, dtype=object), warnings
 
@@ -416,36 +408,19 @@ def validate_progress_bar(sheet, column: int, row_count: int) -> None:
         raise RuntimeError("Saved IDE List Progress data bar must use a fixed 0-100% scale.")
 
 
-def is_target_after_filter(fields: dict) -> bool:
-    from generate_ide_tracking import target_item_kind
-
-    return any(is_dynamic_target_header(name) and selected
-               and {target_item_kind(value) for value in selected} == {"after"}
-               for name, selected in fields.items())
-
-
-def percentage_helper_formula(status_cells: dict[str, list[str]], denominator: str, *,
-                              target_after: bool = False) -> str:
+def percentage_helper_formula(status_cells: dict[str, list[str]], denominator: str) -> str:
     complete = status_cells.get("5.SO Complete", [])
     cancel = status_cells.get("6.Cancel", [])
-    if target_after:
-        # Target After intentionally follows the confirmed manual precedence.
-        completed = f'SUM({",".join(complete)})' if complete else "0"
-        cancelled = f'SUM({",".join(cancel)})' if cancel else "0"
-        expression = f"{completed}+{cancelled}/{denominator}"
-    else:
-        expression = f'({"+".join(complete + cancel) or "0"})/{denominator}'
-    return f"=IF({denominator}=0,0,{expression})"
+    numerator = "+".join(complete + cancel) or "0"
+    return f"=IF({denominator}=0,0,({numerator})/{denominator})"
 
 
 def _restore_percentages(sheet, scratch, blocks) -> None:
     from generate_ide_tracking import restore_pivot_percentage_blocks
 
     restore_pivot_percentage_blocks(sheet, scratch, blocks)
-    filters = _capture_filters(sheet)
     for block in blocks:
         phase = sheet.PivotTables(block.pivot_name)
-        target_after = is_target_after_filter(filters[str(phase.Name)])
         region = phase.TableRange1
         summaries = [p for p in sheet.PivotTables() if int(p.TableRange1.Column) < int(region.Column)
                      and {str(f.SourceName) for f in p.RowFields} == {str(f.SourceName) for f in phase.RowFields}
@@ -484,8 +459,7 @@ def _restore_percentages(sheet, scratch, blocks) -> None:
             if denominator is None:
                 raise RuntimeError(f"Missing percentage denominator for {phase.Name}: {identity!r}")
             target = sheet.Cells(int(row.Row), percentage_column)
-            target.Formula = percentage_helper_formula(
-                status_cells, denominator, target_after=target_after)
+            target.Formula = percentage_helper_formula(status_cells, denominator)
             target.NumberFormat = "0.00%"
 
 

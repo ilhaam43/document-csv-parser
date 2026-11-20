@@ -9,52 +9,30 @@ from generate_ide_tracking import InputFiles, determine_report_date, generate_id
 from ide_list_format import (
     REQUIRED, ColumnPresentation, apply_column_alignment, build_rows, column_presentations,
     generate, is_list_export, normalize_status, presentation_key, read_column_presentations,
-    read_records, target_bucket, fit_unwrapped_text_columns, is_target_after_filter,
+    read_records, target_bucket, fit_unwrapped_text_columns,
     percentage_helper_formula, _restore_percentages,
 )
 
 
 class IdeListPercentageTests(unittest.TestCase):
-    def test_target_after_filter_follows_bucket_not_month_or_pivot_name(self):
-        for period in (date(2026, 11, 17), date(2026, 12, 1), date(2027, 1, 1)):
-            with self.subTest(period=period):
-                self.assertTrue(is_target_after_filter({target_header(period): {"After " + period.strftime("%B")}}))
-
-    def test_other_or_mixed_filters_do_not_change_formula_policy(self):
-        name = target_header(date(2026, 11, 17))
-        for fields in ({}, {name: None}, {name: set()}, {name: {"Target November"}},
-                       {name: {"Before November"}}, {name: {"Target Not Yet Inputted"}},
-                       {name: {"After November", "Target November"}},
-                       {"Department": {"After November"}}):
-            with self.subTest(fields=fields):
-                self.assertFalse(is_target_after_filter(fields))
-
-    def test_target_after_uses_manual_precedence(self):
-        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$356"],
-                                                   "6.Cancel": ["$K$356"]}, "$C$356", target_after=True),
-                         "=IF($C$356=0,0,SUM($I$356)+SUM($K$356)/$C$356)")
+    def test_target_after_adds_both_statuses_before_dividing(self):
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$359"],
+                                                   "6.Cancel": ["$J$359"]}, "$C$359"),
+                         "=IF($C$359=0,0,($I$359+$J$359)/$C$359)")
 
     def test_missing_status_is_zero_not_a_neighbouring_column(self):
-        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$355"]}, "$C$355", target_after=True),
-                         "=IF($C$355=0,0,SUM($I$355)+0/$C$355)")
-        self.assertEqual(percentage_helper_formula({"6.Cancel": ["$G$42"]}, "$C$42", target_after=True),
-                         "=IF($C$42=0,0,0+SUM($G$42)/$C$42)")
-        self.assertEqual(percentage_helper_formula({}, "$D$18", target_after=True),
-                         "=IF($D$18=0,0,0+0/$D$18)")
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$355"]}, "$C$355"),
+                         "=IF($C$355=0,0,($I$355)/$C$355)")
+        self.assertEqual(percentage_helper_formula({"6.Cancel": ["$G$42"]}, "$C$42"),
+                         "=IF($C$42=0,0,($G$42)/$C$42)")
+        self.assertEqual(percentage_helper_formula({}, "$D$18"), "=IF($D$18=0,0,(0)/$D$18)")
 
     def test_split_status_cells_are_summed_before_division(self):
-        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$Q$8", "$R$8"],
-                                                   "6.Cancel": ["$S$8", "$T$8"]}, "$F$8", target_after=True),
-                         "=IF($F$8=0,0,SUM($Q$8,$R$8)+SUM($S$8,$T$8)/$F$8)")
+        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$Q$48", "$R$48"],
+                                                   "6.Cancel": ["$S$48", "$T$48"]}, "$F$48"),
+                         "=IF($F$48=0,0,($Q$48+$R$48+$S$48+$T$48)/$F$48)")
 
-    def test_other_completion_blocks_keep_the_existing_ratio(self):
-        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$31"]}, "$C$31"),
-                         "=IF($C$31=0,0,($I$31)/$C$31)")
-        self.assertEqual(percentage_helper_formula({"5.SO Complete": ["$I$31"],
-                                                   "6.Cancel": ["$K$31"]}, "$C$31"),
-                         "=IF($C$31=0,0,($I$31+$K$31)/$C$31)")
-
-    def test_restore_chooses_policy_from_filter_and_matches_summary_row_identity(self):
+    def test_restore_matches_summary_row_identity_and_ignores_unrelated_status(self):
         class Cells(list):
             def __call__(self, row, column):
                 return self[column - 1]
@@ -89,16 +67,11 @@ class IdeListPercentageTests(unittest.TestCase):
         output = SimpleNamespace()
         sheet = SimpleNamespace(PivotTables=lambda name=None: phase if name else [summary, phase],
                                 Cells=lambda row, column: output)
-        name = target_header(date(2026, 11, 17))
-        for selection, expected in [("After November", "SUM($H$48)+SUM($G$48)/$C$42"),
-                                    ("Target November", "($H$48+$G$48)/$C$42")]:
-            with self.subTest(selection=selection), \
-                 patch("generate_ide_tracking.restore_pivot_percentage_blocks"), \
-                 patch("ide_list_format._capture_filters", return_value={phase.Name: {name: {selection}}}), \
-                 patch("ide_list_format.pivot_row_identity", side_effect=lambda cell, **kwargs: cell.identity):
-                _restore_percentages(sheet, None, [SimpleNamespace(pivot_name=phase.Name)])
-                self.assertEqual(output.Formula, f"=IF($C$42=0,0,{expected})")
-                self.assertEqual(output.NumberFormat, "0.00%")
+        with patch("generate_ide_tracking.restore_pivot_percentage_blocks"), \
+             patch("ide_list_format.pivot_row_identity", side_effect=lambda cell, **kwargs: cell.identity):
+            _restore_percentages(sheet, None, [SimpleNamespace(pivot_name=phase.Name)])
+        self.assertEqual(output.Formula, "=IF($C$42=0,0,($H$48+$G$48)/$C$42)")
+        self.assertEqual(output.NumberFormat, "0.00%")
 
 
 class IdeListRulesTests(unittest.TestCase):
@@ -159,7 +132,7 @@ class IdeListRulesTests(unittest.TestCase):
         self.assertEqual(row["MONTH COMPLETE"], "Oct-26")
         self.assertEqual(row["Future Field"], "kept")
 
-    def test_raw_order_type_and_sd_note_append_without_changing_report_fields(self):
+    def test_raw_order_type_and_sd_note_do_not_change_report_schema_or_values(self):
         baseline = self.build([self.raw(), self.raw(Key="IDE-2")])
         for raw_header in ("order type", "ORDER TYPE", "Order Type"):
             with self.subTest(raw_header=raw_header):
@@ -167,14 +140,12 @@ class IdeListRulesTests(unittest.TestCase):
                     self.raw(**{raw_header: "New-reg", "SD Note": "Raw note"}),
                     self.raw(Key="IDE-2", **{raw_header: None, "SD Note": None}),
                 ])
-                self.assertEqual(list(frame.columns), list(baseline.columns) + ["Order Type (Raw)", "SD Note"])
-                self.assertTrue(frame[baseline.columns].equals(baseline))
-                self.assertEqual(frame["Order Type (Raw)"].tolist(), ["New-reg", None])
-                self.assertEqual(frame["SD Note"].tolist(), ["Raw note", None])
+                self.assertTrue(frame.equals(baseline))
+                self.assertEqual(frame["ORDER TYPE"].tolist(), ["New Registration"] * 2)
 
     def test_duplicate_output_header_fails_before_excel_can_rename_it(self):
-        with self.assertRaisesRegex(ValueError, "Order Type \\(Raw\\).*conflicts"):
-            self.build([self.raw(**{"order type": "New-reg", "Order Type (Raw)": "different"})])
+        with self.assertRaisesRegex(ValueError, "progress.*conflicts"):
+            self.build([self.raw(progress="unexpected case variant")])
 
     def test_unusual_source_year_is_reported_not_guessed(self):
         frame, warnings = build_rows([self.raw(**{"FAB Upload Date": datetime(2926, 7, 28)})],
@@ -241,12 +212,22 @@ class IdeListRulesTests(unittest.TestCase):
 
 
 class IdeListPresentationTests(unittest.TestCase):
-    def test_raw_order_type_presentation_is_separate_from_report_order_type(self):
-        raw_key = presentation_key("order type", raw=True)
-        source = {raw_key: ColumnPresentation("@")}
-        models = column_presentations(["ORDER TYPE", "Order Type (Raw)"], {}, source)
-        self.assertEqual(models["ORDER TYPE"].number_format, "General")
-        self.assertEqual(models["Order Type (Raw)"].number_format, "@")
+    def test_raw_only_headers_do_not_supply_report_presentation(self):
+        alignment = SimpleNamespace(horizontal=None, vertical="top", wrapText=None,
+                                    shrinkToFit=None, indent=0, textRotation=0)
+        names = ["order type", "SD Note", "Progress"]
+        sheet = SimpleNamespace(iter_rows=lambda: iter([
+            [SimpleNamespace(value=name, alignment=alignment) for name in names],
+            [SimpleNamespace(value=value, number_format=fmt, alignment=alignment)
+             for value, fmt in zip(["New-reg", "Raw note", 0.5], ["@", "@", "0.0%"])],
+        ]))
+        class Book(dict):
+            def close(self):
+                pass
+
+        with patch("ide_list_format.load_workbook", return_value=Book({"List": sheet})):
+            source = read_column_presentations(Path("raw.xlsx"), "List")
+        self.assertEqual(set(source), {"progress"})
 
     def test_number_formats_change_display_not_values(self):
         frame, _ = build_rows([IdeListRulesTests().raw(Progress=.5, **{"Revenue": 1234.5})],
