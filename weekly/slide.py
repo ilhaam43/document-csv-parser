@@ -8,11 +8,13 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .dates import excel_week_number
 
-def week_label(year: int, week: int) -> str:
-    """Label a Thursday-start Excel week by its starting month."""
-    week_start = reporting_week_start(year, week)
-    return f"W{(week_start.day - 1) // 7 + 1}-{week_start:%b}"
+
+def week_label(month: date, week: int) -> str:
+    """Label a completion week relative to the Excel week containing day one."""
+    first_week = excel_week_number(month.replace(day=1))
+    return f"W{week - first_week + 1}-{month:%b}"
 
 
 def reporting_week_start(year: int, week: int) -> date:

@@ -137,7 +137,9 @@ class WeeklyWorkbookValueTests(unittest.TestCase):
             _reset_summary_adjustment_filters(workbook)
 
     def test_adjustment_policy_discovers_new_pivots_but_preserves_detail_filters(self) -> None:
-        for name in ("PIVOT PERFORMANCE", "SLIDE GH MEETING", "LEADTIME NOT ACHIEVED"):
+        summaries = {"PIVOT PERFORMANCE", "SLIDE GH MEETING"}
+        detail_sheets = ("PIVOT PERFORMANCE (2)", "MONITORING ORDER - MOBILE", "LEADTIME NOT ACHIEVED")
+        for name in (*sorted(summaries), *detail_sheets):
             with self.subTest(sheet=name):
                 field = SimpleNamespace(AllItemsVisible=False, Orientation=3)
                 field.ClearAllFilters = lambda: setattr(field, "AllItemsVisible", True)
@@ -148,7 +150,7 @@ class WeeklyWorkbookValueTests(unittest.TestCase):
                         return pivot
                 sheet = SimpleNamespace(Name=name, PivotTables=lambda: Collection())
                 changed = _reset_summary_adjustment_filters(SimpleNamespace(Worksheets=[sheet]))
-                is_summary = name == "PIVOT PERFORMANCE"
+                is_summary = name in summaries
                 self.assertEqual(field.AllItemsVisible, is_summary)
                 self.assertEqual(bool(changed), is_summary)
 

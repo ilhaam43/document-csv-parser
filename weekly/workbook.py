@@ -186,7 +186,7 @@ def _reset_summary_adjustment_filters(workbook) -> set[tuple[str, str]]:
     # Operational and exception sheets retain their separate curated populations.
     changed_pivots: set[tuple[str, str]] = set()
     for sheet in workbook.Worksheets:
-        if str(sheet.Name) != PIVOT_PERFORMANCE_SHEET_NAME:
+        if str(sheet.Name) not in SUMMARY_SHEET_NAMES:
             continue
         pivot_tables = sheet.PivotTables()
         for pivot_number in range(1, pivot_tables.Count + 1):
@@ -577,6 +577,36 @@ def _refresh_pivots(
     _refresh_selected_pivots(workbook, changed_pivots)
 
 
+def _slide_summary_rows(
+    pivot_labels: list[tuple[int, str]],
+    *,
+    report_month: date,
+    report_week: int,
+    old_labels: dict[date, str],
+    require_current_week: bool,
+) -> list[tuple[str, int | None]]:
+    summary_rows: list[tuple[str, int | None]] = []
+    weeks: dict[int, int] = {}
+    active_month = None
+    first_week = excel_week_number(report_month)
+    for row, label in pivot_labels:
+        if (month := completion_month(label)) is not None:
+            active_month = month
+            if month.year == report_month.year and month < report_month:
+                summary_rows.append((old_labels.get(month, label), row))
+        elif active_month == report_month and (week := _week_number(label)) is not None:
+            if first_week <= week <= report_week:
+                weeks[week] = row
+    if require_current_week and report_week not in weeks:
+        raise RuntimeError("Slide PivotTable has no current report week in its completion month.")
+    summary_rows.extend(
+        (week_label(report_month, week), weeks.get(week))
+        for week in range(first_week, report_week + 1)
+        if week in weeks or not require_current_week
+    )
+    return summary_rows
+
+
 def _refresh_slide_summary(
     workbook,
     *,
@@ -602,7 +632,8 @@ def _refresh_slide_summary(
     if pivot is None:
         raise RuntimeError("Slide summary has no Week Completion PivotTable.")
 
-    report_month = reporting_week_start(report_year, report_week).replace(day=1)
+    week_start = reporting_week_start(report_year, report_week)
+    report_month = max(week_start, date(report_year, 1, 1)).replace(day=1)
     month_field = pivot.PivotFields("Month Completion")
     month_items = month_field.PivotItems()
     original_manual = bool(pivot.ManualUpdate)
@@ -635,12 +666,10 @@ def _refresh_slide_summary(
         str(sheet.Cells(header_row, column).Value or "").strip().casefold(): column
         for column in range(first_column + 1, last_column + 1)
     }
-    week_rows = {
-        str(sheet.Cells(row, first_column).Value or "").strip(): row
+    pivot_labels = [
+        (row, str(sheet.Cells(row, first_column).Value or "").strip())
         for row in range(header_row + 1, last_row + 1)
-    }
-    if require_current_week and f"W{report_week}" not in week_rows:
-        raise RuntimeError("Slide PivotTable has no current report week.")
+    ]
 
     static_columns = {
         column: str(sheet.Cells(9, column).Value or "").strip().casefold()
@@ -664,22 +693,10 @@ def _refresh_slide_summary(
     if len(old_total_rows) != 1:
         raise RuntimeError("Slide chart source must contain exactly one AVG Total row.")
 
-    summary_rows = []
-    for label, pivot_row in week_rows.items():
-        month = completion_month(label)
-        week = _week_number(label)
-        if month is not None and month < report_month and month.year == report_year:
-            summary_rows.append((old_labels.get(month, label), pivot_row))
-        elif (week is not None and week <= report_week
-              and reporting_week_start(report_year, week).replace(day=1) == report_month):
-            summary_rows.append((week_label(report_year, week), pivot_row))
-    if not require_current_week:
-        summary_rows = [(label, row) for label, row in summary_rows if completion_month(label) is not None]
-        summary_rows.extend(
-            (week_label(report_year, week), week_rows.get(f"W{week}"))
-            for week in range(1, report_week + 1)
-            if reporting_week_start(report_year, week).replace(day=1) == report_month
-        )
+    summary_rows = _slide_summary_rows(
+        pivot_labels, report_month=report_month, report_week=report_week,
+        old_labels=old_labels, require_current_week=require_current_week,
+    )
     current_row = 9 + len(summary_rows)
     total_row = current_row + 1
     old_total_row = old_total_rows[0]

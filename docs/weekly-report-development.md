@@ -177,13 +177,10 @@ long-term audit store. A server restart during an active job does not resume it.
   horizontal borders while retaining their own numeric format. Grand Total
   styling follows the actual total row when a pivot grows or shrinks; obsolete
   helper formulas and their formatting are cleared without removing unrelated notes.
-- Performance summary pivots include all ADJUSTMENT notes in both
-  Master and Mobile. This changes aggregation membership, not ACHIEVEMENT or PM
-  approval. A note is not an automatic exclusion. SLIDE GH MEETING and
-  detail/exception sheets retain their separate operational/investigation
-  filters; an explicit pivot-review input is applied after
-  the default summary policy. Manual samples with additional exclusions remain
-  differences, not evidence that the default reproduces those selections.
+- `PIVOT PERFORMANCE` and `SLIDE GH MEETING` summary pivots default to all
+  `ADJUSTMENT` items, following the W46 manual. This changes which orders are
+  counted, not `ACHIEVEMENT` or PM approval. Detail/exception sheets retain
+  their own filters, and explicit pivot reviews still apply after the default.
 - FAB-CASH page filters preserve each template pivot's explicit numeric
   exclusions, including zero when excluded. The writer captures these selections
   before cache refresh and reapplies them by value, not cache index. Newly seen
@@ -337,6 +334,10 @@ the reporting month expands into weeks. The reporting month comes from the
 Thursday-start report week, not the BQ export month (W39 remains September
 even with an October export). Both Master and Mobile retain the full precision
 of the refreshed pivot, including weekly values and the weighted grand total.
+Chart weeks come from the pivot's current `Month Completion` group. The Excel
+week containing the first day of that month is `W1`, even if it started in the
+previous month. For example, November W44, W45, and W46 are `W1-Nov`, `W2-Nov`,
+and `W3-Nov`. A week without data does not renumber later weeks.
 The template's number formats control display precision without rounding the
 stored cell values.
 All chart series are resized to the resulting range. Helper percentage formulas
@@ -661,12 +662,11 @@ expects the incomplete legacy checkpoint to expose differences.
 
 ## Earlier summary population and layout validation
 
-The performance-summary policy is metric-specific. PIVOT PERFORMANCE includes
-all ADJUSTMENT notes for both roles. SLIDE GH MEETING and the monitoring and
-exception sheets retain their separate operational populations; resetting their
-filters globally changes otherwise matching reference values. Explicit optional
-pivot reviews are still applied last. No additional review is required for
-normal generation.
+Earlier validation reset `ADJUSTMENT` only on `PIVOT PERFORMANCE`. The W46
+manual also includes all adjustments on `SLIDE GH MEETING`; current generation
+applies that default on both summary sheets. Monitoring and exception filters
+remain unchanged. `AVG Total` is rebuilt from the refreshed pivot even when
+the manual chart-source table still contains an older total.
 
 The original validation below reset numeric FAB-CASH page filters to all finite
 values >= 0. The October 26 revalidation supersedes that behavior: resetting
