@@ -72,15 +72,8 @@
             <input id="previous_iphone_workbook" name="previous_iphone_workbook" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
           </div>
 
-          <label class="option">
-            <input id="refresh_template" name="refresh_template" type="checkbox" checked>
-            <span>Refresh Daily Tracking template pivots</span>
-          </label>
-
-          <label class="option">
-            <input id="ongoing_with_pivot" name="ongoing_with_pivot" type="checkbox">
-            <span>Force full ongoing pivot refresh</span>
-          </label>
+          <input type="hidden" name="refresh_template" value="true">
+          <input type="hidden" name="ongoing_with_pivot" value="false">
 
           <button id="submit-button" type="submit">Run Daily Pipeline</button>
         </form>
@@ -97,6 +90,6 @@
     </div>
   </main>
 
-  <script src="/static/pipeline.js?v=20260901-fetch-retry-v3"></script>
+  <script src="/static/pipeline.js?v=20261124-pivot-defaults"></script>
 </body>
 </html>

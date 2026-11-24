@@ -57,10 +57,7 @@
             <input id="yesterday_cleaned_data" name="yesterday_cleaned_data" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
           </div>
 
-          <label class="option">
-            <input id="refresh_template" name="refresh_template" type="checkbox" checked>
-            <span>Refresh template pivots</span>
-          </label>
+          <input type="hidden" name="refresh_template" value="true">
 
           <button id="submit-button" type="submit">Generate Workbook</button>
         </form>
@@ -78,6 +75,6 @@
   </main>
 
   <script src="/static/job-monitor.js?v=20260907-preassigned-job-v1"></script>
-  <script src="/static/app.js?v=20260907-preassigned-job-v1"></script>
+  <script src="/static/app.js?v=20261124-pivot-defaults"></script>
 </body>
 </html>

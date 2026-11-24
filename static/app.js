@@ -157,7 +157,6 @@ form.addEventListener("submit", async (event) => {
   try {
     const body = new FormData(form);
     body.set("job_id", jobId);
-    body.set("refresh_template", document.getElementById("refresh_template").checked ? "true" : "false");
 
     const queued = await fetchJson("/convert/upload/jobs", {
       method: "POST",

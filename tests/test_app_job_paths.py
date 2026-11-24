@@ -11,6 +11,33 @@ import app as app_module
 
 
 class ReportJobPathTests(unittest.TestCase):
+    def test_daily_forms_use_hidden_pivot_defaults(self) -> None:
+        class PivotInputs(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.fields = []
+
+            def handle_starttag(self, tag, attrs):
+                field = dict(attrs)
+                if tag == "input" and field.get("name") in {"refresh_template", "ongoing_with_pivot"}:
+                    self.fields.append((field["name"], field.get("type"), field.get("value")))
+
+        client = TestClient(app_module.app)
+        daily_defaults = [("refresh_template", "hidden", "true")]
+        for route, expected, labels in (
+            ("/report-1", daily_defaults, ("Refresh template pivots",)),
+            ("/pipeline", daily_defaults + [("ongoing_with_pivot", "hidden", "false")],
+             ("Refresh Daily Tracking template pivots", "Force full ongoing pivot refresh")),
+        ):
+            with self.subTest(route=route):
+                response = client.get(route)
+                self.assertEqual(response.status_code, 200)
+                parser = PivotInputs()
+                parser.feed(response.text)
+                self.assertEqual(parser.fields, expected)
+                for label in labels:
+                    self.assertNotIn(label, response.text)
+
     def test_report_4_public_form_only_offers_the_two_excel_uploads(self) -> None:
         class Inputs(HTMLParser):
             def __init__(self):
